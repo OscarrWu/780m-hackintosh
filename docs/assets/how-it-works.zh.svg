@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1100" font-family="-apple-system,'PingFang SC','Microsoft YaHei','Segoe UI',sans-serif">
+<style>
+.n{fill:#ffffff;stroke-width:1.5}
+.t{font-size:14px;font-weight:600;fill:#1a1a1a;text-anchor:middle}
+.d{font-size:11px;fill:#6b7280;text-anchor:middle}
+.l{font-size:10.5px;fill:#6b7280}
+.lc{font-size:10.5px;fill:#6b7280;text-anchor:middle}
+.tag{font-size:9.5px;font-weight:700;fill:#ffffff;text-anchor:middle}
+.col{font-size:13px;font-weight:600;fill:#6b7280;text-anchor:middle;letter-spacing:.5px}
+.al{stroke:#d4d4d8;stroke-width:1.5;fill:none}
+.sOurs{stroke:#059669}.fOurs{fill:#059669}
+.sBor{stroke:#0891b2}.fBor{fill:#0891b2}
+.sApple{stroke:#2563eb}.fApple{fill:#2563eb}
+.sHook{stroke:#b45309}.fHook{fill:#b45309}
+.sSys{stroke:#6b7280}.fSys{fill:#6b7280}
+.sHw{stroke:#7c3aed}.fHw{fill:#7c3aed}
+@media (prefers-color-scheme:dark){
+.n{fill:#1b1c1f}
+.t{fill:#e7e7ea}
+.d,.l,.lc,.col{fill:#9ca3af}
+.al{stroke:#3f3f46}
+.sOurs{stroke:#34d399}.fOurs{fill:#34d399}
+.sBor{stroke:#22d3ee}.fBor{fill:#22d3ee}
+.sApple{stroke:#60a5fa}.fApple{fill:#60a5fa}
+.sHook{stroke:#fbbf24}.fHook{fill:#fbbf24}
+.sSys{stroke:#9ca3af}.fSys{fill:#9ca3af}
+.sHw{stroke:#a78bfa}.fHw{fill:#a78bfa}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#d4d4d8"/></marker></defs>
+
+<rect x="40" y="8" width="12" height="12" rx="3" class="fOurs"/><text class="l" x="58" y="18">自写</text>
+<rect x="110" y="8" width="12" height="12" rx="3" class="fBor"/><text class="l" x="128" y="18">借用</text>
+<rect x="180" y="8" width="12" height="12" rx="3" class="fApple"/><text class="l" x="198" y="18">复用</text>
+<rect x="250" y="8" width="12" height="12" rx="3" class="fHook"/><text class="l" x="268" y="18">hook</text>
+<rect x="330" y="8" width="12" height="12" rx="3" class="fSys"/><text class="l" x="348" y="18">不动</text>
+<rect x="390" y="8" width="12" height="12" rx="3" class="fHw"/><text class="l" x="408" y="18">硬件</text>
+
+<text class="col" x="250" y="56">路径 A · App 的 3D 渲染（用户态）</text>
+<text class="col" x="710" y="56">路径 B · 桌面合成（内核态）</text>
+
+<rect class="n" x="40" y="68" width="420" height="44" rx="8" style="stroke:var(--muted)"/>
+<rect x="412" y="60" width="40" height="16" rx="8" class="fSys"/><text class="tag" x="432" y="72">不动</text>
+<text class="t" x="250" y="86">App</text><text class="d" x="250" y="102">只会说 Metal</text>
+
+<line class="al" x1="250" y1="116" x2="250" y2="138" marker-end="url(#ah)"/><text class="l" x="262" y="130">Metal 调用</text>
+
+<rect class="n" x="40" y="144" width="420" height="56" rx="8" style="stroke:var(--success)"/>
+<rect x="404" y="136" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="428" y="148">自写</text>
+<text class="t" x="250" y="164">Metal 插件</text><text class="d" x="250" y="182">Metal → Vulkan · 着色器 AIR → SPIR-V</text>
+
+<line class="al" x1="250" y1="204" x2="250" y2="226" marker-end="url(#ah)"/><text class="l" x="262" y="218">Vulkan 调用</text>
+
+<rect class="n" x="40" y="232" width="420" height="48" rx="8" style="stroke:var(--c1)"/>
+<rect x="396" y="224" width="56" height="16" rx="8" class="fBor"/><text class="tag" x="424" y="236">借用</text>
+<text class="t" x="250" y="251">RADV（Mesa）</text><text class="d" x="250" y="268">开源 AMD 驱动，生成 GPU 命令流</text>
+
+<line class="al" x1="250" y1="284" x2="250" y2="306" marker-end="url(#ah)"/><text class="l" x="262" y="298">分配显存 · 提交命令 · 等 fence</text>
+
+<rect class="n" x="40" y="312" width="420" height="48" rx="8" style="stroke:var(--success)"/>
+<rect x="404" y="304" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="428" y="316">自写</text>
+<text class="t" x="250" y="331">N48N 用户接口</text><text class="d" x="250" y="348">用户态进内核的唯一门</text>
+
+<line class="al" x1="250" y1="364" x2="250" y2="492" marker-end="url(#ah)"/><text class="l" x="262" y="420">IOConnectCallMethod</text><text class="l" x="262" y="434">→ 进内核</text>
+
+<rect class="n" x="500" y="68" width="420" height="44" rx="8" style="stroke:var(--muted)"/>
+<rect x="872" y="60" width="40" height="16" rx="8" class="fSys"/><text class="tag" x="892" y="72">不动</text>
+<text class="t" x="710" y="86">WindowServer</text><text class="d" x="710" y="102">把所有窗口合成一帧</text>
+
+<line class="al" x1="710" y1="116" x2="710" y2="138" marker-end="url(#ah)"/><text class="l" x="722" y="130">IOAccelerator 接口</text>
+
+<rect class="n" x="500" y="144" width="420" height="48" rx="8" style="stroke:var(--accent)"/>
+<rect x="864" y="136" width="48" height="16" rx="8" class="fApple"/><text class="tag" x="888" y="148">复用</text>
+<text class="t" x="710" y="163">Apple 加速器</text><text class="d" x="710" y="180">显存 · 队列 · 显示策略，Apple 代码原样跑</text>
+
+<line class="al" x1="710" y1="196" x2="710" y2="218" marker-end="url(#ah)"/><text class="l" x="722" y="210">hwServices → getTtl()</text>
+
+<rect class="n" x="500" y="224" width="420" height="56" rx="8" style="stroke:var(--warning)"/>
+<rect x="872" y="216" width="40" height="16" rx="8" class="fHook"/><text class="tag" x="892" y="228">hook</text>
+<text class="t" x="710" y="244">getTtl 劫持</text><text class="d" x="710" y="262">270 格函数表，第 266 格换成我们的 TTL</text>
+
+<line class="al" x1="710" y1="284" x2="710" y2="306" marker-end="url(#ah)"/><text class="l" x="722" y="298">返回自写 TTL 对象</text>
+
+<rect class="n" x="500" y="312" width="420" height="48" rx="8" style="stroke:var(--success)"/>
+<rect x="864" y="304" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="888" y="316">自写</text>
+<text class="t" x="710" y="331">TTL（43 个方法）</text><text class="d" x="710" y="348">上层摸硬件的唯一途径</text>
+
+<line class="al" x1="710" y1="364" x2="710" y2="386" marker-end="url(#ah)"/><text class="l" x="722" y="378">GFX10.3 旧方言进来</text>
+
+<rect class="n" x="500" y="392" width="420" height="56" rx="8" style="stroke:var(--success)"/>
+<rect x="864" y="384" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="888" y="396">自写</text>
+<text class="t" x="710" y="412">xlat11 / xlat12 翻译器</text><text class="d" x="710" y="430">GFX10.3 → GFX11 / GFX12，逐条查表改写</text>
+
+<line class="al" x1="710" y1="452" x2="710" y2="492" marker-end="url(#ah)"/><text class="l" x="722" y="476">安全后的命令流</text>
+
+<text class="lc" x="480" y="492">两条路径在此汇合 · 以下各层两路共享 · 全系统唯一被允许碰硬件的层</text>
+<line class="al" x1="250" y1="500" x2="710" y2="500" style="stroke-width:2"/>
+<line class="al" x1="480" y1="500" x2="480" y2="518" marker-end="url(#ah)"/>
+
+<rect class="n" x="270" y="524" width="420" height="52" rx="8" style="stroke:var(--success)"/>
+<rect x="634" y="516" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="658" y="528">自写</text>
+<text class="t" x="480" y="545">Navi48Bringup.kext</text><text class="d" x="480" y="563">两个入口（N48N · TTL 后端），内部同一套实现</text>
+
+<line class="al" x1="480" y1="580" x2="480" y2="602" marker-end="url(#ah)"/><text class="l" x="492" y="594">按职责分五路</text>
+
+<rect class="n" x="270" y="608" width="420" height="52" rx="8" style="stroke:var(--success)"/>
+<rect x="634" y="600" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="658" y="612">自写</text>
+<text class="t" x="480" y="629">上电五件套</text><text class="d" x="480" y="647">PSP 固件 · SMU 供电 · GMC 页表 · GFX/CP/MES · SDMA</text>
+
+<line class="al" x1="480" y1="664" x2="480" y2="686" marker-end="url(#ah)"/><text class="l" x="492" y="678">GPU 就绪 · MES 分时调度两路的队列</text>
+
+<rect class="n" x="270" y="692" width="420" height="48" rx="8" style="stroke:var(--c6)"/>
+<rect x="642" y="684" width="40" height="16" rx="8" class="fHw"/><text class="tag" x="662" y="696">硬件</text>
+<text class="t" x="480" y="711">GPU</text><text class="d" x="480" y="728">780M（GFX11）主线 · RX 9070 XT（GFX12）姊妹线</text>
+
+<line class="al" x1="480" y1="744" x2="480" y2="766" marker-end="url(#ah)"/><text class="l" x="492" y="758">画好的帧</text>
+
+<rect class="n" x="270" y="772" width="420" height="48" rx="8" style="stroke:var(--success)"/>
+<rect x="634" y="764" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="658" y="776">自写</text>
+<text class="t" x="480" y="791">IOFramebuffer nub</text><text class="d" x="480" y="808">选模式 · 翻页 · 垂直回扫</text>
+
+<line class="al" x1="480" y1="824" x2="480" y2="846" marker-end="url(#ah)"/><text class="l" x="492" y="838">显示策略问答</text>
+
+<rect class="n" x="270" y="852" width="420" height="44" rx="8" style="stroke:var(--success)"/>
+<rect x="634" y="844" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="658" y="856">自写</text>
+<text class="t" x="480" y="870">AGDC 服务</text><text class="d" x="480" y="886">AppleGraphicsDeviceControl 应答通道</text>
+
+<line class="al" x1="480" y1="900" x2="480" y2="922" marker-end="url(#ah)"/><text class="l" x="492" y="914">时序编程 · 扫描输出</text>
+
+<rect class="n" x="270" y="928" width="420" height="52" rx="8" style="stroke:var(--success)"/>
+<rect x="634" y="920" width="48" height="16" rx="8" class="fOurs"/><text class="tag" x="658" y="932">自写</text>
+<text class="t" x="480" y="949">DCN 3.1.4 / 4.1 显示引擎</text><text class="d" x="480" y="967">HUBP 取帧 → OTG 时序 → DIO 输出</text>
+
+<line class="al" x1="480" y1="984" x2="480" y2="1006" marker-end="url(#ah)"/><text class="l" x="492" y="998">eDP / DP 物理信号</text>
+
+<rect class="n" x="270" y="1012" width="420" height="44" rx="8" style="stroke:var(--c6)"/>
+<rect x="642" y="1004" width="40" height="16" rx="8" class="fHw"/><text class="tag" x="662" y="1016">硬件</text>
+<text class="t" x="480" y="1030">显示器</text><text class="d" x="480" y="1046">亮了</text>
+
+<text class="d" x="480" y="1084">绿 = 自写 · 青 = 借用开源 · 蓝 = Apple 代码原样复用 · 橙 = 运行时 hook · 灰 = 系统自带不动 · 紫 = 硬件</text>
+</svg>

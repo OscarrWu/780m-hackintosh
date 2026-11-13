@@ -1,0 +1,141 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 1100" font-family="-apple-system,'Segoe UI','PingFang SC',sans-serif">
+<style>
+.n{fill:#ffffff;stroke-width:1.5}
+.t{font-size:14px;font-weight:600;fill:#1a1a1a;text-anchor:middle}
+.d{font-size:11px;fill:#6b7280;text-anchor:middle}
+.l{font-size:10.5px;fill:#6b7280}
+.lc{font-size:10.5px;fill:#6b7280;text-anchor:middle}
+.tag{font-size:9.5px;font-weight:700;fill:#ffffff;text-anchor:middle}
+.col{font-size:13px;font-weight:600;fill:#6b7280;text-anchor:middle;letter-spacing:.5px}
+.al{stroke:#d4d4d8;stroke-width:1.5;fill:none}
+.sOurs{stroke:#059669}.fOurs{fill:#059669}
+.sBor{stroke:#0891b2}.fBor{fill:#0891b2}
+.sApple{stroke:#2563eb}.fApple{fill:#2563eb}
+.sHook{stroke:#b45309}.fHook{fill:#b45309}
+.sSys{stroke:#6b7280}.fSys{fill:#6b7280}
+.sHw{stroke:#7c3aed}.fHw{fill:#7c3aed}
+@media (prefers-color-scheme:dark){
+.n{fill:#1b1c1f}
+.t{fill:#e7e7ea}
+.d,.l,.lc,.col{fill:#9ca3af}
+.al{stroke:#3f3f46}
+.sOurs{stroke:#34d399}.fOurs{fill:#34d399}
+.sBor{stroke:#22d3ee}.fBor{fill:#22d3ee}
+.sApple{stroke:#60a5fa}.fApple{fill:#60a5fa}
+.sHook{stroke:#fbbf24}.fHook{fill:#fbbf24}
+.sSys{stroke:#9ca3af}.fSys{fill:#9ca3af}
+.sHw{stroke:#a78bfa}.fHw{fill:#a78bfa}
+}
+</style>
+<defs><marker id="ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="#d4d4d8"/></marker></defs>
+
+<rect x="40" y="8" width="12" height="12" rx="3" class="fOurs"/><text class="l" x="58" y="18">OURS</text>
+<rect x="120" y="8" width="12" height="12" rx="3" class="fBor"/><text class="l" x="138" y="18">BORROWED</text>
+<rect x="240" y="8" width="12" height="12" rx="3" class="fApple"/><text class="l" x="258" y="18">APPLE</text>
+<rect x="330" y="8" width="12" height="12" rx="3" class="fHook"/><text class="l" x="348" y="18">HOOK</text>
+<rect x="410" y="8" width="12" height="12" rx="3" class="fSys"/><text class="l" x="428" y="18">SYS</text>
+<rect x="470" y="8" width="12" height="12" rx="3" class="fHw"/><text class="l" x="488" y="18">HW</text>
+
+<text class="col" x="250" y="56">Path A · App rendering (user space)</text>
+<text class="col" x="710" y="56">Path B · Desktop composition (kernel space)</text>
+
+<rect class="n" x="40" y="68" width="420" height="44" rx="8" style="stroke:var(--muted)"/>
+<rect x="404" y="60" width="48" height="16" rx="8" class="fSys"/><text class="tag" x="428" y="72">SYS</text>
+<text class="t" x="250" y="86">App</text><text class="d" x="250" y="102">speaks Metal only</text>
+
+<line class="al" x1="250" y1="116" x2="250" y2="138" marker-end="url(#ah)"/><text class="l" x="262" y="130">Metal calls</text>
+
+<rect class="n" x="40" y="144" width="420" height="56" rx="8" style="stroke:var(--success)"/>
+<rect x="396" y="136" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="424" y="148">OURS</text>
+<text class="t" x="250" y="164">Metal plugin</text><text class="d" x="250" y="182">Metal → Vulkan · shaders AIR → SPIR-V</text>
+
+<line class="al" x1="250" y1="204" x2="250" y2="226" marker-end="url(#ah)"/><text class="l" x="262" y="218">Vulkan calls</text>
+
+<rect class="n" x="40" y="232" width="420" height="48" rx="8" style="stroke:var(--c1)"/>
+<rect x="384" y="224" width="68" height="16" rx="8" class="fBor"/><text class="tag" x="418" y="236">BORROWED</text>
+<text class="t" x="250" y="251">RADV (Mesa)</text><text class="d" x="250" y="268">open-source AMD driver; emits the command stream</text>
+
+<line class="al" x1="250" y1="284" x2="250" y2="306" marker-end="url(#ah)"/><text class="l" x="262" y="298">alloc · submit · fence</text>
+
+<rect class="n" x="40" y="312" width="420" height="48" rx="8" style="stroke:var(--success)"/>
+<rect x="396" y="304" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="424" y="316">OURS</text>
+<text class="t" x="250" y="331">N48N user client</text><text class="d" x="250" y="348">the only door from user space into the kernel</text>
+
+<line class="al" x1="250" y1="364" x2="250" y2="492" marker-end="url(#ah)"/><text class="l" x="262" y="420">IOConnectCallMethod</text><text class="l" x="262" y="434">→ into the kernel</text>
+
+<rect class="n" x="500" y="68" width="420" height="44" rx="8" style="stroke:var(--muted)"/>
+<rect x="864" y="60" width="48" height="16" rx="8" class="fSys"/><text class="tag" x="888" y="72">SYS</text>
+<text class="t" x="710" y="86">WindowServer</text><text class="d" x="710" y="102">composites all windows into one frame</text>
+
+<line class="al" x1="710" y1="116" x2="710" y2="138" marker-end="url(#ah)"/><text class="l" x="722" y="130">IOAccelerator interface</text>
+
+<rect class="n" x="500" y="144" width="420" height="48" rx="8" style="stroke:var(--accent)"/>
+<rect x="856" y="136" width="56" height="16" rx="8" class="fApple"/><text class="tag" x="884" y="148">APPLE</text>
+<text class="t" x="710" y="163">Apple accelerator</text><text class="d" x="710" y="180">memory · queues · display policy — Apple code as-is</text>
+
+<line class="al" x1="710" y1="196" x2="710" y2="218" marker-end="url(#ah)"/><text class="l" x="722" y="210">hwServices → getTtl()</text>
+
+<rect class="n" x="500" y="224" width="420" height="56" rx="8" style="stroke:var(--warning)"/>
+<rect x="864" y="216" width="48" height="16" rx="8" class="fHook"/><text class="tag" x="888" y="228">HOOK</text>
+<text class="t" x="710" y="244">getTtl hook</text><text class="d" x="710" y="262">270-slot function table; slot 266 → our TTL</text>
+
+<line class="al" x1="710" y1="284" x2="710" y2="306" marker-end="url(#ah)"/><text class="l" x="722" y="298">returns our TTL object</text>
+
+<rect class="n" x="500" y="312" width="420" height="48" rx="8" style="stroke:var(--success)"/>
+<rect x="856" y="304" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="884" y="316">OURS</text>
+<text class="t" x="710" y="331">TTL (43 methods)</text><text class="d" x="710" y="348">the only way the upper layers touch hardware</text>
+
+<line class="al" x1="710" y1="364" x2="710" y2="386" marker-end="url(#ah)"/><text class="l" x="722" y="378">GFX10.3 old dialect in</text>
+
+<rect class="n" x="500" y="392" width="420" height="56" rx="8" style="stroke:var(--success)"/>
+<rect x="856" y="384" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="884" y="396">OURS</text>
+<text class="t" x="710" y="412">xlat11 / xlat12</text><text class="d" x="710" y="430">GFX10.3 → GFX11 / GFX12, translated per command</text>
+
+<line class="al" x1="710" y1="452" x2="710" y2="492" marker-end="url(#ah)"/><text class="l" x="722" y="476">sanitized commands</text>
+
+<text class="lc" x="480" y="492">Both paths converge · everything below is shared · the only layer allowed to touch hardware</text>
+<line class="al" x1="250" y1="500" x2="710" y2="500" style="stroke-width:2"/>
+<line class="al" x1="480" y1="500" x2="480" y2="518" marker-end="url(#ah)"/>
+
+<rect class="n" x="270" y="524" width="420" height="52" rx="8" style="stroke:var(--success)"/>
+<rect x="626" y="516" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="654" y="528">OURS</text>
+<text class="t" x="480" y="545">Navi48Bringup.kext</text><text class="d" x="480" y="563">two entries (N48N · TTL backend), one implementation</text>
+
+<line class="al" x1="480" y1="580" x2="480" y2="602" marker-end="url(#ah)"/><text class="l" x="492" y="594">five power-up subsystems</text>
+
+<rect class="n" x="270" y="608" width="420" height="52" rx="8" style="stroke:var(--success)"/>
+<rect x="626" y="600" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="654" y="612">OURS</text>
+<text class="t" x="480" y="629">Power-up five</text><text class="d" x="480" y="647">PSP firmware · SMU · GMC · GFX/CP/MES · SDMA</text>
+
+<line class="al" x1="480" y1="664" x2="480" y2="686" marker-end="url(#ah)"/><text class="l" x="492" y="678">GPU ready · MES schedules both paths' queues</text>
+
+<rect class="n" x="270" y="692" width="420" height="48" rx="8" style="stroke:var(--c6)"/>
+<rect x="634" y="684" width="48" height="16" rx="8" class="fHw"/><text class="tag" x="658" y="696">HW</text>
+<text class="t" x="480" y="711">GPU</text><text class="d" x="480" y="728">780M (GFX11) main line · RX 9070 XT (GFX12) sister line</text>
+
+<line class="al" x1="480" y1="744" x2="480" y2="766" marker-end="url(#ah)"/><text class="l" x="492" y="758">finished frames</text>
+
+<rect class="n" x="270" y="772" width="420" height="48" rx="8" style="stroke:var(--success)"/>
+<rect x="626" y="764" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="654" y="776">OURS</text>
+<text class="t" x="480" y="791">IOFramebuffer nub</text><text class="d" x="480" y="808">mode set · page flip · vblank</text>
+
+<line class="al" x1="480" y1="824" x2="480" y2="846" marker-end="url(#ah)"/><text class="l" x="492" y="838">display-policy Q&amp;A</text>
+
+<rect class="n" x="270" y="852" width="420" height="44" rx="8" style="stroke:var(--success)"/>
+<rect x="626" y="844" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="654" y="856">OURS</text>
+<text class="t" x="480" y="870">AGDC service</text><text class="d" x="480" y="886">AppleGraphicsDeviceControl answers</text>
+
+<line class="al" x1="480" y1="900" x2="480" y2="922" marker-end="url(#ah)"/><text class="l" x="492" y="914">timing programming · scanout</text>
+
+<rect class="n" x="270" y="928" width="420" height="52" rx="8" style="stroke:var(--success)"/>
+<rect x="626" y="920" width="56" height="16" rx="8" class="fOurs"/><text class="tag" x="654" y="932">OURS</text>
+<text class="t" x="480" y="949">DCN 3.1.4 / 4.1 display engine</text><text class="d" x="480" y="967">HUBP fetch → OTG timing → DIO output</text>
+
+<line class="al" x1="480" y1="984" x2="480" y2="1006" marker-end="url(#ah)"/><text class="l" x="492" y="998">eDP / DP signal</text>
+
+<rect class="n" x="270" y="1012" width="420" height="44" rx="8" style="stroke:var(--c6)"/>
+<rect x="634" y="1004" width="48" height="16" rx="8" class="fHw"/><text class="tag" x="658" y="1016">HW</text>
+<text class="t" x="480" y="1030">Display</text><text class="d" x="480" y="1046">lit</text>
+
+<text class="d" x="480" y="1084">Green = written by us · Cyan = borrowed open source · Blue = Apple code reused as-is · Orange = runtime hook · Grey = untouched system · Purple = hardware</text>
+</svg>

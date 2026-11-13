@@ -1,0 +1,7 @@
+#!/bin/bash
+# fake ioreg: 原样输出现场 fixture（$FAKE_REGISTRY）。空/未设 → 无节点。
+D=${FAKE_DIR:-/dev/null}
+echo "FAKE ioreg $*" >>"$D/cmds.log" 2>/dev/null
+F=${FAKE_REGISTRY:-}
+if [ -n "$F" ] && [ -f "$F" ]; then cat "$F"; fi
+exit 0

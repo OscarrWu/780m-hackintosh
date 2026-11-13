@@ -1,0 +1,5 @@
+#!/bin/bash
+# fake launchctl: 记录调用，成功返回。
+D=${FAKE_DIR:-/dev/null}
+echo "FAKE launchctl $*" >>"$D/cmds.log" 2>/dev/null
+exit 0

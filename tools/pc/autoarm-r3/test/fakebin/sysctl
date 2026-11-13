@@ -1,0 +1,8 @@
+#!/bin/bash
+# fake sysctl: kern.boottime 由 FAKE_BOOTSEC 决定（用于验证同 boot 幂等）。
+D=${FAKE_DIR:-/dev/null}
+echo "FAKE sysctl $*" >>"$D/cmds.log" 2>/dev/null
+case "$1 $2" in
+    *kern.boottime*) echo "{ sec = ${FAKE_BOOTSEC:-1791470000}, usec = 0 } Thu Jan  1 00:00:00 1970" ;;
+    *) exit 0 ;;
+esac

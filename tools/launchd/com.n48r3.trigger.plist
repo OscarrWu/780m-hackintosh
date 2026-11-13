@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.n48r3.trigger</string>
+    <key>ProgramArguments</key>
+    <array><string>/bin/sh</string><string>/var/tmp/n48r3-trigger.sh</string></array>
+    <key>RunAtLoad</key><false/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>/var/tmp/n48r3-trigger.log</string>
+    <key>StandardErrorPath</key><string>/var/tmp/n48r3-trigger.log</string>
+</dict>
+</plist>

@@ -1,0 +1,101 @@
+# xlat11 skeleton register seed list (GFX10.3 source dialect).
+#
+# One gfx10.3 register NAME per line. This file is the xlat11 analogue of
+# xlat12's "which registers does Apple emit" inputs (mtl-regrecs.txt /
+# pm4census.txt), which are NOT available for RDNA3 yet (see
+# evidence/src/INDEX.md and docs/Cobalt64-RDNA3-阶段1-技术方案.md §4.9).
+#
+# Stage-1 scope: the core draw / shader path plus one deliberate example of
+# every Xlat11Class (identical, moved, field_repack, absent, legacy_vs,
+# reused) and the NGG trap register. Stage 3 expands this list to the full
+# Apple-emitted set captured on the target machine. Names MUST exist in
+# gfx103.json; the generator refuses (exit 2) otherwise.
+
+# --- shader (pixel stage) ------------------------------------------------
+SPI_SHADER_PGM_LO_PS
+SPI_SHADER_PGM_HI_PS
+SPI_SHADER_PGM_RSRC1_PS
+SPI_SHADER_PGM_RSRC2_PS
+SPI_SHADER_PGM_RSRC3_PS
+SPI_SHADER_PGM_RSRC4_PS
+SPI_SHADER_PGM_CHKSUM_PS
+SPI_SHADER_USER_DATA_PS_0
+
+# --- legacy vertex stage (GFX11 is NGG-only; these must be refused/dropped)
+SPI_SHADER_PGM_LO_VS
+SPI_SHADER_PGM_HI_VS
+SPI_SHADER_PGM_RSRC1_VS
+SPI_SHADER_PGM_RSRC3_VS
+SPI_SHADER_PGM_RSRC4_VS
+SPI_SHADER_LATE_ALLOC_VS
+SPI_SHADER_USER_DATA_VS_0
+
+# --- NGG switch ----------------------------------------------------------
+VGT_SHADER_STAGES_EN
+
+# --- depth / stencil -----------------------------------------------------
+DB_DEPTH_CONTROL
+DB_Z_INFO
+DB_STENCIL_INFO
+DB_SHADER_CONTROL
+DB_RENDER_CONTROL
+
+# --- colour buffer -------------------------------------------------------
+CB_COLOR_CONTROL
+CB_COLOR0_BASE
+CB_COLOR0_INFO
+CB_COLOR0_ATTRIB
+CB_COLOR0_ATTRIB2
+CB_COLOR0_ATTRIB3
+CB_BLEND0_CONTROL
+
+# --- DCC controls (reused at the same address by GFX11's FDCC registers) --
+CB_DCC_CONTROL
+CB_COLOR0_DCC_CONTROL
+CB_COLOR1_DCC_CONTROL
+CB_COLOR2_DCC_CONTROL
+CB_COLOR3_DCC_CONTROL
+CB_COLOR4_DCC_CONTROL
+CB_COLOR5_DCC_CONTROL
+CB_COLOR6_DCC_CONTROL
+CB_COLOR7_DCC_CONTROL
+
+# --- scissor -------------------------------------------------------------
+PA_SC_SCREEN_SCISSOR_TL
+PA_SC_SCREEN_SCISSOR_BR
+PA_SC_WINDOW_SCISSOR_TL
+PA_SC_WINDOW_SCISSOR_BR
+PA_SC_GENERIC_SCISSOR_TL
+PA_SC_GENERIC_SCISSOR_BR
+PA_SC_VPORT_SCISSOR_0_TL
+PA_SC_VPORT_SCISSOR_0_BR
+PA_SC_CLIPRECT_RULE
+
+# --- rasteriser / setup --------------------------------------------------
+PA_CL_CLIP_CNTL
+PA_SU_SC_MODE_CNTL
+PA_CL_VTE_CNTL
+PA_SC_MODE_CNTL_0
+PA_SC_MODE_CNTL_1
+
+# --- shader interpolation / VS output ------------------------------------
+SPI_PS_INPUT_CNTL_0
+SPI_PS_INPUT_ENA
+SPI_PS_INPUT_ADDR
+SPI_VS_OUT_CONFIG
+
+# --- primitive assembly --------------------------------------------------
+VGT_PRIMITIVE_TYPE
+VGT_GS_OUT_PRIM_TYPE
+VGT_GS_MAX_VERT_OUT
+
+# --- streamout (absent on GFX11) -----------------------------------------
+VGT_STRMOUT_CONFIG
+VGT_STRMOUT_BUFFER_CONFIG
+
+# --- geometry engine -----------------------------------------------------
+GE_CNTL
+
+# --- moved with identical fields (exercise Xlat11Class MOVED) ------------
+COMPUTE_RELAUNCH
+COMPUTE_WAVE_RESTORE_ADDR_HI
