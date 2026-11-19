@@ -24,6 +24,69 @@
 namespace amdgpu {
 
 // =========================================================================
+// 写守卫全链预算契约 — 数量编译期已知（boot5 根因修复，实施蓝本 W-fixplan-2）
+// =========================================================================
+// 设计意图：每张 IP 声明表的行数是编译期常量（amd/*.cpp 内由 sizeof 反证），
+// 全链登记量的"布局+行"预算集中于此作为唯一数字来源：R3_WG_GRANT_MAX 必须
+// 不小于全链总预算，否则编译期断言直接失败——而不是像 boot5 那样真机运行到
+// S7 第 4 行才表满返回 -2（被折叠成 pre:register）。每一常量由 amd/*.cpp 的
+// 反证 static_assert 机械核对（删本地 sizeof 常量处），总和与 R3_WG_GRANT_MAX
+// 在此比较。IH 的输入行（9 行）只参与 expect 集（<= R3_WG_EXPECT_MAX），
+// 不参与 grant 预算，故保留本地（ih_v6_0.cpp），未在此重复。
+
+// ---- 阶段2（prep 生产注册，S2..S11）常量 ----
+constexpr uint32_t kPspLayoutCount   = 5u;   // psp_v13_0.cpp kPspLayouts[]（5 项 layout）
+constexpr uint32_t kPspRowCount      = 5u;   // psp_v13_0.cpp kPspRows[]（MP0 C2PMSG 5 行）
+constexpr uint32_t kSmuRowCount      = 3u;   // smu_v13_0.cpp kSmuRows[]（MP1 C2PMSG 3 行）
+constexpr uint32_t kSdmaLayoutCount  = 1u;   // sdma_v6_0.cpp layout:sdma 计 1 条
+constexpr uint32_t kSdmaRowCount     = 17u;  // sdma_v6_0.cpp kSdmaRows[]（17 行）
+constexpr uint32_t kMesLayoutCount   = 1u;   // mes_v11_0.cpp layout:mes 计 1 条
+constexpr uint32_t kMesRowCount      = 74u;  // mes_v11_0.cpp kMesRows[]（52 hub + 10 S0-S5 + 12 HQD）
+constexpr uint32_t kMesDoorbellCount = 4u;   // mes_v11_0.cpp kMesDoorbells[]（kiq+sch+cmp+gfx）
+constexpr uint32_t kMesQueueRowCount = 8u;   // mes_v11_0.cpp kMesQueueRows[]（2 dbrange+GRBM+5 S11）
+
+// ---- 阶段2之后（S6..S11 增量）常量 ----
+constexpr uint32_t kHdpGrantCount           = 1u;   // stages.cpp reg:hdp-flush 共享窗口 1 条
+constexpr uint32_t kGmcSeqLayoutCount       = 6u;   // gmc_v11_0.cpp S6 uma 6 条 layout
+constexpr uint32_t kGartRowCount            = 21u;  // gmc_v11_0.cpp kGartRows[]（含 2 条 inv-arm）
+constexpr uint32_t kVmid8FirstInvalidateRow = 15u;  // S9 只注册前 15 行（15..17 由 S7 已注册）
+constexpr uint32_t kVmid8RowCount           = 18u;  // 声明全集（expect 用；15..17 非 S9 注册）
+constexpr uint32_t kMesQueueLayoutCount     = 1u;   // mes S11 test_buf layout 计 1 条
+
+// ---- 派生合计（与实施蓝本附录 A 账目一一对应） ----
+constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
+    kPspLayoutCount + kSdmaLayoutCount + kMesLayoutCount +
+    kGmcSeqLayoutCount + kMesQueueLayoutCount;                       // = 14
+constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
+    kPspRowCount + kSmuRowCount + kSdmaRowCount + kMesRowCount +
+    kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
+    kGartRowCount + kVmid8FirstInvalidateRow;                        // = 148
+constexpr uint32_t R3_WG_BUDGET_STAGE2 =
+    kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
+    kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
+    kMesQueueRowCount;                                               // = 118
+constexpr uint32_t R3_WG_BUDGET_TOTAL =
+    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 162
+
+static_assert(R3_WG_BUDGET_STAGE2 == 118u, "阶段2 生产注册预算应为 118 项");
+static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
+static_assert(R3_WG_BUDGET_REG_TOTAL == 148u, "全链 reg 预算应为 148 项");
+static_assert(R3_WG_BUDGET_TOTAL == 162u, "全链写守卫预算应为 162 项");
+static_assert(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
+              "写守卫 grant 容量小于全链预算：请同步 R3_WG_GRANT_MAX");
+
+// expect 集容量契约：单个 IP 的期望集合不得超过 R3_WG_EXPECT_MAX(80)。
+static_assert(kMesRowCount <= R3_WG_EXPECT_MAX, "MES 声明行数超过 R3_WG_EXPECT_MAX");
+static_assert(kMesDoorbellCount <= R3_WG_EXPECT_MAX, "MES 门铃数超过 R3_WG_EXPECT_MAX");
+static_assert(kMesQueueRowCount <= R3_WG_EXPECT_MAX, "MES 队列行数超过 R3_WG_EXPECT_MAX");
+static_assert(kGartRowCount <= R3_WG_EXPECT_MAX, "GART 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kVmid8RowCount <= R3_WG_EXPECT_MAX, "VMID8 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kPspRowCount <= R3_WG_EXPECT_MAX, "PSP 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kPspLayoutCount <= R3_WG_EXPECT_MAX, "PSP layout 数超过 R3_WG_EXPECT_MAX");
+static_assert(kSmuRowCount <= R3_WG_EXPECT_MAX, "SMU 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kSdmaRowCount <= R3_WG_EXPECT_MAX, "SDMA 行数超过 R3_WG_EXPECT_MAX");
+
+// =========================================================================
 // GFX 11.0.1 — substep entry (read-only)
 // =========================================================================
 R3SubstepResult gfx_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
@@ -55,6 +118,8 @@ constexpr int      kGfx11CpStatBase        = 0;
 R3SubstepResult mes_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
 const R3WriteRowReg*  getMesRows(void);
 uint32_t              getMesRowCount(void);
+const R3WriteRowReg*  getMesQueueRows(void);
+uint32_t              getMesQueueRowCount(void);
 const char*           getMesLayoutTag(void);
 const R3WriteRowAbs*  getMesDoorbells(void);
 uint32_t              getMesDoorbellCount(void);
@@ -119,5 +184,27 @@ constexpr uint32_t kRegSdma0Queue0RbWptr           = 0x0085;
 constexpr uint32_t kRegSdma0F32Cntl                = 0x589a;
 constexpr uint32_t kRbCntlRbEnableMask             = 0x00000001u;
 constexpr uint32_t kF32CntlHaltMask                = 0x00000001u;
+// =========================================================================
+// IH 6.0 — substep entry (doorbell + interrupt handler init)
+// =========================================================================
+R3SubstepResult ih_v6_0_substep(const R3Io *io, const R3SubstepEnv *env);
+
+// =========================================================================
+// GMC 11.0 — substep entries (uma/gart/gpuvm0/vmid8)
+// =========================================================================
+R3SubstepResult uma_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
+R3SubstepResult gart_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
+R3SubstepResult gpuvm0_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
+R3SubstepResult vmid8_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
+
+// =========================================================================
+// MES 11.0 queue — substep entry (queue setup portion, split from mes_v11_0)
+// =========================================================================
+R3SubstepResult mes_queue_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
+
+// =========================================================================
+// Compute 11.0 — substep entry (S13 compute magic)
+// =========================================================================
+R3SubstepResult compute_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
 
 } // namespace amdgpu

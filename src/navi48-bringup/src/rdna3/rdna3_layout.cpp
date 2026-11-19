@@ -7,7 +7,11 @@
  *
  * Placement order: C1 fw_buf, C2 PSP ring/cmd/fence directly after it, C4 TMR (preferred
  * slot, else the lowest aligned hole, else the F6 fallback above 0x10000000), then C5
- * SDMA/MES at their fixed interval unless the TMR occupies it (then L3 moves them up). Every
+ * SDMA/MES at their fixed interval unless the TMR occupies it (then L3 moves them up),
+ * then D4-D8 (CSIB, query fence, read-only fence page, test buffer, IH ring + rptr
+ * writeback) filling the head of the old C6 margin in fixed order. D1-D3 are system-memory
+ * pools: the plan only records their size/owner in sysmem_grants and the runtime stages
+ * back-fill start/end. Every
  * hole search only consults the grants already placed, so the result cannot contradict L5;
  * each plan is re-checked with r3_layout_validate() before it is published.
  *
@@ -34,6 +38,16 @@ constexpr char kTagFence[] = "psp_fence";
 constexpr char kTagTmr[] = "tmr";
 constexpr char kTagSdma[] = "sdma";
 constexpr char kTagMes[] = "mes";
+constexpr char kTagCsib[] = "csib";
+constexpr char kTagQueryFence[] = "query_fence";
+constexpr char kTagFenceRo[] = "fence_ro";
+constexpr char kTagTestBuf[] = "test_buf";
+constexpr char kTagIhRing[] = "ih_ring";
+constexpr char kTagIhRptrWb[] = "ih_rptr_wb";
+/* D1-D3 sysmem pool names (no carveout interval; back-filled by the runtime stages). */
+constexpr char kTagGartTable[] = "gart_table";
+constexpr char kTagCtx0RootPool[] = "ctx0_root_pool";
+constexpr char kTagVmid8RootPool[] = "vmid8_root_pool";
 
 /* Fail reasons (static; the caller logs them verbatim, E1). */
 constexpr const char *kFailGop = "gop-range-unconfirmed";
@@ -114,7 +128,7 @@ bool place_hole(const Placed &p, uint64_t from, uint64_t size, uint64_t limit, u
 
 /* One grant appended to the plan under construction. */
 bool add_grant(R3LayoutPlan *p, uint32_t *n, const char *tag, uint64_t start, uint64_t end,
-               R3Owner owner, bool needs_cpu)
+               R3Owner owner, bool needs_cpu, R3B2Class cls = R3B2Class::DataMove)
 {
     if (*n >= R3_LAYOUT_MAX_GRANTS || end <= start)
         return false;
@@ -125,7 +139,7 @@ bool add_grant(R3LayoutPlan *p, uint32_t *n, const char *tag, uint64_t start, ui
     g.end = end;
     g.size = end - start;
     g.owner = owner;
-    g.cls = R3B2Class::DataMove; /* every carveout allocation is ② data movement */
+    g.cls = cls; /* default ② data movement; D4 CSIB is ④, D6 fence page is ⑤ */
     g.needs_cpu = needs_cpu;
     (*n)++;
     return true;
@@ -274,6 +288,65 @@ int r3_layout_compute(const R3LayoutInputs *in, R3LayoutPlan *out)
     if (!add_grant(out, &n, kTagSdma, sdma_start, sdma_start + R3_C5_SIZE, R3Owner::Sdma, true) ||
         !add_grant(out, &n, kTagMes, mes_start, mes_start + R3_C5_SIZE, R3Owner::Mes, true))
         return fail(out, kFailRoom);
+    /* D4-D8 (tech plan §3): fixed-order placement in the head of the old C6 margin, right
+     * after the C5 MES half. Starts are page aligned; the IH ring is 64 KiB aligned (the
+     * Linux IH ring base alignment). The hole search sees every grant placed so far, so
+     * L5 holds by construction; running past the ceiling fails closed. */
+    struct DRegion {
+        const char *tag;
+        uint64_t size;
+        uint64_t align;
+        R3Owner owner;
+        R3B2Class cls;
+        bool needs_cpu;
+    };
+    constexpr DRegion kDRegions[] = {
+        {kTagCsib, R3_D4_CSIB_SIZE, kGrantAlign, R3Owner::Gfx, R3B2Class::StateConfig, true},
+        {kTagQueryFence, R3_D5_QFENCE_SIZE, kGrantAlign, R3Owner::Mes, R3B2Class::DataMove,
+         true},
+        {kTagFenceRo, R3_D6_FENCE_RO_SIZE, kGrantAlign, R3Owner::Abi, R3B2Class::ReadOnly,
+         false},
+        {kTagTestBuf, R3_D7_TEST_BUF_SIZE, kGrantAlign, R3Owner::Abi, R3B2Class::DataMove,
+         true},
+        {kTagIhRing, R3_D8_IH_RING_SIZE, R3_D8_IH_RING_SIZE, R3Owner::Ih, R3B2Class::DataMove,
+         true},
+        {kTagIhRptrWb, R3_D8_IH_RPTR_SIZE, kGrantAlign, R3Owner::Ih, R3B2Class::DataMove,
+         true},
+    };
+    uint64_t d_cursor = mes_start + R3_C5_SIZE;
+    for (const DRegion &d : kDRegions) {
+        uint64_t d_start = 0;
+        if (!place_hole_aligned(placed, d_cursor, d.size, d.align, out->limit, &d_start) ||
+            !add_grant(out, &n, d.tag, d_start, d_start + d.size, d.owner, d.needs_cpu, d.cls))
+            return fail(out, kFailRoom);
+        placed.n = n;
+        d_cursor = d_start + d.size;
+    }
+
+    /* D1-D3 (tech plan §3): system-memory pools outside the carveout. The plan records
+     * size and owner only; the runtime stages allocate the backing memory and back-fill
+     * start/end (a zeroed start/end means "not yet back-filled"). */
+    struct DSysmem {
+        const char *tag;
+        uint64_t size;
+        R3Owner owner;
+    };
+    constexpr DSysmem kSysmem[] = {
+        {kTagGartTable, 4ull * R3_L3_MIB, R3Owner::Gmc},
+        {kTagCtx0RootPool, 4ull * R3_L3_MIB + 4ull * 1024ull, R3Owner::Gfx},
+        {kTagVmid8RootPool, 4ull * R3_L3_MIB + 4ull * 1024ull, R3Owner::Gfx},
+    };
+    static_assert(sizeof(kSysmem) / sizeof(kSysmem[0]) == R3_LAYOUT_SYSMEM_MAX,
+                  "plan records exactly the D1-D3 pools");
+    for (const DSysmem &s : kSysmem) {
+        R3SysmemGrant &g = out->sysmem_grants[out->sysmem_grant_count++];
+        strncpy(g.tag, s.tag, sizeof(g.tag) - 1);
+        g.tag[sizeof(g.tag) - 1] = '\0';
+        g.owner = s.owner;
+        g.size = s.size;
+        g.start = 0;
+        g.end = 0;
+    }
     out->grant_count = n; /* lookups below see the full set */
 
     /* L2/L3 derived TMR fields: the PSP descriptor needs all three address forms. */
@@ -316,12 +389,12 @@ bool r3_layout_validate(const R3LayoutPlan *plan, const char **why)
                 *why = "tag-empty";
             return false;
         }
-        if (static_cast<unsigned>(g.owner) > static_cast<unsigned>(R3Owner::Mes)) {
+        if (static_cast<unsigned>(g.owner) > static_cast<unsigned>(R3Owner::Abi)) {
             if (why)
                 *why = "owner-out-of-range";
             return false;
         }
-        if (static_cast<unsigned>(g.cls) > static_cast<unsigned>(R3B2Class::StateConfig)) {
+        if (static_cast<unsigned>(g.cls) > static_cast<unsigned>(R3B2Class::ReadOnly)) {
             if (why)
                 *why = "class-out-of-range";
             return false;
@@ -359,6 +432,47 @@ bool r3_layout_validate(const R3LayoutPlan *plan, const char **why)
             const uint64_t i_end = g.end;
             const uint64_t j_end = o.end;
             if (g.start < j_end && o.start < i_end) {
+                if (why)
+                    *why = "overlap";
+                return false;
+            }
+        }
+    }
+    /* D1-D3 sysmem entries: tag/owner always, geometry only once back-filled. */
+    if (plan->sysmem_grant_count > 3) {
+        if (why)
+            *why = "sysmem-count";
+        return false;
+    }
+    for (uint32_t i = 0; i < plan->sysmem_grant_count; i++) {
+        const R3SysmemGrant &s = plan->sysmem_grants[i];
+        if (s.tag[0] == '\0') {
+            if (why)
+                *why = "tag-empty";
+            return false;
+        }
+        if (static_cast<unsigned>(s.owner) > static_cast<unsigned>(R3Owner::Abi)) {
+            if (why)
+                *why = "owner-out-of-range";
+            return false;
+        }
+        if (s.start == 0 && s.end == 0)
+            continue; /* not yet back-filled by the runtime stage */
+        if (s.end <= s.start || s.size != s.end - s.start) {
+            if (why)
+                *why = "sysmem-extent";
+            return false;
+        }
+        if (s.start % kGrantAlign != 0) {
+            if (why)
+                *why = "align-sysmem";
+            return false;
+        }
+        for (uint32_t j = i + 1; j < plan->sysmem_grant_count; j++) {
+            const R3SysmemGrant &o = plan->sysmem_grants[j];
+            if (o.start == 0 && o.end == 0)
+                continue;
+            if (s.start < o.end && o.start < s.end) {
                 if (why)
                     *why = "overlap";
                 return false;
@@ -408,6 +522,8 @@ const char *r3_b2_class_name(R3B2Class cls)
         return "protocol";
     case R3B2Class::StateConfig:
         return "state-config";
+    case R3B2Class::ReadOnly:
+        return "read-only";
     }
     return "unknown";
 }
@@ -425,6 +541,12 @@ const char *r3_owner_name(R3Owner owner)
         return "sdma";
     case R3Owner::Mes:
         return "mes";
+    case R3Owner::Gmc:
+        return "gmc";
+    case R3Owner::Ih:
+        return "ih";
+    case R3Owner::Abi:
+        return "abi";
     }
     return "unknown";
 }

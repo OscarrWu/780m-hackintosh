@@ -35,10 +35,15 @@
 #include <fcntl.h>
 #include <time.h>
 #include "../../src/navi48-bringup/src/Navi48UserClientABI.h"
+#include "../../src/navi48-bringup/src/Navi48R3ABI.h"
 
-#define N48R3_SERVICE_NAME "NaviR3Bringup"
-#define N48R3_SEL_INFO     0u
-#define N48R3_SEL_TRIGGER  1u
+#define N48R3_SERVICE_NAME N48R3_UC_SERVICE_NAME
+#define N48R3_SEL_INFO     ((uint32_t)kN48R3SelInfo)
+#define N48R3_SEL_TRIGGER  ((uint32_t)kN48R3SelTrigger)
+#define N48R3_SEL_BO_ALLOC   ((uint32_t)kN48R3SelBoAlloc)
+#define N48R3_SEL_BO_FREE    ((uint32_t)kN48R3SelBoFree)
+#define N48R3_SEL_SUBMIT     ((uint32_t)kN48R3SelSubmit)
+#define N48R3_SEL_FENCE_READ ((uint32_t)kN48R3SelFenceRead)
 #define N48R3_INFO_MAX     16384u
 /* Tool version, printed by the `version` sub-command (ABI self-identification). */
 #define N48R3_TOOL_VERSION "1.0.0"
@@ -61,6 +66,7 @@ enum {
     N48R3_EXIT_CALL       = 3,
     N48R3_EXIT_NOT_ROOT   = 4,
     N48R3_EXIT_USAGE      = 5,
+    N48R3_EXIT_TIMEOUT    = 6,
 };
 
 #ifdef N48R3_HOST_TEST
@@ -94,6 +100,11 @@ enum n48r3_cmd {
     N48R3_CMD_LOGSTREAM,
     N48R3_CMD_LOGRESET,
     N48R3_CMD_VERSION,
+    N48R3_CMD_MEM,
+    N48R3_CMD_GART,
+    N48R3_CMD_DOORBELL,
+    N48R3_CMD_SUBMIT,
+    N48R3_CMD_COMPUTE,
     N48R3_CMD_UNKNOWN,
 };
 
@@ -110,6 +121,11 @@ static const struct n48r3_cmd_entry n48r3_cmd_table[] = {
     { N48R3_CMD_LOGSTREAM, "logstream", "stream the log ring to a file (logstream <path> [interval_ms] [max_s] [stopfile])" },
     { N48R3_CMD_LOGRESET, "logreset", "clear the driver log buffer" },
     { N48R3_CMD_VERSION, "version", "print the tool version and the expected selector set" },
+    { N48R3_CMD_MEM, "mem", "allocate a BO via ABI, report GPU VA, free it" },
+    { N48R3_CMD_GART, "gart", "allocate BO and verify GPUVA mapping via ABI" },
+    { N48R3_CMD_DOORBELL, "doorbell", "submit a minimal IB (RELEASE_MEM only) via ABI and wait for fence" },
+    { N48R3_CMD_SUBMIT, "submit", "submit a user IB (via ABI) and wait for fence" },
+    { N48R3_CMD_COMPUTE, "compute", "exercise the compute queue: alloc BO, submit RELEASE_MEM, read fence" },
 };
 
 static void n48r3_usage(FILE *out) {
@@ -223,6 +239,56 @@ static int n48r3_emit_version(FILE *out) {
                 kNavi48SelReadLog, kNavi48SelLogReset, kNavi48SelLogConsume) < 0)
         return -1;
     return fflush(out) == 0 ? 0 : -1;
+}
+
+/* ---- stage-3 ABI pure helpers (compiled and tested under N48R3_HOST_TEST too) ----
+ * These depend only on Navi48R3ABI.h numeric contracts and plain string parsing,
+ * so the host harness can exercise them without IOKit. */
+
+/* Magic this tool programs into a BO during the `compute` round-trip. */
+#define N48R3_COMPUTE_MAGIC 0xCAFEDEADu
+
+/* Parse "fb_mc_base=0x..." out of the survey text served by selector 0.
+ * Returns 1 on success and sets *out; 0 if the key is absent. */
+static int n48r3_parse_fb_mc_base(const char *txt, size_t len, uint64_t *out) {
+    static const char key[] = "fb_mc_base=0x";
+    const size_t klen = sizeof key - 1;
+    size_t i;
+    if (!txt || !out || len < klen) return 0;
+    for (i = 0; i + klen <= len; i++) {
+        uint64_t v = 0;
+        size_t j = i + klen, n = 0;
+        if (memcmp(txt + i, key, klen) != 0) continue;
+        while (j < len && n < 16) {
+            const char c = txt[j];
+            unsigned d;
+            if (c >= '0' && c <= '9') d = (unsigned)(c - '0');
+            else if (c >= 'a' && c <= 'f') d = (unsigned)(c - 'a') + 10u;
+            else if (c >= 'A' && c <= 'F') d = (unsigned)(c - 'A') + 10u;
+            else break;
+            v = (v << 4) | d;
+            n++;
+            j++;
+        }
+        if (n == 0) return 0;
+        *out = v;
+        return 1;
+    }
+    return 0;
+}
+
+/* Fill dwords with the deterministic pattern seed ^ (i * 0x9E3779B1). */
+static void n48r3_fill_pattern(volatile uint32_t *p, uint32_t dwords, uint32_t seed) {
+    uint32_t i;
+    for (i = 0; i < dwords; i++) p[i] = seed ^ (i * 0x9E3779B1u);
+}
+
+/* Verify read-back dwords against the pattern. Returns 0 on match. */
+static int n48r3_check_pattern(const volatile uint32_t *p, uint32_t dwords, uint32_t seed) {
+    uint32_t i;
+    for (i = 0; i < dwords; i++)
+        if (p[i] != (seed ^ (i * 0x9E3779B1u))) return 1;
+    return 0;
 }
 
 #ifndef N48R3_HOST_TEST
@@ -532,6 +598,414 @@ static int cmd_logreset(int argc) {
     return N48R3_EXIT_OK;
 }
 
+/* ---- ABI helper: allocate a BO of given size/domain, return gpu_va (0 on failure).
+ * The third scalar output is the BO handle used as IOConnectMapMemory64 memoryType. ---- */
+static uint64_t n48r3_abi_alloc(io_connect_t conn, uint64_t size, uint32_t domain,
+                                uint64_t *handle) {
+    const uint64_t inp[2] = {size, domain};
+    uint32_t out_cnt = 3;
+    uint64_t out[3] = {0, 0, 0};
+    kern_return_t kr = IOConnectCallMethod(conn, N48R3_SEL_BO_ALLOC,
+                                           inp, 2, NULL, 0,
+                                           out, &out_cnt, NULL, NULL);
+    if (kr != KERN_SUCCESS || out_cnt < 3) return 0ull;
+    if (handle) *handle = out[2];
+    return n48r3_va_from_scalars(out[0], out[1]);
+}
+
+/* ---- ABI helper: free BO ---- */
+static kern_return_t n48r3_abi_free(io_connect_t conn, uint64_t gpu_va) {
+    const uint64_t inp[2] = {gpu_va & 0xFFFFFFFFull, gpu_va >> 32};
+    return IOConnectCallMethod(conn, N48R3_SEL_BO_FREE,
+                               inp, 2, NULL, 0, NULL, NULL, NULL, NULL);
+}
+
+/* ---- ABI helper: submit an IB descriptor array (1..N48R3_CS_IB_MAX).
+ * selector 4 takes a N48R3CsIn header followed by num_ibs N48R3CsIb records
+ * as structureInput; the kernel only puts INDIRECT_BUFFER/RELEASE_MEM on the
+ * ring, and the IB bytes stay in the user-mapped BO. ---- */
+static uint64_t n48r3_abi_submit(io_connect_t conn, const N48R3CsIb *ibs,
+                                 uint32_t num_ibs) {
+    size_t bytes;
+    uint8_t *in;
+    N48R3CsIn h;
+    uint32_t out_cnt = 2;
+    uint64_t out[2] = {0, 0};
+    kern_return_t kr;
+    if (!ibs || num_ibs == 0 || num_ibs > N48R3_CS_IB_MAX) return 0ull;
+    bytes = sizeof h + (size_t)num_ibs * sizeof *ibs;
+    in = (uint8_t *)malloc(bytes);
+    if (!in) return 0ull;
+    h.abi_version = N48R3_UC_ABI_VERSION;
+    h.num_ibs = num_ibs;
+    h.flags = 0;
+    h.reserved = 0;
+    memcpy(in, &h, sizeof h);
+    memcpy(in + sizeof h, ibs, (size_t)num_ibs * sizeof *ibs);
+    kr = IOConnectCallMethod(conn, N48R3_SEL_SUBMIT,
+                             NULL, 0, in, bytes,
+                             out, &out_cnt, NULL, NULL);
+    free(in);
+    if (kr != KERN_SUCCESS || out_cnt < 2) return 0ull;
+    return n48r3_va_from_scalars(out[0], out[1]);
+}
+
+/* ---- ABI helper: wait for fence (returns observed seq; timed_out if non-NULL) ---- */
+static uint64_t n48r3_abi_fence_wait(io_connect_t conn, uint64_t expected_seq,
+                                     uint32_t timeout_us, bool *timed_out) {
+    const uint64_t inp[2] = {expected_seq, timeout_us};
+    uint32_t out_cnt = 3;
+    uint64_t out[3] = {0, 0, 0};
+    kern_return_t kr = IOConnectCallMethod(conn, N48R3_SEL_FENCE_READ,
+                                           inp, 2, NULL, 0,
+                                           out, &out_cnt, NULL, NULL);
+    if (kr != KERN_SUCCESS || out_cnt < 2) return 0ull;
+    if (timed_out) *timed_out = (out_cnt >= 3 && out[2] != 0);
+    return n48r3_va_from_scalars(out[0], out[1]);
+}
+
+/* ---- ABI helper: map a BO (memoryType = BO handle) or the D6 fence page. ----
+ * The IOUserClient's clientMemoryForType turns the type into a BAR0/sysmem
+ * physical slice; the tool then reads/writes the mapped CPU window directly. */
+static kern_return_t n48r3_abi_map(io_connect_t conn, uint32_t memory_type,
+                                   mach_vm_address_t *addr, mach_vm_size_t *size) {
+    IOOptionBits opt = 0;
+    *size = 0;
+    *addr = 0;
+    return IOConnectMapMemory64(conn, memory_type, mach_task_self(),
+                                addr, size, opt);
+}
+
+static kern_return_t n48r3_abi_unmap(io_connect_t conn, uint32_t memory_type,
+                                     mach_vm_address_t addr) {
+    return IOConnectUnmapMemory64(conn, memory_type, mach_task_self(), addr);
+}
+
+/* ---- ABI helper: read the selector-0 survey text into buf. ---- */
+static kern_return_t n48r3_abi_read_info(io_connect_t conn, char *buf, size_t cap,
+                                         size_t *done_out) {
+    uint64_t total = 0;
+    uint32_t offset = 0;
+    size_t done = 0;
+    *done_out = 0;
+    for (;;) {
+        uint32_t out_n = 1;
+        size_t sz = NAVI48_UC_MAX_XFER;
+        uint64_t in = offset;
+        kern_return_t kr;
+        if (sz > cap - done) sz = cap - done;
+        kr = IOConnectCallMethod(conn, N48R3_SEL_INFO, &in, 1, NULL, 0,
+                                 &total, &out_n, buf + done, &sz);
+        if (kr != KERN_SUCCESS) return kr;
+        if (sz == 0) break;
+        done += sz;
+        offset = (uint32_t)done;
+        if (done >= total || done >= cap) break;
+    }
+    if (done < cap) buf[done] = '\0';
+    else buf[cap - 1] = '\0';
+    *done_out = done;
+    return KERN_SUCCESS;
+}
+
+/* Allocate a BO, map its memoryType, and report the common failure path. */
+static int n48r3_bo_map(io_connect_t conn, const char *cmd, uint64_t size,
+                        uint32_t domain, uint64_t *gva, uint64_t *handle,
+                        volatile uint32_t **cpu) {
+    mach_vm_address_t addr = 0;
+    mach_vm_size_t mapped = 0;
+    kern_return_t kr;
+    *gva = n48r3_abi_alloc(conn, size, domain, handle);
+    if (*gva == 0 || *handle == 0 || *handle > N48R3_BO_MAX) {
+        fprintf(stderr, "n48r3: %s: BOAlloc failed\n", cmd);
+        return N48R3_EXIT_CALL;
+    }
+    kr = n48r3_abi_map(conn, (uint32_t)*handle, &addr, &mapped);
+    if (kr != KERN_SUCCESS || addr == 0 || mapped < size) {
+        fprintf(stderr, "n48r3: %s: map(handle=%llu) failed: %s (0x%x)\n",
+                cmd, (unsigned long long)*handle, n48r3_kr_text(kr), kr);
+        n48r3_abi_free(conn, *gva);
+        return N48R3_EXIT_CALL;
+    }
+    *cpu = (volatile uint32_t *)addr;
+    return N48R3_EXIT_OK;
+}
+
+static int n48r3_bo_release(io_connect_t conn, uint32_t memory_type,
+                            mach_vm_address_t addr, uint64_t gva) {
+    n48r3_abi_unmap(conn, memory_type, addr);
+    return n48r3_abi_free(conn, gva) == KERN_SUCCESS ? N48R3_EXIT_OK : N48R3_EXIT_CALL;
+}
+
+/* Parse a byte size for mem/gart; shared command-line contract. */
+static int n48r3_cmd_size(int argc, char **argv, const char *cmd, uint64_t *size) {
+    *size = 4096ull;
+    if (argc > 2) *size = strtoull(argv[2], NULL, 0);
+    if (*size == 0 || *size > 0x100000ull) {
+        fprintf(stderr, "n48r3: %s: size must be 1..1048576\n", cmd);
+        return N48R3_EXIT_USAGE;
+    }
+    return N48R3_EXIT_OK;
+}
+
+/* ---- mem: UMA BO allocation, mapped write/read-back, carveout comparison ---- */
+static int cmd_mem(int argc, char **argv) {
+    uint64_t size = 0, gva = 0, handle = 0, fb_mc = 0;
+    uint32_t dwords;
+    volatile uint32_t *cpu = NULL;
+    io_connect_t conn;
+    char info[N48R3_INFO_MAX];
+    size_t info_len = 0;
+    int rc = n48r3_cmd_size(argc, argv, "mem", &size);
+    if (rc != N48R3_EXIT_OK) return rc;
+    rc = n48r3_open_connection(&conn);
+    if (rc != N48R3_EXIT_OK) return rc;
+
+    rc = n48r3_bo_map(conn, "mem", size, (uint32_t)kN48R3DomainUMA,
+                      &gva, &handle, &cpu);
+    if (rc != N48R3_EXIT_OK) { IOServiceClose(conn); return rc; }
+    dwords = (uint32_t)(size / 4u);
+    n48r3_fill_pattern(cpu, dwords, 0xA5A55A5Au);
+    __sync_synchronize();
+    if (n48r3_check_pattern(cpu, dwords, 0xA5A55A5Au) != 0) {
+        fprintf(stderr, "n48r3: mem: FAIL pattern read-back mismatch\n");
+        rc = N48R3_EXIT_CALL;
+        goto out;
+    }
+    if (n48r3_abi_read_info(conn, info, sizeof info, &info_len) == KERN_SUCCESS &&
+        n48r3_parse_fb_mc_base(info, info_len, &fb_mc)) {
+        printf("n48r3: mem: PASS gpu_va=0x%016llx size=%llu handle=%llu "
+               "fb_mc_base=0x%016llx carveout_off=0x%016llx\n",
+               (unsigned long long)gva, (unsigned long long)size,
+               (unsigned long long)handle, (unsigned long long)fb_mc,
+               (unsigned long long)n48r3_carveout_offset(fb_mc, gva, size));
+    } else {
+        printf("n48r3: mem: PASS gpu_va=0x%016llx size=%llu handle=%llu "
+               "pattern=readback-ok carveout_off=unavailable(fb_mc_base)\n",
+               (unsigned long long)gva, (unsigned long long)size,
+               (unsigned long long)handle);
+    }
+
+out:
+    if (cpu) {
+        int release = n48r3_bo_release(conn, (uint32_t)handle,
+                                       (mach_vm_address_t)cpu, gva);
+        if (rc == N48R3_EXIT_OK) rc = release;
+    }
+    IOServiceClose(conn);
+    return rc;
+}
+
+/* ---- gart: GTT BO allocation, GART PTE evidence via mapped sysmem window ---- */
+static int cmd_gart(int argc, char **argv) {
+    uint64_t size = 0, gva = 0, handle = 0;
+    uint32_t dwords;
+    volatile uint32_t *cpu = NULL;
+    io_connect_t conn;
+    int rc = n48r3_cmd_size(argc, argv, "gart", &size);
+    if (rc != N48R3_EXIT_OK) return rc;
+    rc = n48r3_open_connection(&conn);
+    if (rc != N48R3_EXIT_OK) return rc;
+
+    rc = n48r3_bo_map(conn, "gart", size, (uint32_t)kN48R3DomainGTT,
+                      &gva, &handle, &cpu);
+    if (rc != N48R3_EXIT_OK) { IOServiceClose(conn); return rc; }
+    dwords = (uint32_t)(size / 4u);
+    n48r3_fill_pattern(cpu, dwords, 0x47415254u); /* "GART" */
+    __sync_synchronize();
+    if (n48r3_check_pattern(cpu, dwords, 0x47415254u) != 0) {
+        fprintf(stderr, "n48r3: gart: FAIL sysmem mapped window mismatch\n");
+        rc = N48R3_EXIT_CALL;
+    } else {
+        /* GTT BO gpu_va is a GART VA, not an MC aperture address. */
+        printf("n48r3: gart: PASS gart_va=0x%016llx size=%llu handle=%llu "
+               "sysmem_window=write-readback-ok gart_index=0x%llx "
+               "ptes=%u (CP consumption deferred to stage 4/5)\n",
+               (unsigned long long)gva, (unsigned long long)size,
+               (unsigned long long)handle,
+               (unsigned long long)((gva >> 12) & 0x7ffffull),
+               (unsigned)((size + 4095ull) >> 12));
+    }
+    {
+        int release = n48r3_bo_release(conn, (uint32_t)handle,
+                                       (mach_vm_address_t)cpu, gva);
+        if (rc == N48R3_EXIT_OK) rc = release;
+    }
+    IOServiceClose(conn);
+    return rc;
+}
+
+/* Run one mapped UMA BO through selector 4 + selector 5; shared by doorbell
+ * and submit. `compute` builds its own WRITE_DATA IB. */
+static int n48r3_submit_roundtrip(io_connect_t conn, const char *cmd,
+                                  volatile uint32_t *cpu, uint64_t gva,
+                                  uint32_t ib_dwords, uint32_t ip_type) {
+    N48R3CsIb ib;
+    uint64_t fence = 0, obs = 0;
+    bool to = false;
+    struct timespec t0, t1;
+    long us;
+    if (ib_dwords == 0) {
+        cpu[0] = N48R3_PM4_NOP;
+        cpu[1] = 0u;          /* NOP body: 完整 NO_OP 包 = 头 + 0，共 2 dwords */
+        ib_dwords = 2;
+    }
+    ib.va_start = gva;
+    ib.ib_bytes = ib_dwords * 4u;
+    ib.ip_type = ip_type;
+    __sync_synchronize(); /* HDP/WC barrier before the CP reads the user BO */
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    fence = n48r3_abi_submit(conn, &ib, 1u);
+    if (fence == 0) {
+        fprintf(stderr, "n48r3: %s: submit failed\n", cmd);
+        return N48R3_EXIT_CALL;
+    }
+    obs = n48r3_abi_fence_wait(conn, fence, 2000000u, &to);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    us = (long)(t1.tv_sec - t0.tv_sec) * 1000000L +
+         (t1.tv_nsec - t0.tv_nsec) / 1000L;
+    printf("n48r3: %s: %s ib_dwords=%u fence_seq=%llu observed=%llu "
+           "timed_out=%s elapsed_us=%ld\n", cmd, to ? "FAIL" : "PASS",
+           ib_dwords, (unsigned long long)fence, (unsigned long long)obs,
+           to ? "yes" : "no", us);
+    return to ? N48R3_EXIT_TIMEOUT : N48R3_EXIT_OK;
+}
+
+/* ---- doorbell: real compute queue submission with a minimal NOP IB ---- */
+static int cmd_doorbell(int argc, char **argv) {
+    uint64_t gva = 0, handle = 0;
+    volatile uint32_t *cpu = NULL;
+    io_connect_t conn;
+    int rc;
+    (void)argc; (void)argv;
+    rc = n48r3_open_connection(&conn);
+    if (rc != N48R3_EXIT_OK) return rc;
+    rc = n48r3_bo_map(conn, "doorbell", 4096ull, (uint32_t)kN48R3DomainUMA,
+                      &gva, &handle, &cpu);
+    if (rc != N48R3_EXIT_OK) { IOServiceClose(conn); return rc; }
+    rc = n48r3_submit_roundtrip(conn, "doorbell", cpu, gva, 0u,
+                                (uint32_t)kN48R3IpCompute);
+    {
+        int release = n48r3_bo_release(conn, (uint32_t)handle,
+                                       (mach_vm_address_t)cpu, gva);
+        if (rc == N48R3_EXIT_OK) rc = release;
+    }
+    IOServiceClose(conn);
+    return rc;
+}
+
+/* ---- submit: user-written IB of len_dw dwords (default 16) ---- */
+static int cmd_submit(int argc, char **argv) {
+    uint32_t len_dw = 16u;
+    uint64_t gva = 0, handle = 0, bo_size = 0;
+    volatile uint32_t *cpu = NULL;
+    io_connect_t conn;
+    int rc;
+    if (argc > 2) len_dw = (uint32_t)strtoul(argv[2], NULL, 0);
+    if (len_dw == 0 || len_dw > 0x10000u || (len_dw & 1u) != 0u) {
+        fprintf(stderr, "n48r3: submit: len_dw must be a positive even dword count <= 65536 "
+                        "(each NO_OP packet is 2 dwords)\n");
+        return N48R3_EXIT_USAGE;
+    }
+    rc = n48r3_open_connection(&conn);
+    if (rc != N48R3_EXIT_OK) return rc;
+    bo_size = (uint64_t)len_dw * 4ull;
+    rc = n48r3_bo_map(conn, "submit", bo_size, (uint32_t)kN48R3DomainUMA,
+                      &gva, &handle, &cpu);
+    if (rc != N48R3_EXIT_OK) { IOServiceClose(conn); return rc; }
+    {
+        uint32_t i;
+        for (i = 0; i < len_dw; i += 2) {
+            cpu[i] = N48R3_PM4_NOP;
+            cpu[i + 1] = 0u;   /* 完整 NO_OP 包：头 + body 0 */
+        }
+    }
+    rc = n48r3_submit_roundtrip(conn, "submit", cpu, gva, len_dw,
+                                (uint32_t)kN48R3IpCompute);
+    {
+        int release = n48r3_bo_release(conn, (uint32_t)handle,
+                                       (mach_vm_address_t)cpu, gva);
+        if (rc == N48R3_EXIT_OK) rc = release;
+    }
+    IOServiceClose(conn);
+    return rc;
+}
+
+/* ---- compute: store_magic round-trip. The user writes a WRITE_DATA packet
+ * into its own BO, submits that BO's GPU address as the IB, polls the fence,
+ * and reads the magic back from a second dword in the same mapped BO. ---- */
+static int cmd_compute(int argc, char **argv) {
+    uint64_t gva = 0, handle = 0;
+    uint32_t n = 0;
+    volatile uint32_t *cpu = NULL;
+    io_connect_t conn;
+    int rc;
+    struct timespec t0, t1;
+    long us;
+    (void)argc; (void)argv;
+    rc = n48r3_open_connection(&conn);
+    if (rc != N48R3_EXIT_OK) return rc;
+    rc = n48r3_bo_map(conn, "compute", 4096ull, (uint32_t)kN48R3DomainUMA,
+                      &gva, &handle, &cpu);
+    if (rc != N48R3_EXIT_OK) { IOServiceClose(conn); return rc; }
+
+    /* DST is a raw 48-bit MC/VM address (S13 writes test_va=fb_mc+offset that
+     * way); gpu_va is canonical, so strip the sign extension first. The magic
+     * slot is cleared before submission so a stale value cannot fake a PASS. */
+    cpu[0x100 / 4u] = 0;
+    n = n48r3_pm4_write_data((uint32_t *)(void *)cpu,
+                             n48r3_va_strip(gva) + 0x100u,
+                             N48R3_COMPUTE_MAGIC);
+    if (n != 5u) {
+        fprintf(stderr, "n48r3: compute: WRITE_DATA build failed\n");
+        rc = N48R3_EXIT_CALL;
+        goto out;
+    }
+    cpu[n] = N48R3_PM4_NOP;
+    cpu[n + 1] = 0u;   /* 完整 NO_OP 包 = 2 dwords；整个 BO 即 IB */
+    __sync_synchronize();
+    {
+        N48R3CsIb ib;
+        uint64_t fence = 0, obs = 0;
+        bool to = false;
+        ib.va_start = gva;
+        ib.ib_bytes = (n + 2u) * 4u;
+        ib.ip_type = (uint32_t)kN48R3IpCompute;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        fence = n48r3_abi_submit(conn, &ib, 1u);
+        if (fence == 0) {
+            fprintf(stderr, "n48r3: compute: submit failed\n");
+            rc = N48R3_EXIT_CALL;
+            goto out;
+        }
+        obs = n48r3_abi_fence_wait(conn, fence, 2000000u, &to);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        us = (long)(t1.tv_sec - t0.tv_sec) * 1000000L +
+             (t1.tv_nsec - t0.tv_nsec) / 1000L;
+        if (to || cpu[0x100 / 4u] != N48R3_COMPUTE_MAGIC) {
+            printf("n48r3: compute: FAIL ib_dwords=%u fence_seq=%llu observed=%llu "
+                   "magic=0x%08x expected=0x%08x timed_out=%s elapsed_us=%ld\n",
+                   n + 2u, (unsigned long long)fence, (unsigned long long)obs,
+                   cpu[0x100 / 4u], N48R3_COMPUTE_MAGIC, to ? "yes" : "no", us);
+            rc = to ? N48R3_EXIT_TIMEOUT : N48R3_EXIT_CALL;
+        } else {
+            printf("n48r3: compute: PASS ib_dwords=%u fence_seq=%llu observed=%llu "
+                   "magic=0x%08x elapsed_us=%ld\n",
+                   n + 2u, (unsigned long long)fence, (unsigned long long)obs,
+                   N48R3_COMPUTE_MAGIC, us);
+        }
+    }
+
+out:
+    {
+        int release = n48r3_bo_release(conn, (uint32_t)handle,
+                                       (mach_vm_address_t)cpu, gva);
+        if (rc == N48R3_EXIT_OK) rc = release;
+    }
+    IOServiceClose(conn);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     const char *bad = NULL;
 
@@ -551,6 +1025,16 @@ int main(int argc, char **argv) {
         return cmd_logreset(argc);
     case N48R3_CMD_VERSION:
         return cmd_version(argc);
+    case N48R3_CMD_MEM:
+        return cmd_mem(argc, argv);
+    case N48R3_CMD_GART:
+        return cmd_gart(argc, argv);
+    case N48R3_CMD_DOORBELL:
+        return cmd_doorbell(argc, argv);
+    case N48R3_CMD_SUBMIT:
+        return cmd_submit(argc, argv);
+    case N48R3_CMD_COMPUTE:
+        return cmd_compute(argc, argv);
     case N48R3_CMD_UNKNOWN:
         fprintf(stderr, "n48r3: unknown command '%s'\n", bad ? bad : "");
         n48r3_usage(stderr);
@@ -609,6 +1093,21 @@ static void test_parse(void) {
     T_CHECK(bad == NULL, "logstream leaves bad NULL");
     T_CHECK(n48r3_parse_command(2, lrst, &bad) == N48R3_CMD_LOGRESET, "logreset");
     T_CHECK(bad == NULL, "logreset leaves bad NULL");
+    char *mem[]   = { (char *)"n48r3test", (char *)"mem", NULL };
+    char *gart[]  = { (char *)"n48r3test", (char *)"gart", NULL };
+    char *dbell[] = { (char *)"n48r3test", (char *)"doorbell", NULL };
+    char *sub[]   = { (char *)"n48r3test", (char *)"submit", NULL };
+    char *comp[]  = { (char *)"n48r3test", (char *)"compute", NULL };
+    T_CHECK(n48r3_parse_command(2, mem, &bad) == N48R3_CMD_MEM, "mem");
+    T_CHECK(bad == NULL, "mem leaves bad NULL");
+    T_CHECK(n48r3_parse_command(2, gart, &bad) == N48R3_CMD_GART, "gart");
+    T_CHECK(bad == NULL, "gart leaves bad NULL");
+    T_CHECK(n48r3_parse_command(2, dbell, &bad) == N48R3_CMD_DOORBELL, "doorbell");
+    T_CHECK(bad == NULL, "doorbell leaves bad NULL");
+    T_CHECK(n48r3_parse_command(2, sub, &bad) == N48R3_CMD_SUBMIT, "submit");
+    T_CHECK(bad == NULL, "submit leaves bad NULL");
+    T_CHECK(n48r3_parse_command(2, comp, &bad) == N48R3_CMD_COMPUTE, "compute");
+    T_CHECK(bad == NULL, "compute leaves bad NULL");
     T_CHECK(n48r3_parse_command(2, bogus, &bad) == N48R3_CMD_UNKNOWN, "unknown");
 }
 
@@ -786,6 +1285,138 @@ static void test_version(void) {
     free(out);
 }
 
+/* ---- X-02: stage-3 ABI parameter parsing, validation and address shapes ----
+ * Pure functions from Navi48R3ABI.h plus the tool's own text parser. The
+ * fb_mc_base != 0 case is the negative test demanded by verdict C-08: io->bus
+ * must receive a carveout byte offset, never an MC aperture address. */
+static void test_abi_pure(void) {
+    const uint64_t fb_mc = 0x8000000000ull;
+    const uint64_t d7_off = 0x00abc000ull;
+    uint64_t gva = n48r3_uma_gpu_va_canonical(fb_mc, d7_off);
+    uint8_t buf[sizeof(N48R3CsIn) + 2 * sizeof(N48R3CsIb)];
+    N48R3CsIn *h = (N48R3CsIn *)(void *)buf;
+    N48R3CsIb *ibs = (N48R3CsIb *)(void *)(buf + sizeof(N48R3CsIn));
+    const N48R3CsIn *out_h = NULL;
+    const N48R3CsIb *out_ibs = NULL;
+    uint32_t pkt[5];
+    uint32_t n;
+    uint64_t parsed = 0, scratch[32];
+    char txt[] = "PASS copy=GC fb_mc_base=0x8000000000 fb_mc_top=0x8001000000\n";
+    char badtxt[] = "PASS copy=GC fb_mc_base=0x zzz\n";
+
+    /* selector numbering comes from the contract header (C-10). */
+    T_CHECK(kN48R3SelBoAlloc == 2 && kN48R3SelBoFree == 3 &&
+            kN48R3SelSubmit == 4 && kN48R3SelFenceRead == 5 &&
+            kN48R3SelBoImportHost == 21, "selector numbering");
+    T_CHECK(kN48R3DomainUMA == 0 && kN48R3DomainGTT == 1 &&
+            kN48R3IpGfx == 0 && kN48R3IpCompute == 1,
+            "domain / ip_type enumeration");
+
+    /* Address shapes: canonical UMA gpu_va; carveout offset is the difference. */
+    T_CHECK(n48r3_uma_gpu_va(fb_mc, d7_off) == fb_mc + d7_off,
+            "UMA gpu_va = fb_mc_base + D7 offset (raw 48-bit)");
+    T_CHECK(n48r3_va_canonical(gva) && n48r3_va_strip(gva) == fb_mc + d7_off,
+            "UMA canonical gpu_va sign-extends bit 47");
+    T_CHECK(n48r3_carveout_offset(fb_mc, gva, 4096u) == d7_off,
+            "fb_mc_base != 0: carveout offset is the byte offset, not MC address");
+    T_CHECK(n48r3_carveout_offset(fb_mc, fb_mc - 4096u, 4096u) == 0,
+            "C-08 negative: address below fb_mc_base is rejected");
+    T_CHECK(n48r3_carveout_offset(0, 0x1000u, 4096u) == 0,
+            "C-08 negative: zero fb_mc_base cannot turn MC into a carveout offset");
+    T_CHECK(n48r3_va_from_scalars(0x89abcdefu, 0x01234567u) == 0x0123456789abcdefull,
+            "scalar lo/hi VA assembly");
+    T_CHECK(n48r3_bo_alloc_args(4096u, kN48R3DomainUMA) == 0 &&
+            n48r3_bo_alloc_args(4096u, kN48R3DomainGTT) == 0,
+            "BO alloc legal args");
+    T_CHECK(n48r3_bo_alloc_args(0, kN48R3DomainUMA) == -1 &&
+            n48r3_bo_alloc_args(0x100001u, kN48R3DomainUMA) == -1 &&
+            n48r3_bo_alloc_args(4096u, 2u) == -1,
+            "BO alloc rejects zero/oversize/unknown domain");
+
+    /* cs_ib validation (canonical, 4-byte aligned and capped length). */
+    T_CHECK(n48r3_cs_ib_valid(NULL) != 0, "cs_ib rejects NULL");
+    ibs[0].va_start = gva; ibs[0].ib_bytes = 20u;
+    ibs[0].ip_type = kN48R3IpCompute;
+    T_CHECK(n48r3_cs_ib_valid(&ibs[0]) == 0, "cs_ib legal compute IB");
+    ibs[0].ib_bytes = 18u;
+    T_CHECK(n48r3_cs_ib_valid(&ibs[0]) != 0, "cs_ib rejects unaligned bytes");
+    ibs[0].ib_bytes = N48R3_CS_IB_BYTES_MAX + 4u;
+    T_CHECK(n48r3_cs_ib_valid(&ibs[0]) != 0, "cs_ib rejects oversize bytes");
+    ibs[0].ib_bytes = 20u; ibs[0].ip_type = 7u;
+    T_CHECK(n48r3_cs_ib_valid(&ibs[0]) != 0, "cs_ib rejects unknown ip_type");
+    ibs[0].ip_type = kN48R3IpCompute;
+    ibs[0].va_start = 0x0001000000000000ull; /* bit 48 set -> not canonical */
+    T_CHECK(n48r3_cs_ib_valid(&ibs[0]) != 0, "cs_ib rejects noncanonical VA");
+    ibs[0].va_start = gva;
+
+    /* N48R3CsIn parsing: version, count, reserved fields, exact length. */
+    memset(buf, 0, sizeof buf);
+    h->abi_version = N48R3_UC_ABI_VERSION;
+    h->num_ibs = 1;
+    ibs[0].va_start = gva; ibs[0].ib_bytes = 20u;
+    ibs[0].ip_type = kN48R3IpCompute;
+    T_CHECK(n48r3_cs_in_size(h) == sizeof(N48R3CsIn) + sizeof(N48R3CsIb),
+            "cs_in_size one IB");
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof(N48R3CsIn) + sizeof(N48R3CsIb),
+                                 &out_h, &out_ibs) == 0 &&
+            out_h->num_ibs == 1 && out_ibs[0].ib_bytes == 20u,
+            "cs_in_validate legal one IB");
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof(N48R3CsIn),
+                                 &out_h, &out_ibs) == -1,
+            "cs_in_validate rejects short structure");
+    h->abi_version++;
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof(N48R3CsIn) + sizeof(N48R3CsIb),
+                                 &out_h, &out_ibs) == -1,
+            "cs_in_validate rejects ABI version mismatch");
+    h->abi_version = N48R3_UC_ABI_VERSION;
+    h->num_ibs = 0;
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof(N48R3CsIn) + sizeof(N48R3CsIb),
+                                 &out_h, &out_ibs) == -1,
+            "cs_in_validate rejects 0 IBs");
+    h->num_ibs = N48R3_CS_IB_MAX + 1u;
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof buf, &out_h, &out_ibs) == -1,
+            "cs_in_validate rejects >64 IBs");
+    h->num_ibs = 1; h->flags = 1u;
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof(N48R3CsIn) + sizeof(N48R3CsIb),
+                                 &out_h, &out_ibs) == -1,
+            "cs_in_validate rejects nonzero flags");
+    h->flags = 0;
+    ibs[0].ib_bytes = 18u;
+    T_CHECK(n48r3_cs_in_validate(buf, (uint32_t)sizeof(N48R3CsIn) + sizeof(N48R3CsIb),
+                                 &out_h, &out_ibs) == -2,
+            "cs_in_validate rejects illegal IB");
+
+    /* WRITE_DATA packet shape used by the compute round-trip. */
+    n = n48r3_pm4_write_data(pkt, n48r3_va_strip(gva) + 0x100u,
+                             N48R3_COMPUTE_MAGIC);
+    T_CHECK(n == 5 && pkt[0] == 0xC0370003u && pkt[1] == 0x00100500u &&
+            pkt[2] == (uint32_t)((n48r3_va_strip(gva) + 0x100u) & 0xffffffffu) &&
+            pkt[3] == (uint32_t)((n48r3_va_strip(gva) + 0x100u) >> 32) &&
+            pkt[4] == N48R3_COMPUTE_MAGIC,
+            "pm4_write_data golden shape (5 dwords)");
+    T_CHECK(n48r3_pm4_write_data(pkt, 0x1001u, 0) != 5,
+            "pm4_write_data rejects unaligned destination");
+
+    /* PM4 NO_OP：PACKET3(PACKET3_NOP,0) 包头及完整 2-dword 包形态（C-09）。 */
+    T_CHECK(N48R3_PM4_NOP == 0xC0001000u, "NOP header = PACKET3(PACKET3_NOP,0)");
+    T_CHECK(N48R3_PM4_NOP_PAIR == 0x00000000C0001000ull,
+            "complete NOP packet = header + zero body");
+    T_CHECK((N48R3_PM4_NOP & 0x0000ff00u) == 0x1000u,
+            "NOP opcode 0x10 at bits 15:8 (nvd.h:48-55)");
+
+    /* Survey text parsing and mapped pattern helpers. */
+    T_CHECK(n48r3_parse_fb_mc_base(txt, sizeof txt - 1, &parsed) == 1 &&
+            parsed == fb_mc, "parse fb_mc_base from survey text");
+    T_CHECK(n48r3_parse_fb_mc_base(badtxt, sizeof badtxt - 1, &parsed) == 0,
+            "parse fb_mc_base rejects empty hex");
+    n48r3_fill_pattern((volatile uint32_t *)scratch, 32u, 0xA5A55A5Au);
+    T_CHECK(n48r3_check_pattern((volatile uint32_t *)scratch, 32u, 0xA5A55A5Au) == 0,
+            "BO pattern write/read-back match");
+    ((volatile uint32_t *)scratch)[17] ^= 1u;
+    T_CHECK(n48r3_check_pattern((volatile uint32_t *)scratch, 32u, 0xA5A55A5Au) != 0,
+            "BO pattern read-back detects corruption");
+}
+
 int main(void) {
     test_parse();
     test_root();
@@ -794,6 +1425,7 @@ int main(void) {
     test_kr_text();
     test_emit();
     test_usage();
+    test_abi_pure();
     test_version();
     printf("%s: %d checks, %d failures\n", t_fail ? "FAIL" : "PASS", t_checks, t_fail);
     return t_fail ? 1 : 0;

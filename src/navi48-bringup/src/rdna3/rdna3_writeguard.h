@@ -18,10 +18,13 @@
  *
  * Stage 2 extension (tech plan §6.1):
  *   WClass   - B2 side-effect class: Access / Data / Protocol / State.
- *   WSubstep - power-up substep owner: None / Psp / Smu / Gfx / Sdma / Mes.
+ *   WSubstep - power-up substep owner: None / Psp / Smu / Gfx / Sdma / Mes / Gmc / Ih / Abi.
  *   Grants   - ② Data layout intervals (tag "layout:...") allow any sub-range inside the grant;
  *              ③ Protocol and ④ State register windows (tag "reg:...") match exactly one
  *              address+width. ① Access keeps the legacy stage-1 window table below.
+ *   ReadOnly - D6 fence-page grants (r3_wg_register_layout_readonly): every write landing
+ *              inside them is DENY whatever the declared class; reads never pass through
+ *              this classifier, so no read path exists here.
  *
  * Structural constraints (fail closed, a violation fails the substep):
  *   1. a window whose owner differs from the armed substep is DENY;
@@ -55,7 +58,11 @@
 #define R3_WG_MM_WINDOW_COUNT 3u
 #define R3_WG_AUX_WINDOW_COUNT 25u
 #define R3_WG_WINDOW_COUNT (R3_WG_MM_WINDOW_COUNT + R3_WG_AUX_WINDOW_COUNT)
-#define R3_WG_GRANT_MAX 128u
+#define R3_WG_GRANT_MAX 192u
+/* 写守卫 grant 表容量：全链预算 162 项 + 30 行预留（rdna3_ip_entries.h 预算契约）。
+ * 数值一致性由该头文件的 static_assert 机械保证（R3_WG_BUDGET_TOTAL <=
+ * R3_WG_GRANT_MAX）。容量只是兜底：越界的第一道拦截是批量注册前的
+ * r3_wg_reserve() 预算检查（prep/stage 入口），此宏仅供表数组与诊断使用。 */
 
 
 /* B2.1: write necessity level for expectation verification (tech plan v3 §B.2.1). */
@@ -84,7 +91,10 @@ enum class WSubstep : uint8_t {
     Smu = 2,
     Gfx = 3,
     Sdma = 4,
-    Mes = 5
+    Mes = 5,
+    Gmc = 6,
+    Ih = 7,
+    Abi = 8
 };
 
 /* Register write declaration: one row per unique address (P5). Used by substep
@@ -123,7 +133,8 @@ struct R3WriteRowAbs {
 /* One registered stage-2 window. A Data grant has range=true and allows any sub-range inside
  * [start, start+dwords); a Protocol/State/Access register window has range=false and matches
  * exactly (addr, dwords). `tag` must be "layout:..." for range grants and "reg:..." otherwise,
- * and must outlive the guard (string literal). */
+ * and must outlive the guard (string literal). A read-only grant (readonly=true, the D6 fence
+ * page) denies every write inside it; reads bypass this layer entirely. */
 struct R3WgGrant {
     uint32_t start;   /* first dword address                */
     uint32_t dwords;  /* width in dwords (>= 1)             */
@@ -132,6 +143,7 @@ struct R3WgGrant {
     const char *tag;  /* "layout:..." or "reg:..."          */
     bool range;       /* true: layout grant (Data only)     */
     bool shared;      /* true: any armed substep may use it (platform resource) */
+    bool readonly;    /* true: D6 fence page — every write DENY (reads bypass this layer) */
 };
 
 /* Arm the guard from the DMU (DCN) IP's five discovery segment bases. Returns 0 on success,
@@ -156,6 +168,12 @@ int r3_wg_register_grant(const R3WgGrant *grant);
 /* ② data-movement layout grant: cls=Data, range=true, tag must start "layout:". */
 int r3_wg_register_layout(uint32_t start, uint32_t dwords, WSubstep owner, const char *tag);
 
+/* ② read-only layout grant (D6 fence page): cls=Data, range=true, tag must start "layout:".
+ * Every write through this grant is DENY regardless of class; reads never pass through
+ * this classifier. */
+int r3_wg_register_layout_readonly(uint32_t start, uint32_t dwords, WSubstep owner,
+                                   const char *tag);
+
 /* ③④ explicit register window: cls must be Access/Protocol/State, range=false, tag must start
  * "reg:". Data must use r3_wg_register_layout(). */
 int r3_wg_register_reg(uint32_t addr, uint32_t dwords, WClass cls, WSubstep owner,
@@ -166,6 +184,13 @@ int r3_wg_register_reg(uint32_t addr, uint32_t dwords, WClass cls, WSubstep owne
  * owned by a single IP; making it per-IP is how visibility fixes go missing. */
 int r3_wg_register_shared_reg(uint32_t addr, uint32_t dwords, WClass cls, WSubstep owner,
                               const char *tag);
+
+/* 预算预留：批量注册前声明"本阶段将要登记的 grant 条数"，只读检查，不注册、
+ * 不改变任何状态。返回 0 成功；-1 参数错（rows 为 0）；-2 容量不足
+ * （used + rows > R3_WG_GRANT_MAX；此时用 log sink 记录 used/need/cap）。
+ * 设计意图：把"表满"从逐条 register 的偶发失败提升为阶段入口的预检失败，
+ * 使失败点落在阶段名前缀（prep 与 seq）而非折叠进 pre:register。 */
+int r3_wg_reserve(uint32_t rows);
 
 uint32_t r3_wg_grant_count(void);
 const R3WgGrant *r3_wg_grant(uint32_t index);
@@ -193,7 +218,8 @@ void r3_wg_set_log(R3WgLogFn fn, void *user);
  * If some row fits address/width but none fits owner + class, the write is DENIED with that
  * row's tag. A row that only contains part of the range was not written and claims nothing:
  * a write that starts inside a layout grant and ends past its last dword is checked against
- * the remaining windows and normally DENIED. */
+ * the remaining windows and normally DENIED. A read-only grant (D6 fence page) denies every
+ * write that lands inside it, whatever the declared class. */
 WVerdict r3_wg_classify(uint64_t pa, uint32_t size, WClass cls, const char *ctx);
 
 /* Stage-1 compatibility wrapper: classifies as WClass::Access. */
@@ -247,7 +273,7 @@ struct R3WgWindow {
  * 失败路径：子步失败（r3_wg_set_path("failure")）后期望校验只记录、不阻断——失败原因
  *   必须可回退、不被 expect-write-mismatch 覆盖。成功路径 strict=true 时阻断。
  * ----------------------------------------------------------------------------------------- */
-#define R3_WG_EXPECT_MAX 64u
+#define R3_WG_EXPECT_MAX 80u
 
 /* 注册期望：遍历 rows/layouts 存入内部表。每次调用先清空之前状态（P4）。 */
 int r3_wg_expect_writes(const R3WriteRowReg *rows, uint32_t count,

@@ -69,7 +69,7 @@ bool tgt_boot_arg_present(const char *leaf)
 
 static bool is_r3_kill_leaf(const char *leaf)
 {
-    static const char *const kLeaves[] = { "psp", "smu", "gfx", "sdma", "mes" };
+    static const char *const kLeaves[] = { "psp", "smu", "gfx", "sdma", "mes", "gart", "queue" };
     if (!leaf) return false;
     for (size_t i = 0; i < sizeof kLeaves / sizeof kLeaves[0]; i++) {
         if (strcmp(leaf, kLeaves[i]) == 0) return true;

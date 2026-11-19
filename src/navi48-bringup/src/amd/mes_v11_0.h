@@ -117,6 +117,23 @@ constexpr uint32_t kMesScratchBytes            = 0x2000u; /* default page + reso
 
 constexpr uint32_t kMesKiqRingDwords            = 1024u; /* 4 KiB */
 constexpr uint32_t kMesSchRingDwords            = 1024u; /* 4 KiB */
+
+/* CSIB sub-offset inside the C5 mes grant (after queue structures + scratch).
+ * 0x2000 (8 KiB) for 960 dw preamble + header. Placed by layout allocator at D4. */
+constexpr uint32_t kMesCsibOff                  = kMesRegionBytes + kMesScratchBytes; /* 0x16000 */
+constexpr uint32_t kMesCsibBytes                = 0x2000u;
+constexpr uint32_t kMesCsibHeader               = 0x0D000000u;
+
+/* Doorbell range byte values (gfx_v11_0_cp_set_doorbell_range). */
+constexpr uint32_t kMesRbDoorbellLower           = 0x458u; /* GFX_DB<<2 = 0x116<<2 */
+constexpr uint32_t kMesRbDoorbellUpper           = 0x7f8u;
+constexpr uint32_t kMesMecDoorbellLower          = 0x60u;  /* KIQ<<2 = 0x18<<2 */
+constexpr uint32_t kMesMecDoorbellUpper          = 0x7f8u;
+
+/* S11 ADD_QUEUE full payload: page_table_base_addr comes from the sysmem_grants
+ * entry tagged "ctx0_root_pool" (parsed by mes_queue_v11_0_substep); missing
+ * grant fails the substep. kMesDefaultPageTableBase is only a zero initializer. */
+constexpr uint64_t kMesDefaultPageTableBase      = 0ull;
 constexpr uint32_t kMesGfxRingDwords            = 2048u; /* 8 KiB */
 constexpr uint32_t kMesCmpRingDwords            = 1024u; /* 4 KiB */
 constexpr uint32_t kMesMqdBytes                 = 0x1000u;
@@ -144,6 +161,9 @@ constexpr uint32_t kMesApiSetHwRsrc             = 0u;
 constexpr uint32_t kMesApiSetHwRsrc1            = 19u;
 constexpr uint32_t kMesApiQuerySchedulerStatus  = 11u;
 constexpr uint32_t kMesApiAddQueue              = 2u;
+constexpr uint32_t kMesApiRemoveQueue            = 3u;
+constexpr uint32_t kMesApiQueryStatus            = 17u; /* MISC opcode 2 */
+
 
 constexpr uint32_t kMesQueueTypeGfx             = 0u;
 constexpr uint32_t kMesQueueTypeCompute         = 1u;
@@ -290,6 +310,19 @@ static_assert(sizeof(MesApiSetHwResources1) <= kMesApiFrameDwords * 4u,
               "SET_HW_RESOURCES_1 must fit the 64-dword API frame");
 
 
+/* T-E split: queue substep entry (S7..S11: ADD_QUEUE compute/gfx, chk_queues, S11).
+ * Arms/verifies/disarms independently from mes_v11_0_substep. Both entries share
+ * doorbell expectations (kMesDoorbells). */
+R3SubstepResult mes_queue_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
+
+/* Writeguard row table accessors (T-E split: mes and queue are separate tables). */
+const R3WriteRowReg *getMesRows(void);
+uint32_t             getMesRowCount(void);
+const R3WriteRowReg *getMesQueueRows(void);
+uint32_t             getMesQueueRowCount(void);
+const char          *getMesLayoutTag(void);
+const R3WriteRowAbs *getMesDoorbells(void);
+uint32_t             getMesDoorbellCount(void);
 } /* namespace amdgpu */
 
 #endif /* NAVI48_MES_V11_0_H */

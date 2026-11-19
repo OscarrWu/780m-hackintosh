@@ -763,10 +763,12 @@ R3SubstepResult smu_v13_0_substep(const R3Io *io, const R3SubstepEnv *env)
     // blocking bound outside this file.
     const bool have_io = r3_io_complete(io);
     r3_wg_arm_substep(WSubstep::Smu);
-    r3_wg_expect_writes(getSmuRows(), getSmuRowCount(), nullptr, 0, WSubstep::Smu);
+    if (r3_wg_expect_writes(getSmuRows(), getSmuRowCount(), nullptr, 0, WSubstep::Smu) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     uint32_t declared[R3_WG_EXPECT_MAX];
     r3_wg_resolve_row_addrs(env->ip, getSmuRows(), getSmuRowCount(), declared);
-    r3_wg_expect_declared_addrs(declared, getSmuRowCount());
+    if (r3_wg_expect_declared_addrs(declared, getSmuRowCount()) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     if (have_io)
         io->lock(io->ctx);
 
@@ -814,8 +816,8 @@ constexpr R3WriteRowReg kSmuRows[] = {
     {&r3gold::kMp1SmnC2pmsg82, static_cast<uint8_t>(IPBlock::MP1), 0, 0, 1, WClass::Protocol, WNeed::Required, "smu-mbox-arg"},
     {&r3gold::kMp1SmnC2pmsg90, static_cast<uint8_t>(IPBlock::MP1), 0, 0, 1, WClass::Protocol, WNeed::Required, "smu-mbox-resp"},
 };
-constexpr uint32_t kSmuRowCount = sizeof(kSmuRows) / sizeof(kSmuRows[0]);
-static_assert(kSmuRowCount == 3, "smu declaration table must have 3 rows");
+static_assert(sizeof(kSmuRows) / sizeof(kSmuRows[0]) == kSmuRowCount,
+              "smu declaration table must have 3 rows");
 } // anonymous namespace
 
 const R3WriteRowReg* getSmuRows(void) { return kSmuRows; }

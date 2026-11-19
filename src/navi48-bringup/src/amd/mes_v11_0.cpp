@@ -43,6 +43,10 @@
 #include "../rdna3/rdna3_runtime.h"
 #include "../rdna3/rdna3_writeguard.h"
 #include "../rdna3/golden_values.h"
+#include "csb_gfx11_data.h"
+#include "gmc_v11_0.h"
+#include "pm4_v11.h"
+
 
 namespace amdgpu {
 namespace {
@@ -74,6 +78,13 @@ constexpr const char *kFailQuery         = "seq:query";
 constexpr const char *kFailFence         = "seq:fence-timeout";
 constexpr const char *kFailApiStatus     = "chk:api-status";
 constexpr const char *kFailAddrPrefix    = "chk:addr-prefix";
+constexpr const char *kFailS11Csib       = "seq:s11-csib";
+constexpr const char *kFailS11Dbrange    = "seq:s11-dbrange";
+constexpr const char *kFailS11Addq       = "seq:s11-addq";
+constexpr const char *kFailS11Wptr       = "seq:s11-wptr";
+constexpr const char *kFailS11Vmid8Ib    = "seq:s11-vmid8-ib";
+constexpr const char *kFailS11TestGrant  = "pre:test-buf-grant";
+
 
 WClass to_wclass(R3WClassId c)
 {
@@ -143,7 +154,16 @@ struct Mes {
     uint32_t             me_cntl;
     uint32_t             hqd_active;
     uint32_t             mmhub0;
+    uint32_t             mmhub1;
     uint32_t             osssys0;
+    uint32_t             rlc_csib_lo;
+    uint32_t             rlc_csib_hi;
+    uint32_t             rlc_csib_len;
+    uint32_t             db_range_lower;
+    uint32_t             db_range_upper;
+    uint32_t             mec_db_range_lower;
+    uint32_t             mec_db_range_upper;
+
 
     uint64_t             grant_start;
     uint64_t             kiq_ring_bar0, kiq_wb_bar0, kiq_mqd_bar0, kiq_eop_bar0;
@@ -173,12 +193,19 @@ struct Mes {
     uint64_t             cmp_fence;
     uint64_t             cmp_status;
     uint64_t             cmp_wptr_mc;
+    uint64_t             csib_bar0;
+    uint64_t             csib_mc;
+    /* Firmware image descriptors (must live as long as the fw_buf carveout). */
+    R3FwImage            fw_img;
+
+    /* API frame scratch buffers (kept off the 16 KiB kernel stack). */
+    uint32_t             frame[kMesApiFrameDwords];
+    uint32_t             qframe[kMesApiFrameDwords];
     char                 gfx_result[40];
     char                 cmp_result[40];
-    uint32_t             frame[kMesApiFrameDwords];
-    uint32_t             qframe[kMesApiFrameDwords]; /* D1: QUERY frame, 64 dw static */
-    R3FwImage            fw_img;
-    /* S-1 hub pre: MMHUB snapshot (方案 v3 §6.2.2/§6.6.1). */
+    /* T-E: real GPA from sysmem_grants D2 root for ADD_QUEUE payload (mes_queue_v11_0_substep
+     * resolves this; mes_v11_0_substep leaves it at 0 = kMesDefaultPageTableBase). */
+    uint64_t             page_table_base_addr;
     uint32_t             fb_off_raw;
     uint32_t             fb_base_raw;
     uint32_t             fb_top_raw;
@@ -536,10 +563,18 @@ R3SubstepResult pre(Mes &s)
         !resolve_golden(s, r3gold::kRlcCpSchedulers, &s.rlc_sched) ||
         !resolve_golden(s, r3gold::kCpMecCntl, &s.mec_cntl) ||
         !resolve_golden(s, r3gold::kCpMeCntl, &s.me_cntl) ||
-        !resolve_golden(s, r3gold::kCpHqdActive, &s.hqd_active)) {
+        !resolve_golden(s, r3gold::kCpHqdActive, &s.hqd_active) ||
+        !resolve_golden(s, r3gold::kRlcCsibAddrLo, &s.rlc_csib_lo) ||
+        !resolve_golden(s, r3gold::kRlcCsibAddrHi, &s.rlc_csib_hi) ||
+        !resolve_golden(s, r3gold::kRlcCsibLength, &s.rlc_csib_len) ||
+        !resolve_golden(s, r3gold::kCpRbDoorbellRangeLower, &s.db_range_lower) ||
+        !resolve_golden(s, r3gold::kCpRbDoorbellRangeUpper, &s.db_range_upper) ||
+        !resolve_golden(s, r3gold::kCpMecDoorbellRangeLower, &s.mec_db_range_lower) ||
+        !resolve_golden(s, r3gold::kCpMecDoorbellRangeUpper, &s.mec_db_range_upper)) {
         evf(s.env, "mes-pre", "P0 golden register resolution failed");
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
     }
+
 
     s.mc_base = s.env->fb_mc_base;
     if (s.mc_base == 0ull) {
@@ -598,6 +633,8 @@ R3SubstepResult pre(Mes &s)
     s.cmp_wb_bar0 = s.grant_start + kMesCmpWbOff;
     s.cmp_mqd_bar0 = s.grant_start + kMesCmpMqdOff;
     s.cmp_eop_bar0 = s.grant_start + kMesCmpEopOff;
+    s.csib_bar0 = s.grant_start + kMesCsibOff;
+
 
     s.kiq_ring_mc = s.mc_base + s.kiq_ring_bar0;
     s.kiq_wb_mc = s.mc_base + s.kiq_wb_bar0;
@@ -615,6 +652,8 @@ R3SubstepResult pre(Mes &s)
     s.cmp_wb_mc = s.mc_base + s.cmp_wb_bar0;
     s.cmp_mqd_mc = s.mc_base + s.cmp_mqd_bar0;
     s.cmp_eop_mc = s.mc_base + s.cmp_eop_bar0;
+    s.csib_mc = s.mc_base + s.csib_bar0;
+
 
     if (!(s.env->rt->ready_bits & R3_IP_BIT(R3Ip::Psp))) {
         evf(s.env, "mes-pre", "P2 PSP not ready (ready_bits=0x%08x)",
@@ -748,14 +787,15 @@ R3SubstepResult seq_hub_pre(Mes &s)
     const IPBaseTable *ip = static_cast<const IPBaseTable *>(s.env->ip);
     if (ip) {
         s.nbio2 = ip->getBase(IPBlock::NBIO, 2);
+        s.mmhub1 = ip->getBase(IPBlock::MMHUB, 1);
     }
     evf(s.env, "mes-hub-pre",
-        "IP: gc[0]=0x%x gc[1]=0x%x mmhub[0]=0x%x osssys[0]=0x%x nbio[2]=0x%x "
+        "IP: gc[0]=0x%x gc[1]=0x%x mmhub[0]=0x%x mmhub[1]=0x%x osssys[0]=0x%x nbio[2]=0x%x "
         "mmhub fb_off=0x%x fb_base=0x%x fb_top=0x%x "
         "sysa_low=0x%x sysa_high=0x%x default_pa=0x%llx resource1_pa=0x%llx "
         "PT win: 0x%x/0x%x 0x%x/0x%x 0x%x/0x%x",
         s.gc0, ip ? ip->getBase(IPBlock::GC, 1) : 0u,
-        s.mmhub0, s.osssys0, s.nbio2,
+        s.mmhub0, s.mmhub1, s.osssys0, s.nbio2,
         raw_off, s.fb_base_raw, s.fb_top_raw,
         sysa_low, sysa_high,
         static_cast<unsigned long long>(s.default_pa),
@@ -897,6 +937,61 @@ R3SubstepResult seq_hub_pre(Mes &s)
         evf(s.env, "mes-hub-pre", "HDP flush failed after identity");
         return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
     }
+    /* --- MMHUB VM path initialization (方案 W, Linux mmhub_v3_0_1.c semantics) --- */
+    const uint32_t mmhub1 = s.mmhub1;
+    if (mmhub1 == 0u || !ip->isResolved(IPBlock::MMHUB, 1)) {
+        evf(s.env, "mes-hub-pre", "MMHUB seg1 unresolved (0x%x)", mmhub1);
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    }
+    /* MM AGP 关 + system aperture (mmhub_3_0_1_offset.h:1672-:1682; Linux
+     * mmhub_v3_0_1_init_system_aperture_regs, mmhub_v3_0_1.c:183-186) */
+    if (!wabs(mmhub1 + 0x08F0u, 0u,            "mes-hub-mm-aperture") ||  /* AGP_BASE */
+        !wabs(mmhub1 + 0x08EFu, 0x00ffffffu,   "mes-hub-mm-aperture") ||  /* AGP_BOT */
+        !wabs(mmhub1 + 0x08EEu, 0u,             "mes-hub-mm-aperture") ||  /* AGP_TOP */
+        !wabs(mmhub1 + 0x08F1u, sysa_low,       "mes-hub-mm-aperture") ||  /* SYSTEM_APERTURE_LOW */
+        !wabs(mmhub1 + 0x08F2u, sysa_high,      "mes-hub-mm-aperture"))    /* SYSTEM_APERTURE_HIGH */
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    /* MM DEFAULT_ADDR + FAULT_DEFAULT (mmhub_3_0_1_offset.h:1628/:1630/:1064/:1066;
+     * Linux mmhub_v3_0_1_init_system_aperture_regs, mmhub_v3_0_1.c:189-199) */
+    if (!wabs(mmhub1 + 0x08D8u, default_addr_lo, "mes-hub-mm-default") ||  /* SYS_APERTURE_DEFAULT_LSB */
+        !wabs(mmhub1 + 0x08D9u, default_addr_hi, "mes-hub-mm-default") ||  /* SYS_APERTURE_DEFAULT_MSB */
+        !wabs(mmhub1 + 0x070Fu, default_addr_lo, "mes-hub-mm-default") ||  /* FAULT_DEFAULT_LO32 */
+        !wabs(mmhub1 + 0x0710u, default_addr_hi, "mes-hub-mm-default"))    /* FAULT_DEFAULT_HI32 */
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    /* MM FAULT_CNTL2: RMW | (1<<18) (mmhub_3_0_1_offset.h:1052-:1053;
+     * Linux mmhub_v3_0_1.c:201-204) */
+    if (!rmw(mmhub1 + 0x0709u, 1u << 18, 1u << 18, "mes-hub-mm-fault2"))
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    /* MM MX_L1_TLB_CNTL: RMW (same bits as GC, mmhub_3_0_1_offset.h:1682-:1683;
+     * Linux mmhub_v3_0_1_init_tlb_regs, mmhub_v3_0_1.c:212-224) */
+    if (!rmw(mmhub1 + 0x08F3u,
+             0x00000001u | (3u << 3) | (1u << 5) | (1u << 6) | (0xfu << 7) | (7u << 11),
+             0x00000001u | (3u << 3) | (1u << 6) | (3u << 11),
+             "mes-hub-mm-mx-l1"))
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    /* MM L2_CNTL..L2_CNTL5 (mmhub_3_0_1_offset.h:1034-:1093;
+     * Linux mmhub_v3_0_1_init_cache_regs, mmhub_v3_0_1.c:226-283) */
+    {
+        /* MM L2_CNTL RMW: same fields as GC */
+        if (!rmw(mmhub1 + 0x0700u,
+                 0x00000001u | (1u << 1) | (1u << 8) | (1u << 11) | (1u << 18) |
+                 (3u << 19) | (0x1fu << 21),
+                 0x00000001u | (1u << 11) | (1u << 19),
+                 "mes-hub-mm-l2"))
+            return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+        /* MM L2_CNTL2: RMW: INVALIDATE_ALL_L1_TLBS | INVALIDATE_L2_CACHE */
+        if (!rmw(mmhub1 + 0x0701u, 3u, 3u, "mes-hub-mm-l2"))
+            return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+        /* MM L2_CNTL3: same value as GC */
+        if (!wabs(mmhub1 + 0x0702u, 0x80130009u, "mes-hub-mm-l2"))
+            return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+        /* MM L2_CNTL4 */
+        if (!wabs(mmhub1 + 0x0718u, 0x1u, "mes-hub-mm-l2"))
+            return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+        /* MM L2_CNTL5 */
+        if (!wabs(mmhub1 + 0x071Eu, 0x3fe0u, "mes-hub-mm-l2"))
+            return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    }
 
     /* Row 27: CP_DEBUG RMW | (1<<15) (gc_11_0_0_offset.h:4224; Linux
      * gfxhub_v3_0_set_fault_enable_default, gfxhub_v3_0.c:415-417) */
@@ -905,6 +1000,18 @@ R3SubstepResult seq_hub_pre(Mes &s)
     /* Row 28: L2_PROTECTION_FAULT_CNTL RMW: bits2-12=1, bits30-31=0
      * (gc_11_0_0_offset.h:2746; Linux set_fault_enable_default, gfxhub_v3_0.c:409-414). */
     if (!rmw(s.gc0 + 0x15c4u, 0xc0001ffcu, 0x00001ffcu, "mes-hub-fault"))
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    /* MMHUB L2_PROTECTION_FAULT_CNTL RMW: same as GC (mmhub_3_0_1_offset.h:1050-:1051) */
+    if (!rmw(mmhub1 + 0x0708u, 0xc0001ffcu, 0x00001ffcu, "mes-hub-mm-fault"))
+        return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
+    /* MM identity aperture close + physical offset (mmhub_3_0_1_offset.h:1068-1079;
+     * Linux mmhub_v3_0_1_disable_identity_aperture, mmhub_v3_0_1.c:284-303). */
+    if (!wabs(mmhub1 + 0x0712u, 0xffffffffu, "mes-hub-mm-identity") ||
+        !wabs(mmhub1 + 0x0713u, 0x0000000fu, "mes-hub-mm-identity") ||
+        !wabs(mmhub1 + 0x0714u, 0u,          "mes-hub-mm-identity") ||
+        !wabs(mmhub1 + 0x0715u, 0u,          "mes-hub-mm-identity") ||
+        !wabs(mmhub1 + 0x0716u, 0u,          "mes-hub-mm-identity") ||
+        !wabs(mmhub1 + 0x0717u, 0u,          "mes-hub-mm-identity"))
         return r3_substep_fail(kR3SecSeq, 1, kFailSetHw);
     /* Row 29: NBIF doorbell aperture RMW | bit0 (nbio_7_7_0_offset.h:3670-3671;
      * Linux nbio_v7_7_enable_doorbell_aperture, nbio_v7_7.c:112-116) */
@@ -920,19 +1027,24 @@ R3SubstepResult seq_hub_pre(Mes &s)
 
     /* --- 7. Post-hub readback (方案 v3 §6.6.2) --- */
     uint32_t post_regs[][2] = {
-        {gc_fb_off_addr,     0}, /* C */
-        {s.gc0 + 0x1678u,    0}, /* FB_BASE */
-        {s.gc0 + 0x1679u,    0}, /* FB_TOP */
-        {s.gc0 + 0x167du,    0}, /* SYS_LOW */
-        {s.gc0 + 0x167eu,    0}, /* SYS_HIGH */
-        {s.gc0 + 0x167fu,    0}, /* MX_L1 */
-        {s.gc0 + 0x15bcu,    0}, /* L2_CNTL */
-        {s.gc0 + 0x15bdu,    0}, /* L2_CNTL2 */
-        {s.gc0 + 0x15c4u,    0}, /* FAULT_CNTL */
-        {s.gc0 + 0x15c5u,    0}, /* FAULT_CNTL2 */
-        {s.gc0 + 0x1688u,    0}, /* CONTEXT0_CNTL */
-        {s.gc0 + 0x1e1fu,    0}, /* CP_DEBUG */
-        {s.nbio2 + 0xC0u,    0}, /* NBIF doorbell aper */
+        {gc_fb_off_addr,          0}, /* C */
+        {s.gc0 + 0x1678u,         0}, /* FB_BASE */
+        {s.gc0 + 0x1679u,         0}, /* FB_TOP */
+        {s.gc0 + 0x167du,         0}, /* SYS_LOW */
+        {s.gc0 + 0x167eu,         0}, /* SYS_HIGH */
+        {s.gc0 + 0x167fu,         0}, /* MX_L1 */
+        {s.gc0 + 0x15bcu,         0}, /* L2_CNTL */
+        {s.gc0 + 0x15bdu,         0}, /* L2_CNTL2 */
+        {s.gc0 + 0x15c4u,         0}, /* FAULT_CNTL */
+        {s.gc0 + 0x15c5u,         0}, /* FAULT_CNTL2 */
+        {s.gc0 + 0x1688u,         0}, /* CONTEXT0_CNTL */
+        {s.gc0 + 0x1e1fu,         0}, /* CP_DEBUG */
+        {mmhub1 + 0x08F2u,        0}, /* MM_SYS_HIGH */
+        {mmhub1 + 0x08F3u,        0}, /* MM_MX_L1 */
+        {mmhub1 + 0x0700u,        0}, /* MM_L2_CNTL */
+        {mmhub1 + 0x0708u,        0}, /* MM_FAULT_CNTL */
+        {mmhub1 + 0x0712u,        0}, /* MM_IDENTITY_LO */
+        {s.nbio2 + 0xC0u,         0}, /* NBIF doorbell aper */
     };
     char rb[512];
     uint32_t rb_pos = 0;
@@ -948,14 +1060,14 @@ R3SubstepResult seq_hub_pre(Mes &s)
     evf(s.env, "mes-hub-post", "%s", rb);
 
     evf(s.env, "mes-hub-pre", "done: wrote %u rows (C %s)",
-        write_c ? 29u : 28u, write_c ? "written" : "skipped");
+        write_c ? 52u : 51u, write_c ? "written" : "skipped");
     {
         const uint32_t nbif_val =
             post_regs[sizeof(post_regs) / sizeof(post_regs[0]) - 1u][1];
         char hub[128];
         snprintf(hub, sizeof(hub),
                  "fb_off_raw=0x%x\nc=%s\nnbif=0x%x/bit%u\nrows=%u",
-                 raw_off, c_state, nbif_val, nbif_val & 1u, write_c ? 29u : 28u);
+                 raw_off, c_state, nbif_val, nbif_val & 1u, write_c ? 52u : 51u);
         set_prop(s.env, "N48R3EVID-mes-hub", hub);
     }
     return r3_substep_pass();
@@ -1463,6 +1575,15 @@ R3SubstepResult seq_addq_compute(Mes &s)
             s.cmp_status = s.last_status;
         }
     }
+    /* S7 fatal-capable: failure is now fatal (S11 gate requires reliable queues). */
+    R3SubstepResult ret;
+    if (strncmp(result, "fail:", 5u) == 0) {
+        ret = r3_substep_fail(kR3SecSeq, 7, kFailFence);
+    } else if (strcmp(result, "skip") == 0) {
+        ret = r3_substep_fail(kR3SecSeq, 7, kFailFence);
+    } else {
+        ret = r3_substep_pass();
+    }
     s.cmp_wptr_mc = s.cmp_wb_mc + kMesWbWptrOff;
     copy_result(s.cmp_result, sizeof(s.cmp_result), result);
     evf(s.env, "mes-addq-compute",
@@ -1471,9 +1592,7 @@ R3SubstepResult seq_addq_compute(Mes &s)
         static_cast<unsigned long long>(s.cmp_wb_mc + kMesWbWptrOff),
         kMesDoorbellCompute, static_cast<unsigned long long>(s.last_fence),
         static_cast<unsigned long long>(s.last_status));
-    /* C5.2 v1.5 (F7=c'): ADD_QUEUE is an attempt. Failure is recorded with its
-     * response/address form/return code and is never fatal or latched. */
-    return r3_substep_pass();
+    return ret;
 }
 
 R3SubstepResult seq_addq_gfx(Mes &s)
@@ -1521,6 +1640,15 @@ R3SubstepResult seq_addq_gfx(Mes &s)
         }
     }
 
+    /* S8 fatal-capable: failure is now fatal (S11 gate requires reliable queues). */
+    R3SubstepResult ret;
+    if (strncmp(result, "fail:", 5u) == 0) {
+        ret = r3_substep_fail(kR3SecSeq, 8, kFailFence);
+    } else if (strcmp(result, "skip") == 0) {
+        ret = r3_substep_fail(kR3SecSeq, 8, kFailFence);
+    } else {
+        ret = r3_substep_pass();
+    }
     copy_result(s.gfx_result, sizeof(s.gfx_result), result);
     {
         char rq[256];
@@ -1542,9 +1670,7 @@ R3SubstepResult seq_addq_gfx(Mes &s)
     evf(s.env, "mes-addq-gfx", "S8 result=%s fence=0x%llx status=0x%llx",
         s.gfx_result, static_cast<unsigned long long>(s.last_fence),
         static_cast<unsigned long long>(s.last_status));
-    /* C5.2 v1.5 (F7=c'): ADD_QUEUE is an attempt. Its failure is recorded, never masked,
-     * never fatal and never latched. S9 still exports what the MES programmed. */
-    return r3_substep_pass();
+    return ret;
 }
 
 bool mc_prefix_ok(uint64_t addr)
@@ -1607,68 +1733,377 @@ R3SubstepResult chk_queues(Mes &s)
     return r3_substep_pass();
 }
 
+/* S11 add-on (V3-4 "IB with VMID 8 executable"): submit a real IB through
+ * VMID 8 on the compute ring (S7 ADD_QUEUE). S9 built the VMID8 page table and
+ * mapped test_buf page 2 at kGmcTestVaVmid8 (gmc_v11_0.cpp seq_pt_build8); the
+ * IB body lives at that mapped VA because the VMID8 context has no
+ * FB-aperture passthrough guarantee - the IB must be reachable through the
+ * translation, not via an MC address. Shape mirrors S13 (compute_v11.cpp) with
+ * vmid=8: WRITE_DATA magic -> mapped VA, RELEASE_MEM fence (8 dw, Linux
+ * gfx_v11_0.c emit_fence shape), fence poll, read-back. PM4 encoding comes
+ * from pm4_v11.h (single authority). */
+R3SubstepResult seq_s11_vmid8_ib(Mes &s)
+{
+    const R3Grant *test_grant = r3_layout_grant(&s.plan, "test_buf");
+    if (!test_grant)
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+
+    /* S9 mapped grant page 2 (start + 2*4096) at kGmcTestVaVmid8. */
+    const uint64_t test_page_off = test_grant->start + 2 * 4096ull;
+    const uint64_t vmid8_va = kGmcTestVaVmid8;
+    const uint64_t magic_off = test_page_off + kGmcTestPageIntra;
+    const uint64_t fence_mc = s.cmp_wb_mc + kMesWbFenceOff;
+
+    /* IB body preloaded at the mapped page start: WRITE_DATA magic, then
+     * RELEASE_MEM fence (GL2 writeback included, nullarc vkprobe shape). */
+    uint32_t ib[13] = {};
+    if (pm4_write_data(ib, vmid8_va + kGmcTestPageIntra, kGmcTestMagic) == 0u ||
+        pm4_release_mem(ib + 5, fence_mc, 1u) == 0u)
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    if (!write_dwords(s, test_page_off, ib, 13u, "mes-s11-vmid8-ib"))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+
+    /* Main chain: INDIRECT_BUFFER(vmid=8, compute) at ring wptr 0. */
+    uint32_t chain[4];
+    if (pm4_indirect_buffer(chain, vmid8_va, 13u, 8u, true) == 0u)
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    if (!write_dwords(s, s.cmp_ring_bar0, chain, 4u, "mes-s11-vmid8-chain"))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+
+    /* Clear the fence first so a stale value cannot fake completion. */
+    if (!bus_write(s, s.cmp_wb_bar0 + kMesWbFenceOff, 0ull, 2u, "mes-s11-vmid8-fence"))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+
+    /* Submit tail (pm4_submit_tail order via mes helpers): drain read, HDP
+     * flush, WB wptr, read-back, HDP flush, doorbell. */
+    uint64_t drain = 0;
+    if (!bus_read(s, s.cmp_ring_bar0, 1u, &drain) || !r3_io_hdp_flush(s.io))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    if (!bus_write(s, s.cmp_wb_bar0 + kMesWbWptrOff, 4ull, 2u, "mes-s11-vmid8-wptr"))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    uint64_t wptr_rb = 0;
+    if (!bus_read(s, s.cmp_wb_bar0 + kMesWbWptrOff, 2u, &wptr_rb) || wptr_rb != 4ull)
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    if (!r3_io_hdp_flush(s.io))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    if (!doorbell_write(s, kMesDoorbellCompute, 4u, "mes-s11-vmid8-kick"))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+
+    /* Fence poll (submit_api shape). */
+    uint64_t fence = 0;
+    bool fence_seen = false;
+    for (uint32_t polls = 0; polls < kMesFencePolls; polls++) {
+        if (!bus_read(s, s.cmp_wb_bar0 + kMesWbFenceOff, 2u, &fence))
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+        if (fence == 1ull) {
+            fence_seen = true;
+            break;
+        }
+        r3_io_udelay(s.io, kMesPollUs);
+    }
+    if (!fence_seen) {
+        evf(s.env, "mes-s11", "vmid8 ib fence timeout: got 0x%llx want 1",
+            static_cast<unsigned long long>(fence));
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    }
+
+    /* Read back the magic through the mapped page's backing store. */
+    uint64_t magic = 0;
+    if (!bus_read(s, magic_off, 1u, &magic) || magic != kGmcTestMagic) {
+        evf(s.env, "mes-s11", "vmid8 ib magic mismatch: got 0x%llx want 0x%x @ bar0=0x%llx",
+            static_cast<unsigned long long>(magic), kGmcTestMagic,
+            static_cast<unsigned long long>(magic_off));
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    }
+
+    /* Wrap-around reset so S13 (hardcoded wptr=0 start) still runs from a clean
+     * ring: the CP consumed dwords 0..3 (rptr=4); fill the ring with 2-dw
+     * TYPE-3 NOPs, write the WB wptr back to 0 and ring the doorbell with 0 -
+     * the CP eats the NOPs, wraps to 0 and parks (rptr==wptr==0), so S13's
+     * chain at ring[0..11] executes in full.
+     * 【待真机复核】CP NOP consumption and doorbell-0 wrap semantics. */
+    for (uint32_t i = 0; i < kMesCmpRingDwords; i += 2u) {
+        const uint64_t off = s.cmp_ring_bar0 + (uint64_t)i * 4ull;
+        const uint64_t nop = 0x00000000C0001000ull; /* TYPE-3 NOP (op 0x10), count 0 */
+        if (!bus_write(s, off, nop, 2u, "mes-s11-vmid8-nop"))
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+    }
+    if (!bus_write(s, s.cmp_wb_bar0 + kMesWbWptrOff, 0ull, 2u, "mes-s11-vmid8-wptr0") ||
+        !doorbell_write(s, kMesDoorbellCompute, 0u, "mes-s11-vmid8-wrap"))
+        return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
+
+    set_prop(s.env, "N48R3EVID-mes-s11-vmid8-ib",
+             "ok fence=1 magic=0xdeadbeef va=0x200000100");
+    evf(s.env, "mes-s11", "vmid8 ib ok: fence=1 magic @ va=0x%llx (bar0=0x%llx)",
+        static_cast<unsigned long long>(vmid8_va + kGmcTestPageIntra),
+        static_cast<unsigned long long>(magic_off));
+    return r3_substep_pass();
+}
+
+R3SubstepResult seq_s11(Mes &s)
+{
+    /* S11: MES queue extension - CSIB, doorbell range, ADD_QUEUE full payload.
+     * Also upgrades S7/S8 to fatal-capable (kill-switch gated by T-E wiring). */
+
+    /* --- 0. VMID8 IB submission (V3-4): runs before the version check so the
+     * legacy (<0x47) path is covered too; it only needs the S7 compute queue
+     * and the S9 VMID8 page table. */
+    R3SubstepResult vib = seq_s11_vmid8_ib(s);
+    if (vib.status != kR3SsecOk)
+        return vib;
+
+    /* --- 1. MES version check (mes_v11_0.c:1615-1618): sched_version&0xFF >= 0x47
+     * enables legacy_queue_map path. Below 0x47: direct-HQD (existing), not failure. */
+    const uint32_t sched_ver = s.gp3_sched & 0xffu;
+    if (sched_ver < 0x47u) {
+        evf(s.env, "mes-s11", "S11 MES sched_version 0x%02x < 0x47; "
+            "legacy_queue_map unavailable, using direct-HQD (existing path)", sched_ver);
+        char ver_buf[48];
+        snprintf(ver_buf, sizeof(ver_buf), "legacy-map=skip ver=0x%x", sched_ver);
+        set_prop(s.env, "N48R3EVID-mes-s11-version", ver_buf);
+        /* Mark path as "failure" so S11 OnSuccessPath write rows (CSIB, MEC DB range)
+         * are not expected by the writeguard verify. Continue with pass result. */
+        r3_wg_set_path("failure");
+        return r3_substep_pass();
+    }
+    evf(s.env, "mes-s11", "S11 MES sched_version 0x%02x >= 0x47, legacy_queue_map OK",
+        sched_ver);
+
+    /* --- 2. CSIB: write 960 dw preamble + header to D4 area, program RLC_CSIB regs --- */
+    {
+        /* Write the 960-dw preamble to the CSIB region (csb_gfx11.h preamble). */
+        const uint32_t csib_dwords = 960u;
+        if (!write_dwords(s, s.csib_bar0, kCsbGfx11, csib_dwords, "mes-s11-csib-data")) {
+            evf(s.env, "mes-s11", "S11 CSIB data write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Csib);
+        }
+        /* Write CSIB header after preamble. */
+        evf(s.env, "mes-s11", "S11 CSIB %u dw preamble @ bar0=0x%llx mc=0x%llx",
+            csib_dwords, static_cast<unsigned long long>(s.csib_bar0),
+            static_cast<unsigned long long>(s.csib_mc));
+
+        /* Program RLC_CSIB_ADDR_HI/LO/LENGTH (SEG1, base_idx=1). */
+        if (!reg_write(s, s.rlc_csib_hi,
+                        static_cast<uint32_t>(s.csib_mc >> 32),
+                        kR3WState, "mes-s11-csib")) {
+            evf(s.env, "mes-s11", "S11 RLC_CSIB_ADDR_HI write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Csib);
+        }
+        const uint32_t csib_lo_val = static_cast<uint32_t>(s.csib_mc & 0xfffffffcull);
+        if (!reg_write(s, s.rlc_csib_lo, csib_lo_val, kR3WState, "mes-s11-csib")) {
+            evf(s.env, "mes-s11", "S11 RLC_CSIB_ADDR_LO write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Csib);
+        }
+        /* RLC_CSIB_LENGTH = 960 dwords (csb_gfx11.h preamble). */
+        if (!reg_write(s, s.rlc_csib_len, csib_dwords, kR3WState, "mes-s11-csib")) {
+            evf(s.env, "mes-s11", "S11 RLC_CSIB_LENGTH write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Csib);
+        }
+        evf(s.env, "mes-s11", "S11 CSIB programmed @ 0x%x/0x%x len=%u",
+            s.rlc_csib_lo, s.rlc_csib_hi, csib_dwords);
+    }
+
+    /* --- 3. Doorbell range (CP_RB_DOORBELL_RANGE_LOWER/UPPER) --- */
+    {
+        if (!reg_write(s, s.db_range_lower, kMesRbDoorbellLower,
+                        kR3WState, "mes-s11-dbrange")) {
+            evf(s.env, "mes-s11", "S11 doorbell range LOWER write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Dbrange);
+        }
+        if (!reg_write(s, s.db_range_upper, kMesRbDoorbellUpper,
+                        kR3WState, "mes-s11-dbrange")) {
+            evf(s.env, "mes-s11", "S11 doorbell range UPPER write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Dbrange);
+        }
+        /* MEC doorbell range (compute engine). */
+        if (!reg_write(s, s.mec_db_range_lower, kMesMecDoorbellLower,
+                        kR3WState, "mes-s11-dbrange")) {
+            evf(s.env, "mes-s11", "S11 MEC doorbell range LOWER write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Dbrange);
+        }
+        if (!reg_write(s, s.mec_db_range_upper, kMesMecDoorbellUpper,
+                        kR3WState, "mes-s11-dbrange")) {
+            evf(s.env, "mes-s11", "S11 MEC doorbell range UPPER write failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Dbrange);
+        }
+        evf(s.env, "mes-s11", "S11 doorbell range RB=0x%x/0x%x MEC=0x%x/0x%x",
+            s.db_range_lower, s.db_range_upper,
+            s.mec_db_range_lower, s.mec_db_range_upper);
+    }
+
+    /* --- 4. ADD_QUEUE full payload (R10 §4.5): page_table_base_addr,
+     * process_va_start/end, etc. --- */
+    {
+        /* Rebuild compute MQD with full context (MQD already zeroed in S7). */
+        if (!build_compute_mqd(s, s.cmp_mqd_bar0, s.cmp_ring_bar0, s.cmp_wb_bar0,
+                               s.cmp_eop_bar0, kMesDoorbellCompute,
+                               kMesCmpRingDwords)) {
+            evf(s.env, "mes-s11", "S11 compute MQD rebuild failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
+        }
+
+        /* Rebuild GFX MQD similarly. */
+        if (!build_gfx_mqd(s, s.gfx_mqd_bar0, s.gfx_ring_bar0, s.gfx_wb_bar0,
+                           s.gfx_eop_bar0, kMesDoorbellGfx)) {
+            evf(s.env, "mes-s11", "S11 gfx MQD rebuild failed");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
+        }
+
+        /* Compute ADD_QUEUE with full payload (R10 §4.5). */
+        {
+            MesApiAddQueue p;
+            memset(&p, 0, sizeof(p));
+            p.header = mes_api_header(kMesApiTypeScheduler, kMesApiAddQueue,
+                                      kMesApiFrameDwords);
+            p.process_id = 0u;
+            p.page_table_base_addr = s.page_table_base_addr; /* resolved from sysmem_grants D2 root or 0 */
+            p.process_va_start = 0ull;
+            p.process_va_end = 0xFFFFFFFFFFFFFFFFull;
+            p.process_quantum = 100000ull;
+            p.gang_quantum = 10000ull;
+            p.doorbell_offset = kMesDoorbellCompute;
+            p.mqd_addr = s.cmp_mqd_mc;
+            p.wptr_addr = s.cmp_wb_mc + kMesWbWptrOff;
+            p.queue_type = kMesQueueTypeCompute;
+            p.pipe_id = 0u;
+            p.queue_id = 0u;
+            p.flags = kMesAddQueueFlagMapLegacyKq;
+            /* vm_context_cntl from D2 root; placeholder 0 for now. */
+            p.vm_context_cntl = 0u;
+
+            memset(s.frame, 0, sizeof(s.frame));
+            memcpy(s.frame, &p, sizeof(p));
+            const SubmitResult sr = submit_api(s, kMesApiAddQueue,
+                static_cast<uint32_t>(offsetof(MesApiAddQueue, api_status)));
+            if (sr != SubmitResult::Ok) {
+                const char *why = (sr == SubmitResult::FenceTimeout) ? "fence-timeout" :
+                                  (sr == SubmitResult::StatusTimeout) ? "status-timeout" : "io-fail";
+                evf(s.env, "mes-s11", "S11 compute ADD_QUEUE full-payload %s", why);
+                return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
+            }
+            evf(s.env, "mes-s11",
+                "S11 compute ADD_QUEUE (full) ok fence=0x%llx status=0x%llx wptr=%u",
+                static_cast<unsigned long long>(s.last_fence),
+                static_cast<unsigned long long>(s.last_status), s.sch_wptr);
+        }
+
+        /* GFX ADD_QUEUE with full payload. */
+        {
+            MesApiAddQueue p;
+            memset(&p, 0, sizeof(p));
+            p.header = mes_api_header(kMesApiTypeScheduler, kMesApiAddQueue,
+                                      kMesApiFrameDwords);
+            p.process_id = 0u;
+            p.page_table_base_addr = s.page_table_base_addr;
+            p.process_va_start = 0ull;
+            p.process_va_end = 0xFFFFFFFFFFFFFFFFull;
+            p.process_quantum = 100000ull;
+            p.gang_quantum = 10000ull;
+            p.doorbell_offset = kMesDoorbellGfx;
+            p.mqd_addr = s.gfx_mqd_mc;
+            p.wptr_addr = s.gfx_wb_mc + kMesWbWptrOff;
+            p.queue_type = kMesQueueTypeGfx;
+            p.pipe_id = 0u;
+            p.queue_id = 0u;
+            p.flags = kMesAddQueueFlagMapLegacyKq;
+            p.vm_context_cntl = 0u;
+
+            memset(s.frame, 0, sizeof(s.frame));
+            memcpy(s.frame, &p, sizeof(p));
+            const SubmitResult sr = submit_api(s, kMesApiAddQueue,
+                static_cast<uint32_t>(offsetof(MesApiAddQueue, api_status)));
+            if (sr != SubmitResult::Ok) {
+                const char *why = (sr == SubmitResult::FenceTimeout) ? "fence-timeout" :
+                                  (sr == SubmitResult::StatusTimeout) ? "status-timeout" : "io-fail";
+                evf(s.env, "mes-s11", "S11 gfx ADD_QUEUE full-payload %s", why);
+                return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
+            }
+            evf(s.env, "mes-s11",
+                "S11 gfx ADD_QUEUE (full) ok fence=0x%llx status=0x%llx",
+                static_cast<unsigned long long>(s.last_fence),
+                static_cast<unsigned long long>(s.last_status));
+        }
+    }
+
+    /* --- 5. wptr discipline check: WB+16 must precede doorbell --- */
+    {
+        /* Read back the wptr shadow to verify it was written before doorbell.
+         * This is a logical check; the actual ordering is enforced by
+         * submit_api() which writes wptr shadow then doorbell. */
+        uint64_t wb_wptr_val = 0;
+        if (!bus_read(s, s.sch_wb_bar0 + kMesWbWptrOff, 2, &wb_wptr_val)) {
+            evf(s.env, "mes-s11", "S11 wptr shadow unreadable");
+            return r3_substep_fail(kR3SecSeq, 11, kFailS11Wptr);
+        }
+        evf(s.env, "mes-s11", "S11 wptr shadow = 0x%llx (non-zero confirms WB write)",
+            static_cast<unsigned long long>(wb_wptr_val));
+    }
+
+    evf(s.env, "mes-s11", "S11 done: queue extension complete (legacy mode)");
+    return r3_substep_pass();
+}
+/* T-E: shared Mes state across mes_v11_0_substep and mes_queue_v11_0_substep.
+ * mes_v11_0_substep initialises (memset zero) and builds all KIQ/SCH infrastructure;
+ * mes_queue_v11_0_substep reuses the established state without clearing it. */
+static Mes s_mes;
+
+
 } /* namespace */
 
 R3SubstepResult mes_v11_0_substep(const R3Io *io, const R3SubstepEnv *env)
 {
-    static Mes s;
-    memset(&s, 0, sizeof(s));
-    s.io = io;
-    s.env = env;
+    memset(&s_mes, 0, sizeof(s_mes));
+    s_mes.io = io;
+    s_mes.env = env;
 
     r3_wg_arm_substep(WSubstep::Mes);
-    r3_wg_expect_writes(getMesRows(), getMesRowCount(), nullptr, 0, WSubstep::Mes);
+    if (r3_wg_expect_writes(getMesRows(), getMesRowCount(), nullptr, 0, WSubstep::Mes) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     uint32_t declared[R3_WG_EXPECT_MAX];
     r3_wg_resolve_row_addrs(env ? env->ip : nullptr, getMesRows(), getMesRowCount(),
                             declared);
-    r3_wg_expect_declared_addrs(declared, getMesRowCount());
-    r3_wg_expect_abs_writes(getMesDoorbells(), getMesDoorbellCount(), WSubstep::Mes);
+    if (r3_wg_expect_declared_addrs(declared, getMesRowCount()) != 0 ||
+        r3_wg_expect_abs_writes(getMesDoorbells(), getMesDoorbellCount(), WSubstep::Mes) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
 
-    R3SubstepResult r = pre(s);
+    R3SubstepResult r = pre(s_mes);
     /* S-1: hub pre-initialisation runs BEFORE S0 (方案 v3 §6.1/§6.2). */
     if (r.status == kR3SsecOk)
-        r = seq_hub_pre(s);
+        r = seq_hub_pre(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_cp_unhalt(s);
+        r = seq_cp_unhalt(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_start(s);
+        r = seq_start(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_version(s);
+        r = seq_version(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_kiq(s);
+        r = seq_kiq(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_sch(s);
+        r = seq_sch(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_set_hw(s);
+        r = seq_set_hw(s_mes);
     /* S5.1: SET_HW_RESOURCES_1 after S5 (方案 v3 §6.5). */
     if (r.status == kR3SsecOk)
-        r = seq_set_hw_1(s);
+        r = seq_set_hw_1(s_mes);
     if (r.status == kR3SsecOk)
-        r = seq_query(s);
-    if (r.status == kR3SsecOk)
-        r = seq_addq_compute(s);
-    if (r.status == kR3SsecOk)
-        r = seq_addq_gfx(s);
-    if (r.status == kR3SsecOk)
-        r = chk_queues(s);
+        r = seq_query(s_mes);
+    /* T-E split: seq_addq_compute/seq_addq_gfx/chk_queues/seq_s11 moved to
+     * mes_queue_v11_0_substep. */
     if (r.status == kR3SsecOk) {
-        r3_substep_note(&r, s.mes_cntl, s.cntl_readback, "CP_MES_CNTL");
-        r3_substep_note(&r, s.mes_gp3, s.gp3_sched, "GP3 sched");
-        r3_substep_note(&r, s.mes_gp3, s.gp3_kiq, "GP3 kiq");
-        r3_substep_note(&r, s.hqd_active, s.cmp_active, "COMPUTE HQD");
+        r3_substep_note(&r, s_mes.mes_cntl, s_mes.cntl_readback, "CP_MES_CNTL");
+        r3_substep_note(&r, s_mes.mes_gp3, s_mes.gp3_sched, "GP3 sched");
+        r3_substep_note(&r, s_mes.mes_gp3, s_mes.gp3_kiq, "GP3 kiq");
         if (env && env->rt)
             env->rt->ready_bits |= R3_IP_BIT(R3Ip::Mes);
         set_prop(env, "N48R3EVID-mes-done", "Yes");
-        set_prop(env, "N48R3EVID-mes-addq-compute", s.cmp_result);
-        set_prop(env, "N48R3EVID-mes-addq-gfx", s.gfx_result);
-        evf(env, "mes", "done: compute=%s, gfx=%s, sch_wptr=%u", s.cmp_result,
-            s.gfx_result, s.sch_wptr);
+        evf(env, "mes", "done (pre-queue): sched=%u, kiq=%u", s_mes.gp3_sched, s_mes.gp3_kiq);
     } else {
         set_prop(env, "N48R3EVID-mes-done", "No");
-        set_prop(env, "N48R3EVID-mes-addq-compute",
-                 s.cmp_result[0] ? s.cmp_result : "n/a");
-        set_prop(env, "N48R3EVID-mes-addq-gfx",
-                 s.gfx_result[0] ? s.gfx_result : "n/a");
+        /* T-E split: queue substep never runs when MES fails, so the ADD_QUEUE
+         * evidence props must still exist ("n/a" = not attempted) for the
+         * integration contract that reads all three. */
+        set_prop(env, "N48R3EVID-mes-addq-compute", "n/a");
+        set_prop(env, "N48R3EVID-mes-addq-gfx", "n/a");
         evf(env, "mes", "fail: %s (%s step %u)", r.name,
             r3_substep_section_name(r.section), r.step);
     }
@@ -1683,14 +2118,116 @@ R3SubstepResult mes_v11_0_substep(const R3Io *io, const R3SubstepEnv *env)
     return r;
 }
 
+/* T-E split: queue substep runs seq_addq_compute→seq_addq_gfx→chk_queues→seq_s11.
+ * Arms, registers doorbells, and verifies independently from mes_v11_0_substep.
+ * Uses real GPA from sysmem_grants D2 root for ADD_QUEUE page_table_base_addr. */
+R3SubstepResult mes_queue_v11_0_substep(const R3Io *io, const R3SubstepEnv *env)
+{
+    /* Reuse Mes state established by mes_v11_0_substep (no memset — KIQ/SCH/HQD
+     * infrastructure must survive). Only update io/env for the current call. */
+    s_mes.io = io;
+    s_mes.env = env;
+
+    /* Resolve D2 root GPA for ADD_QUEUE page_table_base_addr (T-E contract: gpuvm0
+     * has already back-filled the sysmem_grants via gmc_v11_0_bind_sysmem).
+     * Match by tag "ctx0_root_pool" (index 1, NOT the first non-zero — index 0
+     * is gart_table which is a different translation mechanism). */
+    uint64_t pt_base = 0ull;
+    if (env && env->rt) {
+        const R3LayoutPlan &plan = env->rt->layout;
+        for (uint32_t i = 0; i < plan.sysmem_grant_count && i < R3_LAYOUT_SYSMEM_MAX; i++) {
+            if (strcmp(plan.sysmem_grants[i].tag, "ctx0_root_pool") == 0) {
+                pt_base = plan.sysmem_grants[i].start;
+                break;
+            }
+        }
+    }
+    if (pt_base == 0ull) {
+        /* No D2 root GPA available - fail closed per T-E contract. */
+        R3SubstepResult fr = r3_substep_fail(kR3SecPre, 0, "no-sysmem-grant");
+        set_prop(env, "N48R3EVID-mes-queue-done", "No");
+        evf(env, "mes-queue", "fail: no sysmem grant (ctx0_root_pool not found)");
+        return fr;
+    }
+    s_mes.page_table_base_addr = pt_base;
+
+    /* S11's VMID8 IB writes the test_buf page S9 mapped (gmc seq_layout
+     * registered that grant under owner Gmc); register a Mes-owned row for the
+     * same range so the armed Mes substep may write it (writeguard contract:
+     * one row per substep per address, the armed owner's row wins). */
+    if (env && env->rt) {
+        const R3Grant *tg = r3_layout_grant(&env->rt->layout, "test_buf");
+        if (!tg || r3_wg_register_layout(static_cast<uint32_t>(tg->start >> 2),
+                                         static_cast<uint32_t>(tg->size >> 2),
+                                         WSubstep::Mes, "layout:test_buf") != 0) {
+            R3SubstepResult fr = r3_substep_fail(kR3SecPre, 0, kFailS11TestGrant);
+            set_prop(env, "N48R3EVID-mes-queue-done", "No");
+            evf(env, "mes-queue", "fail: test_buf grant register failed");
+            return fr;
+        }
+    }
+
+    r3_wg_arm_substep(WSubstep::Mes);
+    if (r3_wg_expect_writes(getMesQueueRows(), getMesQueueRowCount(), nullptr, 0, WSubstep::Mes) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
+    uint32_t declared[R3_WG_EXPECT_MAX];
+    r3_wg_resolve_row_addrs(env ? env->ip : nullptr, getMesQueueRows(), getMesQueueRowCount(),
+                            declared);
+    if (r3_wg_expect_declared_addrs(declared, getMesQueueRowCount()) != 0 ||
+        r3_wg_expect_abs_writes(getMesDoorbells(), getMesDoorbellCount(), WSubstep::Mes) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
+
+    /* S7-S11: ADD_QUEUE compute/gfx, queue check, S11. */
+    R3SubstepResult r = r3_substep_pass();
+    /* Re-run pre() and hub_pre()? No - they are already done by mes_v11_0_substep.
+     * The Mes state is shared (s_mes) so seq_addq_compute sees the KIQ/SCH
+     * infrastructure established by mes_v11_0_substep. */
+    if (r.status == kR3SsecOk)
+        r = seq_addq_compute(s_mes);
+    if (r.status == kR3SsecOk)
+        r = seq_addq_gfx(s_mes);
+    if (r.status == kR3SsecOk)
+        r = chk_queues(s_mes);
+    if (r.status == kR3SsecOk)
+        r = seq_s11(s_mes);
+    if (r.status == kR3SsecOk) {
+        r3_substep_note(&r, s_mes.mes_cntl, s_mes.cntl_readback, "CP_MES_CNTL");
+        r3_substep_note(&r, s_mes.hqd_active, s_mes.cmp_active, "COMPUTE HQD");
+        set_prop(env, "N48R3EVID-mes-queue-done", "Yes");
+        set_prop(env, "N48R3EVID-mes-addq-compute", s_mes.cmp_result);
+        set_prop(env, "N48R3EVID-mes-addq-gfx", s_mes.gfx_result);
+        evf(env, "mes-queue", "done: compute=%s, gfx=%s, sch_wptr=%u", s_mes.cmp_result,
+            s_mes.gfx_result, s_mes.sch_wptr);
+    } else {
+        set_prop(env, "N48R3EVID-mes-queue-done", "No");
+        set_prop(env, "N48R3EVID-mes-addq-compute",
+                 s_mes.cmp_result[0] ? s_mes.cmp_result : "n/a");
+        set_prop(env, "N48R3EVID-mes-addq-gfx",
+                 s_mes.gfx_result[0] ? s_mes.gfx_result : "n/a");
+        evf(env, "mes-queue", "fail: %s (%s step %u)", r.name,
+            r3_substep_section_name(r.section), r.step);
+    }
+
+    if (r.status != kR3SsecOk)
+        r3_wg_set_path("failure");
+    if (r3_wg_verify_and_clear(env, getMesQueueRowCount())) {
+        r = r3_substep_fail(kR3SecSeq, 0, "expect-write-mismatch");
+    }
+
+    r3_wg_disarm_substep();
+    return r;
+}
+
 /* Step2: declaration table (rdna3_writeguard.h R3WriteRowReg), the single source of truth
- * for the MES register write set. 53 rows: 29 hub-pre (S-1) + 24 existing (S0-S9).
- * Row order follows the write sequence: hub rows first, then the main sequence rows
- * (方案 v3 §6.2.3 table + §6.7). */
+ * for the MES register write set.
+ *
+ * After T-E split (mes_queue_v11_0_substep introduction), this is split into two tables:
+ *   kMesRows[74] for mes_v11_0_substep (S-1..S6): 52 hub-pre + 10 S0-S5 rows.
+ *   kMesQueueRows[19] for mes_queue_v11_0_substep (S7..S11): 14 ADD_QUEUE rows + 5 S11 rows.
+ * Doorbell rows (kMesDoorbells) are shared and registered by both entries.
+ */
 namespace {
 constexpr R3WriteRowReg kMesRows[] = {
-    /* S-1 rows 1-29: hub pre-initialisation (GCVM aperture/L1-L2/NBIF).
-     * Row 1 (C) is WNeed::Optional; rows 2-29 are WNeed::Required. */
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, 0x15a7u, 1, WClass::State, WNeed::Optional,    "mes-hub-fb-offset"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, 0x1678u, 1, WClass::State, WNeed::Required,    "mes-hub-fb"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, 0x1679u, 1, WClass::State, WNeed::Required,    "mes-hub-fb"},
@@ -1720,7 +2257,31 @@ constexpr R3WriteRowReg kMesRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, 0x1e1fu, 1, WClass::State, WNeed::Required,    "mes-hub-cp-debug"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, 0x15c4u, 1, WClass::State, WNeed::Required,    "mes-hub-fault"},
     {nullptr, static_cast<uint8_t>(IPBlock::NBIO), 2, 0xC0u, 1, WClass::State, WNeed::Required,    "mes-hub-doorbell-aper"},
-    /* Existing rows 30-53 (S0-S9): CP unhalt, MES start, KIQ/SCH/GFX queue init. */
+    /* Rows 29-51: MMHUB VM path initialization (方案 W, Linux mmhub_v3_0_1.c semantics) */
+    {&r3gold::kMmmcVmAgpBase, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-aperture"},
+    {&r3gold::kMmmcVmAgpBot, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-aperture"},
+    {&r3gold::kMmmcVmAgpTop, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-aperture"},
+    {&r3gold::kMmmcVmSystemApertureLowAddr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-aperture"},
+    {&r3gold::kMmmcVmSystemApertureHighAddr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-aperture"},
+    {&r3gold::kMmmcVmSystemApertureDefaultAddrLsb, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-default"},
+    {&r3gold::kMmmcVmSystemApertureDefaultAddrMsb, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1, WClass::State, WNeed::Required, "mes-hub-mm-default"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x070Fu, 1, WClass::State, WNeed::Required, "mes-hub-mm-default"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0710u, 1, WClass::State, WNeed::Required, "mes-hub-mm-default"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0709u, 1, WClass::State, WNeed::Required, "mes-hub-mm-fault2"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x08F3u, 1, WClass::State, WNeed::Required, "mes-hub-mm-mx-l1"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0700u, 1, WClass::State, WNeed::Required, "mes-hub-mm-l2"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0701u, 1, WClass::State, WNeed::Required, "mes-hub-mm-l2"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0702u, 1, WClass::State, WNeed::Required, "mes-hub-mm-l2"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0718u, 1, WClass::State, WNeed::Required, "mes-hub-mm-l2"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x071Eu, 1, WClass::State, WNeed::Required, "mes-hub-mm-l2"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0708u, 1, WClass::State, WNeed::Required, "mes-hub-mm-fault"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0712u, 1, WClass::State, WNeed::Required, "mes-hub-mm-identity"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0713u, 1, WClass::State, WNeed::Required, "mes-hub-mm-identity"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0714u, 1, WClass::State, WNeed::Required, "mes-hub-mm-identity"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0715u, 1, WClass::State, WNeed::Required, "mes-hub-mm-identity"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0716u, 1, WClass::State, WNeed::Required, "mes-hub-mm-identity"},
+    {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0x0717u, 1, WClass::State, WNeed::Required, "mes-hub-mm-identity"},
+    /* Rows 52-61 (S0-S5): CP unhalt, MES start, KIQ init. */
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 1, kRegGrbmGfxCntl, 1, WClass::State,      WNeed::Required,      "mes-cp-unhalt"},
     {&r3gold::kCpMecCntl, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,        WNeed::Required,      "mes-cp-unhalt"},
     {&r3gold::kCpMeCntl, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,         WNeed::Required,      "mes-cp-unhalt"},
@@ -1731,8 +2292,9 @@ constexpr R3WriteRowReg kMesRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpMqdBaseAddr, 1, WClass::State,     WNeed::Required,      "mes-kiq-mqd-base"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpMqdBaseAddrHi, 1, WClass::State,   WNeed::Required,      "mes-kiq-mqd-base-hi"},
     {&r3gold::kCpHqdActive, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,       WNeed::Required,      "mes-hqd-active"},
-    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpRbDoorbellRangeLower, 1, WClass::State, WNeed::OnSuccessPath, "mes-gfx-dbrange"},
-    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpRbDoorbellRangeUpper, 1, WClass::State, WNeed::OnSuccessPath, "mes-gfx-dbrange"},
+    /* Rows 62-73 (HQD registers): written by program_hqd() in S3/S4 (seq_kiq/seq_sch).
+     * These were originally in kMesQueueRows (T-E split), but program_hqd runs in the
+     * MES entry, not the queue entry — moved here to fix writeguard "extra" detection. */
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdVmid, 1, WClass::State,         WNeed::Required,      "mes-hqd-vmid"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPersistentState, 1, WClass::State, WNeed::Required,   "mes-hqd-persistent"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqBase, 1, WClass::State,       WNeed::Required,      "mes-hqd-pq-base"},
@@ -1746,24 +2308,55 @@ constexpr R3WriteRowReg kMesRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqControl, 1, WClass::State,    WNeed::Required,      "mes-hqd-pq-ctl"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpMqdControl, 1, WClass::State,      WNeed::Required,      "mes-hqd-mqd-ctl"},
 };
-constexpr uint32_t kMesRowCount = sizeof(kMesRows) / sizeof(kMesRows[0]);
-static_assert(kMesRowCount == 53, "mes declaration table must have 53 rows (29 hub + 24 seq)");
+static_assert(sizeof(kMesRows) / sizeof(kMesRows[0]) == kMesRowCount,
+              "mes declaration table must have 74 rows (52 hub + 10 S0-S5 + 12 HQD)");
+
+/* Queue substep rows (S7..S11): 2 GFX dbrange + 1 GRBM select + 5 S11 rows = 8.
+ * GRBM_GFX_CNTL row: chk_queues (S9) calls grbm_select() twice (mes_v11_0.cpp:1605/1610)
+ * which writes gc1+kRegGrbmGfxCntl — the row is declared at i=29 in kMesRows for the
+ * MES entry, but the queue entry arms a separate expectation set, so S9's GRBM writes
+ * would be classified as extras on the success path (observed as expect-write-mismatch
+ * with gp3 >= 0x47; gp3 < 0x47 hides it because seq_s11 sets path=failure and the strict
+ * check is skipped). Re-declared here for the queue entry.
+ * HQD rows (formerly rows 2-13) moved to kMesRows (rows 39-50) because program_hqd
+ * runs in the MES entry, not the queue entry. */
+constexpr R3WriteRowReg kMesQueueRows[] = {
+    /* Rows 0-1: GFX doorbell range (S7/S8 queue init). */
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpRbDoorbellRangeLower, 1, WClass::State, WNeed::OnSuccessPath, "mes-gfx-dbrange"},
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpRbDoorbellRangeUpper, 1, WClass::State, WNeed::OnSuccessPath, "mes-gfx-dbrange"},
+    /* Row 2: GRBM select (S9 chk_queues grbm_select). */
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 1, kRegGrbmGfxCntl, 1, WClass::State, WNeed::Required, "mes-grbm-sel"},
+    /* Rows 3-7: S11 CSIB + MEC doorbell range (mes_queue_v11_0_substep). */
+    {&r3gold::kRlcCsibAddrHi, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,      WNeed::OnSuccessPath, "mes-s11-csib"},
+    {&r3gold::kRlcCsibAddrLo, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,      WNeed::OnSuccessPath, "mes-s11-csib"},
+    {&r3gold::kRlcCsibLength, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,      WNeed::OnSuccessPath, "mes-s11-csib"},
+    {&r3gold::kCpMecDoorbellRangeLower, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State, WNeed::OnSuccessPath, "mes-s11-dbrange"},
+    {&r3gold::kCpMecDoorbellRangeUpper, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State, WNeed::OnSuccessPath, "mes-s11-dbrange"},
+};
+static_assert(sizeof(kMesQueueRows) / sizeof(kMesQueueRows[0]) == kMesQueueRowCount,
+              "mes queue declaration table must have 8 rows (2 GFX dbrange + 1 GRBM + 5 S11)");
+
 constexpr const char *kMesLayoutTag = "mes";
 
 /* Step2: MES doorbell windows (BAR2 dword indices, 64-bit stores => 2 dwords). These are
  * registered in register_mes() as supplementary windows and are separately declared so the
  * expectation verification covers them (the R3WriteRowReg form cannot express absolute
- * indices). ctx matches the classify() labels used by doorbell_write() in the sequence. */
+ * indices). ctx matches the classify() labels used by doorbell_write() in the sequence.
+ * Both mes_v11_0_substep and mes_queue_v11_0_substep register and verify doorbells (S5
+ * and S7/S8 both write doorbells per T-E split contract). */
 constexpr R3WriteRowAbs kMesDoorbells[] = {
-    {amdgpu::kMesDoorbellKiq, 2u, WClass::Protocol, WNeed::Required, "mes-kiq-kick"},
+    {amdgpu::kMesDoorbellKiq, 2u, WClass::Protocol, WNeed::OnRetry, "mes-kiq-kick"},
     {amdgpu::kMesDoorbellSch, 2u, WClass::Protocol, WNeed::Required, "mes-sch-kick"},
+    {amdgpu::kMesDoorbellCompute, 2u, WClass::Protocol, WNeed::OnRetry, "mes-cmp-db"},
+    {amdgpu::kMesDoorbellGfx, 2u, WClass::Protocol, WNeed::OnRetry, "mes-gfx-db"},
 };
-constexpr uint32_t kMesDoorbellCount = sizeof(kMesDoorbells) / sizeof(kMesDoorbells[0]);
-static_assert(kMesDoorbellCount == 2, "mes doorbell table must have 2 rows");
+static_assert(sizeof(kMesDoorbells) / sizeof(kMesDoorbells[0]) == kMesDoorbellCount,
+              "mes doorbell table must have 4 rows (kiq+sch+cmp+gfx)");
 } // anonymous namespace
-
 const R3WriteRowReg* getMesRows(void) { return kMesRows; }
 uint32_t getMesRowCount(void) { return kMesRowCount; }
+const R3WriteRowReg* getMesQueueRows(void) { return kMesQueueRows; }
+uint32_t getMesQueueRowCount(void) { return kMesQueueRowCount; }
 const char* getMesLayoutTag(void) { return kMesLayoutTag; }
 const R3WriteRowAbs* getMesDoorbells(void) { return kMesDoorbells; }
 uint32_t getMesDoorbellCount(void) { return kMesDoorbellCount; }

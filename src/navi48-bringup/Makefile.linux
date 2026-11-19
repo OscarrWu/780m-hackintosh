@@ -1,10 +1,12 @@
 # Makefile.linux — Linux 交叉编译 Navi48Bringup.kext（原 Makefile 的 Linux 适配版，勿改原文件）。
 # 工具链前提见 docs/Linux快速迭代编译指南.md（clang + /opt/cctools ld64 + /opt/MacKernelSDK + /opt/dispatch）。
 # Reuses RDNA4FB's MacKernelSDK. Targets macOS 11 ABI (loads on 11+, incl. Tahoe).
-#   make -f Makefile.linux TARGET=rdna4 all   -> build/rdna4/Navi48Bringup.kext
-#   make -f Makefile.linux TARGET=rdna3 all   -> build/rdna3/Navi48Bringup.kext
-#   make -f Makefile.linux TARGET=rdna3 install  -> src/build/rdna3/Navi48Bringup.kext
-#   make -f Makefile.linux clean
+#   make -f Makefile.linux TARGET=rdna4 all   -> build/rdna4/Navi48Bringup.kext + 同步 src/build/rdna4/
+#   make -f Makefile.linux TARGET=rdna3 all   -> build/rdna3/Navi48Bringup.kext + 同步 src/build/rdna3/
+#   make -f Makefile.linux TARGET=rdna3 install  -> 仅显式同步到 src/build/rdna3/Navi48Bringup.kext
+#   make -f Makefile.linux TARGET=rdna3 deploy-check -> 只读校验构建产物与 src/build/rdna3/ 的 md5 一致
+#   make -f Makefile.linux clean  -> remove build/$(TARGET) + generated fw arrays
+#   make -f Makefile.linux distclean  -> wipe BOTH targets' build trees + fw arrays
 
 PRODUCT   := Navi48Bringup
 BUNDLE_ID := com.navi48.bringup
@@ -135,10 +137,13 @@ CFLAGS   := $(COMMON)
 # src/rdna3/fw_table_rdna3.cpp provides the same FwId interface with the ten embedded RDNA3
 # blobs and is picked up by the src/rdna3/*.cpp wildcard in CXX_SRCS below.
 ifeq ($(TARGET),rdna3)
-CXX_SRCS := $(wildcard src/common/*.cpp src/rdna3/*.cpp) src/ipdiscovery.cpp src/amd/n48log.cpp \
+CXX_SRCS := $(wildcard src/common/*.cpp src/rdna3/*.cpp) src/ipdiscovery.cpp src/amd/n48log.cpp src/amd/amdgpu_sysmem.cpp \
             $(wildcard src/amd/psp_v13_*.cpp src/amd/smu_v13_*.cpp \
                       src/amd/gfx_v11_*.cpp src/amd/sdma_v6_*.cpp \
-                      src/amd/mes_v11_*.cpp)
+                      src/amd/mes_v11_*.cpp src/amd/ih_v6_*.cpp \
+                      src/amd/gmc_v11_*.cpp \
+                      src/amd/pm4_v11*.cpp src/amd/mqd_v11*.cpp src/amd/compute_v11*.cpp)
+
 C_SRCS   := src/kmod_info.c
 INFO_PLIST := Info-rdna3.plist
 RDNA3_C_SRCS := $(wildcard ../xlat11/*.c ../dcn314/*.c)
@@ -181,7 +186,14 @@ LD := LD_LIBRARY_PATH=/opt/dispatch/lib /opt/cctools/bin/x86_64-apple-darwin-ld
 LDFLAGS  := -arch $(ARCH) -kext -platform_version macos $(DEPLOY) 11.0 \
   -L$(MKSDK)/Library/universal -L$(MKSDK)/Library/x86_64 -lkmodc++ -lkmod
 
+# all = 构建 + 同步部署暂存区。与 install 共享同一段原子替换 + md5 自检 recipe，因此不存在
+# 「构建成功但暂存区仍是旧件」的中间状态。候选构建（SHADERCACHE_BLOB 非空）只构建到 $(BUILD)：
+# 其 install 目标本身即报错拒绝，故候选构建不依赖 install。
+ifeq ($(strip $(SHADERCACHE_BLOB)),)
+all: $(KEXT) install
+else
 all: $(KEXT)
+endif
 
 $(OBJS): | check-firmware
 check-firmware:
@@ -245,9 +257,9 @@ $(BUILD)/dcn41/%.o: $(DCN41_DIR)/%.c
 # D-06: the symbol gate's "ours" families are target-specific. rdna3 owns NaviR3/n48r3/
 # xlat11/dcn314/fw_table_rdna3; the rdna4 families are unchanged.
 ifeq ($(TARGET),rdna3)
-GATE_OURS := NaviR3|n48r3|xlat11|dcn314|fw_table_rdna3|amdgpu::|gN48Pf540On|navi48_pf540_log_note
+GATE_OURS := NaviR3|n48r3|xlat11|dcn314|fw_table_rdna3|__ZN6amdgpu|gN48Pf540On|navi48_pf540_log_note
 else
-GATE_OURS := Navi48|AmdTtl|amdgpu::|n48::|n48dcn::|xlat12|_sc_|dcn41_
+GATE_OURS := Navi48|AmdTtl|__ZN6amdgpu|n48::|n48dcn::|xlat12|_sc_|dcn41_
 endif
 
 $(KEXT): $(OBJS) $(INFO_PLIST)
@@ -308,13 +320,16 @@ tools-macos:
 	@echo "Built $(N48R3TEST) (register its md5 in the deployment guide's product-status line)"
 .PHONY: tools-macos
 
-# Install (方案 A): copy the freshly built kext to the deployment staging area
-# src/build/<target>/ — the authoritative source copied to the target machine's
-# EFI and md5-registered in the deployment guide. Same arrangement as N48R3TEST
-# above: the product lands directly in the deployment location, NOT under
-# $(BUILD), which is kext-only and wiped by clean. Depending on $(KEXT) means a
-# stale source rebuilds first and a failed build aborts before anything is
-# copied, so the staging area keeps the previous good product (never half-new).
+# 部署同步语义：all / install / deploy-check 三者围绕同一份「原子复制 + md5 自检」逻辑。
+#   all（非候选构建）= 构建 $(KEXT) 后自动同步部署暂存区（见上方 all 定义）。这样任何一次
+#     正常构建都会更新暂存区，不存在「构建成功但暂存区停留在旧件」的状态——那正是历史上
+#     真机取证拿到旧 md5 的原因。
+#   install = 显式同步（保留原行为）：把 $(KEXT) 原子复制到部署暂存区 src/build/<target>/。
+#   deploy-check = 只读校验两者 md5 一致（不复制、不构建）。
+# 部署暂存区 src/build/<target>/ 才是被复制到目标机 EFI、并在部署指南里登记 md5 的权威交付
+# 位置；$(BUILD) 只是中间产物目录且会被 clean 清掉。与上方 N48R3TEST 同一安排：交付物直接落
+# 部署位置。install 依赖 $(KEXT)：源过期会先重建，构建失败则在复制之前中止，暂存区保留上一份
+# 可用产物（原子替换 tmp+mv，永不半新半旧）。
 DEPLOY_ROOT := $(abspath $(dir $(firstword $(MAKEFILE_LIST)))../../build)
 DEPLOY_KEXT := $(DEPLOY_ROOT)/$(TARGET)/$(PRODUCT).kext
 
@@ -342,7 +357,40 @@ install: $(KEXT)
 endif
 .PHONY: install
 
+# deploy-check: 只读校验。比较构建产物 $(EXEC) 与部署暂存区件的 md5，不一致或缺失即非零退出，
+# 便于在真机取证/部署前机械确认「暂存区不是旧件」。不复制、不构建。
+deploy-check:
+	@src=$(EXEC); dst=$(DEPLOY_KEXT)/Contents/MacOS/$(PRODUCT); \
+	if [ ! -f "$$src" ]; then \
+	  echo "error: 构建产物不存在：$$src"; \
+	  echo "       请先运行 make -f Makefile.linux TARGET=$(TARGET) all"; exit 1; \
+	fi; \
+	if [ ! -f "$$dst" ]; then \
+	  echo "error: 部署暂存区缺少该产品：$$dst"; \
+	  echo "       请先运行 make -f Makefile.linux TARGET=$(TARGET) install"; exit 1; \
+	fi; \
+	src_md5=$$(md5sum "$$src" | awk '{print $$1}'); \
+	dst_md5=$$(md5sum "$$dst" | awk '{print $$1}'); \
+	echo "md5 $$src: $$src_md5"; \
+	echo "md5 $$dst: $$dst_md5"; \
+	if [ "$$src_md5" != "$$dst_md5" ]; then \
+	  echo "error: 构建产物与部署暂存区不一致（暂存区是旧件），请运行 make -f Makefile.linux TARGET=$(TARGET) install 重新同步"; \
+	  exit 1; \
+	fi
+.PHONY: deploy-check
+
 clean:
 	rm -rf $(BUILD)
 	rm -f src/fw/fw_*.c
+
 .PHONY: all clean
+
+# distclean: wipe BOTH targets' build trees and the generated firmware arrays,
+# regardless of the current TARGET (clean only clears build/$(TARGET), so
+# switching between rdna3/rdna4 development leaves the other target's stale
+# products behind). The deployment staging area src/build/ (DEPLOY_ROOT above,
+# the md5-registered delivery anchor) is deliberately NOT touched.
+distclean:
+	rm -rf build/rdna3 build/rdna4
+	rm -f src/fw/fw_*.c
+.PHONY: distclean

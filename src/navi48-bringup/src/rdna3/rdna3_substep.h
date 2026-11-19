@@ -75,7 +75,7 @@ enum R3SubstepStatus : uint8_t {
 // label (E1: every failure names its reason, the snapshot and the substep). `readings`
 // carries up to `n` named values that belong to the failing section, so the evidence export
 // can show them even on the failure path (§8.3: partial evidence still lands).
-#define R3_SUBSTEP_READINGS 4u
+#define R3_SUBSTEP_READINGS 8u
 
 struct R3SubstepReading {
     uint32_t    addr;   // BAR5 dword the value came from, or 0 when `what` is not a register

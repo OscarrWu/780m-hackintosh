@@ -61,16 +61,16 @@ static inline bool r3_tmr_addr(uint32_t vram_mb, uint64_t *out) {
     return true;
 }
 
-// Stage-0 depth: T1..T6 = 0..5. Any other value falls back to T1 (the conservative default).
+// Stage-0 depth: T1..T15 = 0..14. Any other value falls back to T1 (the conservative default).
 // The entry class owns its own boot-arg clamp; this one guards the ladder against a bad setter.
-#define R3_STAGE0_MAX_DEPTH  5u
-#define R3_STAGE0_TIER_COUNT 6u
+#define R3_STAGE0_MAX_DEPTH  14u
+#define R3_STAGE0_TIER_COUNT 15u
 
 static inline uint32_t r3_stage_depth_clamp(uint32_t depth) {
     return depth <= R3_STAGE0_MAX_DEPTH ? depth : 0u;
 }
 
-// Tiers admitted by depth: depth 0 (default) = T1 only, depth 5 = T1..T6.
+// Tiers admitted by depth: depth 0 (default) = T1 only, depth 14 = T1..T15.
 static inline uint32_t r3_stage_depth_tiers(uint32_t depth) {
     return r3_stage_depth_clamp(depth) + 1u;
 }
@@ -83,7 +83,7 @@ static inline bool r3_stage_depth_reaches(uint32_t depth, uint32_t tier) {
 // Run-level prerequisite model (v1.7, requirement C0.9). Pure so the host tests can
 // exercise the exact strings the driver publishes.
 //
-// Depth index semantics stay 0..5 = T1..T6. A stage >= 1 consumes the discovery table
+// Depth index semantics stay 0..14 = T1..T15. A stage >= 1 consumes the discovery table
 // (T2) and the FB/GTT dual read (T3), so its floor is depth 2. The knob stays a breadth
 // preference: effective = max(requested, floor), and the plan records the raise.
 // ---------------------------------------------------------------------------
@@ -595,6 +595,11 @@ static constexpr uint32_t R3_LADDER_FIRST_SUBSTEP = 2u;
 void r3_stage0_set_depth(uint32_t depth);
 uint32_t r3_stage0_depth(void);
 
+// T-E: bind the GMC sysmem allocator before the ladder runs (prepare_stage2
+// calls gmc_v11_0_bind_sysmem with it). The allocator serves uma/gart/gpuvm0/vmid8
+// substeps (S6-S9) for D1-D3 system-memory page tables.
+namespace amdgpu { struct GmcSysmemAlloc; }
+void r3_stages_set_sysmem_allocator(const amdgpu::GmcSysmemAlloc *alloc);
 // Discovery hwId -> amdgpu IPBlock. Only the blocks the survey reads are mapped.
 static inline bool r3_ip_block_from_hw(uint16_t hw, amdgpu::IPBlock *out) {
     switch (hw) {

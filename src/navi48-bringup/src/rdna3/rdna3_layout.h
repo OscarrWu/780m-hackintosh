@@ -43,8 +43,17 @@
  *   C5  sdma/mes      0x0C000000 / 0x0C800000  one grant each (8 MiB), separate owners so
  *                                              the §6.1 owner check accepts each IP's own
  *                                              ring/MQD/fence/copy-buffer writes
- *   C6  [0x0D000000, 0x10000000)               deliberately unallocated (BAR0 margin)
+ *   D4  csib          after C5 (8 KiB, Gfx)    RLC clear-state CSIB (state-config class)
+ *   D5  query_fence   after D4 (4 KiB, Mes)    MES query_status fence
+ *   D6  fence_ro      after D5 (4 KiB, Abi)    fence page, ReadOnly class (user read-only)
+ *   D7  test_buf      after D6 (1 MiB, Abi)    bring-up test buffer
+ *   D8  ih_ring/rptr  after D7 (64 KiB/4 KiB, Ih) IH ring + rptr writeback page
+ *   C6  remainder of [0x0D000000, 0x10000000)  deliberately unallocated (BAR0 margin)
  *   top [top_guard, real_vram_size)            no-write (PSP runtime DB / VBIOS reserve)
+ * D1-D3 are system-memory pools outside the carveout (tech plan §3): the plan records
+ * their sizes in sysmem_grants (gart table 4 MiB, context0 root pool 4 MiB + 4 KiB,
+ * vmid8 root pool the same); the runtime stages back-fill start/end from their own
+ * allocations, so the pure allocator never touches them.
  * The BAR0 window is the entire CPU-reachable carveout, so the layout ceiling is
  * min(0x10000000, bar0_size, top_guard): 256 MiB BAR0 and a 1 MiB top guard give exactly
  * 0x10000000 (R4 §4.5).
@@ -83,24 +92,38 @@
 #define R3_BAR0_LAYOUT_LIMIT (0x10000000ull)   /* C6 end / 256 MiB BAR0 window        */
 #define R3_TOPGUARD_MIN  R3_L3_MIB             /* L4: at least the top 1 MiB          */
 
-/* Grants the allocator can emit: fw_buf, psp_ring, psp_cmd, psp_fence, tmr, sdma, mes.
- * The +1 tail slot lets a caller add one follow-up grant (copy test buffer) and still run
- * r3_layout_validate() without growing the plan. */
-#define R3_LAYOUT_MAX_GRANTS 8u
+/* D-region sizes (tech plan §3 D4-D8): placed after C5, 4 KiB aligned, the IH ring 64 KiB. */
+#define R3_D4_CSIB_SIZE     (0x2000ull)        /* RLC CSIB preamble + header          */
+#define R3_D5_QFENCE_SIZE   (0x1000ull)        /* MES query_status fence              */
+#define R3_D6_FENCE_RO_SIZE (0x1000ull)        /* fence page (ReadOnly class)         */
+#define R3_D7_TEST_BUF_SIZE R3_L3_MIB          /* bring-up test buffer                */
+#define R3_D8_IH_RING_SIZE  (64ull * 1024ull)  /* IH ring (64 KiB aligned)            */
+#define R3_D8_IH_RPTR_SIZE  (4ull * 1024ull)   /* IH rptr writeback page              */
+
+/* Grants the allocator can emit: fw_buf, psp_ring, psp_cmd, psp_fence, tmr, sdma, mes,
+ * csib, query_fence, fence_ro, test_buf, ih_ring, ih_rptr_wb (13 carveout grants), plus
+ * headroom for caller follow-up grants without growing the plan. */
+#define R3_LAYOUT_MAX_GRANTS 16u
 
 /* Static size ceiling (T16, PM ruling): the plan holds no variable-length data, so it may live
- * in the driver instance or on the kernel stack for a snapshot. The ceiling is 768 B: 8 grants
- * x 48 B + the 16 scalars/pointers of the plan, still far below one 4 KiB kernel-stack page. */
+ * in the driver instance or on the kernel stack for a snapshot. The ceiling is 1024 B: 16 grants
+ * x 48 B + the plan scalars and the three sysmem entries, still far below one 4 KiB page. */
 #define R3_LAYOUT_TAG_MAX   16u               /* grant tag storage (one cache line)   */
-#define R3_LAYOUT_MAX_BYTES 768u
+#define R3_LAYOUT_MAX_BYTES 1024u
 
-/* B2 side-effect class of a grant's writes (tech plan §6.1). Layout grants are data
- * movement by construction; the enum mirrors WClass so the integration card can map 1:1. */
+/* D1-D3 system-memory pools recorded in the plan (gart table, ctx0 root pool, vmid8 pool).
+ * The count is fixed: the runtime back-fills exactly these three. */
+#define R3_LAYOUT_SYSMEM_MAX 3u
+
+/* B2 side-effect class of a grant's writes (tech plan §6.1). Most layout grants are data
+ * movement by construction; D6 fence_ro is ReadOnly (the driver writes it, user space only
+ * reads). The enum mirrors WClass so the integration card can map 1:1. */
 enum class R3B2Class : uint8_t {
     AccessEnable = 0, /* ① access enable                     */
     DataMove     = 1, /* ② data movement (this allocator)    */
     Protocol     = 2, /* ③ protocol interaction              */
-    StateConfig  = 3  /* ④ state configuration               */
+    StateConfig  = 3, /* ④ state configuration               */
+    ReadOnly     = 4  /* ⑤ read-only page (writes denied)    */
 };
 
 /* Power-up substep that owns a grant (L6). Must match WSubstep/WClass ordering. */
@@ -109,7 +132,10 @@ enum class R3Owner : uint8_t {
     Smu = 1,
     Gfx = 2,
     Sdma = 3,
-    Mes = 4
+    Mes = 4,
+    Gmc = 5,
+    Ih = 6,
+    Abi = 7
 };
 
 /* One allocated carveout interval [start, end), byte offsets (not addresses; use the
@@ -122,6 +148,18 @@ struct R3Grant {
     R3B2Class cls;
     bool needs_cpu;        /* true: the CPU zeroes/writes through BAR0 (L7)   */
     char tag[R3_LAYOUT_TAG_MAX]; /* fixed storage: plans stay copyable/freezable */
+};
+ 
+/* D1-D3 system-memory pools (tech plan §3): outside the carveout, so they carry no
+ * interval at plan time. `size` is fixed at plan time; the runtime stages allocate the
+ * backing memory and back-fill start/end — a zeroed start/end means "not yet
+ * back-filled" and validate skips the geometry of such an entry. */
+struct R3SysmemGrant {
+    uint64_t start;
+    uint64_t end;
+    uint64_t size;
+    R3Owner owner;
+    char tag[R3_LAYOUT_TAG_MAX];
 };
 
 /* The caller's read-only observations. Every field is a stage-0 (or L1 scanout) reading;
@@ -157,6 +195,8 @@ struct R3LayoutPlan {
     uint64_t tmr_bar0_addr;  /* 0 when the TMR is not in BAR0                     */
     uint32_t grant_count;
     R3Grant grants[R3_LAYOUT_MAX_GRANTS];
+    uint32_t sysmem_grant_count;
+    R3SysmemGrant sysmem_grants[R3_LAYOUT_SYSMEM_MAX]; /* D1 gart, D2 ctx0 root, D3 vmid8 */
 };
 
 /* Compute the plan. Returns 0 and plan->ok=true on success; otherwise non-zero,
@@ -168,8 +208,8 @@ int r3_layout_compute(const R3LayoutInputs *in, R3LayoutPlan *out);
 
 /* Re-check a plan (L5/L6/L7, plus the L2 alignment assertion). Returns true when valid;
  * otherwise false and *why (when non-NULL) points to a static reason string containing
- * "overlap", "owner", "class", "tag", "bar0" or "align". The allocator runs this on its own
- * output before publishing, so a successful r3_layout_compute() already satisfies it. */
+ * "overlap", "owner", "class", "tag", "bar0", "align" or "sysmem". The allocator runs this
+ * on its own output before publishing, so a successful r3_layout_compute() already satisfies it. */
 bool r3_layout_validate(const R3LayoutPlan *plan, const char **why);
 
 /* Look up one grant by tag (NUL-terminated, compared with strcmp). NULL when absent. */

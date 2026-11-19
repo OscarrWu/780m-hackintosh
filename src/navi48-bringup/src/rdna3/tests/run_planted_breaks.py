@@ -43,6 +43,18 @@ BREAKS = [
         "{ 0u, 0x6u, 2u, kMmTag, true },    /* MM_INDEX_HI */",
     ),
     (
+        "writeguard_readonly_write_allowed",
+        HOST,
+        "rdna3/rdna3_writeguard.cpp",
+        "        if (gr.readonly)\n"
+        "            // D6 read-only fence page: every write is refused, whatever the class.\n"
+        "            return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, gr.tag);",
+        "        if (gr.readonly)\n"
+        "            // D6 read-only fence page: every write is refused, whatever the class.\n"
+        "            return note_allow(nullptr, ctx, static_cast<uint32_t>(pa), size, cls,\n"
+        "                              gr.tag);",
+    ),
+    (
         "discovery_major_compared_ge",
         HOST,
         "rdna3/rdna3_discovery.cpp",
@@ -136,6 +148,35 @@ BREAKS = [
         "    const uint32_t expected = getSdmaRowCount() + 1u +          // SDMA regs + layout",
         "    const uint32_t expected = 61u;  // Step1 hardcoded fallback",
     ),
+
+    (
+        "writeguard_grant_one_over",
+        HOST,
+        "rdna3/rdna3_writeguard.cpp",
+        "    if (g.grant_count >= R3_WG_GRANT_MAX) {",
+        "    if (g.grant_count > R3_WG_GRANT_MAX) {",
+    ),
+    (
+        "writeguard_reserve_noop",
+        HOST,
+        "rdna3/rdna3_writeguard.cpp",
+        "int r3_wg_reserve(uint32_t rows)\n"
+        "{\n"
+        "    if (rows == 0u)\n"
+        "        return -1;\n"
+        "    if (g.grant_count > R3_WG_GRANT_MAX ||\n"
+        "        rows > R3_WG_GRANT_MAX - g.grant_count) {\n"
+        "        log_grant_cap(\"reserve\", g.grant_count, rows);\n"
+        "        return -2;\n"
+        "    }\n"
+        "    return 0;\n"
+        "}",
+        "int r3_wg_reserve(uint32_t rows)\n"
+        "{\n"
+        "    (void)rows;\n"
+        "    return 0;  // reserve disabled\n"
+        "}",
+    ),
 ]
 
 def run_tests(src_root, runner):
@@ -167,6 +208,15 @@ def fresh_copy():
                     os.path.join(upper, "firmware"))
     shutil.copytree(os.path.join(SRC, "..", "tools"),
                     os.path.join(upper, "tools"))
+    # run_host_tests.sh's n48r3test suite resolves its source relative to
+    # .../src/navi48-bringup (:182: $root/../../tools/pc/n48r3test.c), i.e. the
+    # tools/ dir THREE levels above tests/ (next to src/, not under navi48-bringup).
+    shutil.copytree(os.path.join(SRC, "..", "..", "..", "tools"),
+                    os.path.join(upper, "..", "..", "tools"))
+    # .../src/navi48-bringup. dalshim lives OUTSIDE the copied SRC, so it must be
+    # mirrored too or the userclient suite fails to build in the temp tree.
+    shutil.copytree(os.path.join(SRC, "..", "tests", "dalshim"),
+                    os.path.join(upper, "tests", "dalshim"))
     # test_golden_values reads the read-only evidence/ tree from the repo root.
     # evidence is ~1.3 GB: symlink, never copy (17 temp trees would move ~22 GB).
     # rmtree(tmp) removes the link, not the target.

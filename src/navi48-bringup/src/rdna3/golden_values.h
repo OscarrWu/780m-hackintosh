@@ -187,6 +187,12 @@ constexpr GoldenReg kRlcCpSchedulers = {
     "gc_11_0_0_offset.h:10594/10595 (offset/_BASE_IDX); RLC/CP scheduler control",
 };
 
+constexpr GoldenReg kRlcF32UcodeVersion = {
+    "RLC_F32_UCODE_VERSION", amdgpu::IPBlock::GC, 0x4C03u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:9802/9803 (offset/_BASE_IDX); version observation, not a gate (Linux driver does not read it; D3/§8.2)",
+};
+
 constexpr GoldenReg kCpStat = {
     "CP_STAT", amdgpu::IPBlock::GC, 0x0F40u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
@@ -259,6 +265,264 @@ constexpr GoldenReg kGcmcVmFbOffset = {
     "gc_11_0_0_offset.h:2690/2691 (offset/_BASE_IDX); Linux gfxhub_v3_0_get_mc_fb_offset source; compare with MMHUB offset (TMR system_phy)",
 };
 
+constexpr GoldenReg kGcmcVmFbLocationBase = {
+    "GCMC_VM_FB_LOCATION_BASE", amdgpu::IPBlock::GC, 0x1678u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2830/2831 (offset/_BASE_IDX); GC-side FB base (S6 cross-check with the MMHUB copy)",
+};
+
+constexpr GoldenReg kGcmcVmFbLocationTop = {
+    "GCMC_VM_FB_LOCATION_TOP", amdgpu::IPBlock::GC, 0x1679u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2832/2833 (offset/_BASE_IDX); GC-side FB top",
+};
+
+constexpr GoldenReg kGcmcVmAgpTop = {
+    "GCMC_VM_AGP_TOP", amdgpu::IPBlock::GC, 0x167Au, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2834/2835 (offset/_BASE_IDX); GART AGP top (gfxhub_v3_0.c:161-164 system aperture group)",
+};
+
+constexpr GoldenReg kGcmcVmAgpBot = {
+    "GCMC_VM_AGP_BOT", amdgpu::IPBlock::GC, 0x167Bu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2836/2837 (offset/_BASE_IDX); GART AGP bottom",
+};
+
+constexpr GoldenReg kGcmcVmAgpBase = {
+    "GCMC_VM_AGP_BASE", amdgpu::IPBlock::GC, 0x167Cu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2838/2839 (offset/_BASE_IDX); GART AGP base",
+};
+
+constexpr GoldenReg kGcmcVmSystemApertureLowAddr = {
+    "GCMC_VM_SYSTEM_APERTURE_LOW_ADDR", amdgpu::IPBlock::GC, 0x167Du, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2840/2841 (offset/_BASE_IDX); GC system aperture low (gfxhub_v3_0.c:161-164)",
+};
+
+constexpr GoldenReg kGcmcVmSystemApertureHighAddr = {
+    "GCMC_VM_SYSTEM_APERTURE_HIGH_ADDR", amdgpu::IPBlock::GC, 0x167Eu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2842/2843 (offset/_BASE_IDX); GC system aperture high (gfxhub_v3_0.c:161-164)",
+};
+
+constexpr GoldenReg kGcmcVmSystemApertureDefaultAddrLsb = {
+    "GCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB", amdgpu::IPBlock::GC, 0x15A8u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2692/2693 (offset/_BASE_IDX); GC system aperture default page, LSB (imu_v12_0.c:253-254 same-form usage)",
+};
+
+constexpr GoldenReg kGcmcVmSystemApertureDefaultAddrMsb = {
+    "GCMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB", amdgpu::IPBlock::GC, 0x15A9u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2694/2695 (offset/_BASE_IDX); GC system aperture default page, MSB",
+};
+
+constexpr GoldenReg kGcvmL2Cntl = {
+    "GCVM_L2_CNTL", amdgpu::IPBlock::GC, 0x15BCu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2730/2731 (offset/_BASE_IDX); GC VM L2 control (gfxhub_v3_0.c:220-312 vm fault group)",
+};
+
+constexpr GoldenReg kGcvmL2Cntl2 = {
+    "GCVM_L2_CNTL2", amdgpu::IPBlock::GC, 0x15BDu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2732/2733 (offset/_BASE_IDX); GC VM L2 control 2",
+};
+
+constexpr GoldenReg kGcvmL2Cntl3 = {
+    "GCVM_L2_CNTL3", amdgpu::IPBlock::GC, 0x15BEu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2734/2735 (offset/_BASE_IDX); GC VM L2 control 3",
+};
+
+constexpr GoldenReg kGcvmL2Cntl4 = {
+    "GCVM_L2_CNTL4", amdgpu::IPBlock::GC, 0x15D4u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2776/2777 (offset/_BASE_IDX); GC VM L2 control 4",
+};
+
+constexpr GoldenReg kGcvmInvalidateCntl = {
+    "GCVM_INVALIDATE_CNTL", amdgpu::IPBlock::GC, 0x15C3u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2744/2745 (offset/_BASE_IDX); GC VM invalidate control (TLB invalidate group)",
+};
+
+constexpr GoldenReg kGcvmInvalidateEng17Sem = {
+    "GCVM_INVALIDATE_ENG17_SEM", amdgpu::IPBlock::GC, 0x16AAu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2918/2919 (offset/_BASE_IDX); invalidate engine 17 semaphore (TLB invalidate group)",
+};
+
+constexpr GoldenReg kGcvmInvalidateEng17Req = {
+    "GCVM_INVALIDATE_ENG17_REQ", amdgpu::IPBlock::GC, 0x16BCu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2954/2955 (offset/_BASE_IDX); invalidate engine 17 request",
+};
+
+constexpr GoldenReg kGcvmInvalidateEng17Ack = {
+    "GCVM_INVALIDATE_ENG17_ACK", amdgpu::IPBlock::GC, 0x16CEu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2990/2991 (offset/_BASE_IDX); invalidate engine 17 acknowledge",
+};
+
+constexpr GoldenReg kGcvmL2ProtectionFaultCntl = {
+    "GCVM_L2_PROTECTION_FAULT_CNTL", amdgpu::IPBlock::GC, 0x15C4u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2746/2747 (offset/_BASE_IDX); L2 fault default control (nullarc E7 writes 0x3ffffffc here)",
+};
+
+constexpr GoldenReg kGcvmL2ProtectionFaultCntl2 = {
+    "GCVM_L2_PROTECTION_FAULT_CNTL2", amdgpu::IPBlock::GC, 0x15C5u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2748/2749 (offset/_BASE_IDX); L2 fault default control 2",
+};
+
+constexpr GoldenReg kGcvmL2ProtectionFaultDefaultAddrLo32 = {
+    "GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32", amdgpu::IPBlock::GC, 0x15CBu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2760/2761 (offset/_BASE_IDX); fault default address low (gfxhub_v3_0.c:174-177)",
+};
+
+constexpr GoldenReg kGcvmL2ProtectionFaultDefaultAddrHi32 = {
+    "GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_HI32", amdgpu::IPBlock::GC, 0x15CCu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2762/2763 (offset/_BASE_IDX); fault default address high (gfxhub_v3_0.c:174-177)",
+};
+
+constexpr GoldenReg kGcvmContext0Cntl = {
+    "GCVM_CONTEXT0_CNTL", amdgpu::IPBlock::GC, 0x1688u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2850/2851 (offset/_BASE_IDX); VM_CONTEXT0 enable (gfxhub_v3_0.c:259-264)",
+};
+
+constexpr GoldenReg kGcvmContext0PageTableBaseAddrLo32 = {
+    "GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32", amdgpu::IPBlock::GC, 0x16F3u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3064/3065 (offset/_BASE_IDX); context0 page-table base low (S7/S8 root back-fill)",
+};
+
+constexpr GoldenReg kGcvmContext0PageTableBaseAddrHi32 = {
+    "GCVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32", amdgpu::IPBlock::GC, 0x16F4u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3066/3067 (offset/_BASE_IDX); context0 page-table base high",
+};
+
+constexpr GoldenReg kGcvmContext0PageTableStartAddrLo32 = {
+    "GCVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32", amdgpu::IPBlock::GC, 0x1713u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3128/3129 (offset/_BASE_IDX); context0 page-table start low",
+};
+
+constexpr GoldenReg kGcvmContext0PageTableStartAddrHi32 = {
+    "GCVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32", amdgpu::IPBlock::GC, 0x1714u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3130/3131 (offset/_BASE_IDX); context0 page-table start high",
+};
+
+constexpr GoldenReg kGcvmContext0PageTableEndAddrLo32 = {
+    "GCVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32", amdgpu::IPBlock::GC, 0x1733u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3192/3193 (offset/_BASE_IDX); context0 page-table end low",
+};
+
+constexpr GoldenReg kGcvmContext0PageTableEndAddrHi32 = {
+    "GCVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32", amdgpu::IPBlock::GC, 0x1734u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3194/3195 (offset/_BASE_IDX); context0 page-table end high",
+};
+
+constexpr GoldenReg kGcvmContext8Cntl = {
+    "GCVM_CONTEXT8_CNTL", amdgpu::IPBlock::GC, 0x1690u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:2866/2867 (offset/_BASE_IDX); VM_CONTEXT8 enable (S9 vmid8 test)",
+};
+
+constexpr GoldenReg kGcvmContext8PageTableBaseAddrLo32 = {
+    "GCVM_CONTEXT8_PAGE_TABLE_BASE_ADDR_LO32", amdgpu::IPBlock::GC, 0x1703u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3096/3097 (offset/_BASE_IDX); context8 page-table base low (S9)",
+};
+
+constexpr GoldenReg kGcvmContext8PageTableBaseAddrHi32 = {
+    "GCVM_CONTEXT8_PAGE_TABLE_BASE_ADDR_HI32", amdgpu::IPBlock::GC, 0x1704u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3098/3099 (offset/_BASE_IDX); context8 page-table base high",
+};
+
+constexpr GoldenReg kGcvmContext8PageTableStartAddrLo32 = {
+    "GCVM_CONTEXT8_PAGE_TABLE_START_ADDR_LO32", amdgpu::IPBlock::GC, 0x1723u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3160/3161 (offset/_BASE_IDX); context8 page-table start low",
+};
+
+constexpr GoldenReg kGcvmContext8PageTableStartAddrHi32 = {
+    "GCVM_CONTEXT8_PAGE_TABLE_START_ADDR_HI32", amdgpu::IPBlock::GC, 0x1724u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3162/3163 (offset/_BASE_IDX); context8 page-table start high",
+};
+
+constexpr GoldenReg kGcvmContext8PageTableEndAddrLo32 = {
+    "GCVM_CONTEXT8_PAGE_TABLE_END_ADDR_LO32", amdgpu::IPBlock::GC, 0x1743u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3224/3225 (offset/_BASE_IDX); context8 page-table end low",
+};
+
+constexpr GoldenReg kGcvmContext8PageTableEndAddrHi32 = {
+    "GCVM_CONTEXT8_PAGE_TABLE_END_ADDR_HI32", amdgpu::IPBlock::GC, 0x1744u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:3226/3227 (offset/_BASE_IDX); context8 page-table end high",
+};
+
+constexpr GoldenReg kRlcCsibAddrLo = {
+    "RLC_CSIB_ADDR_LO", amdgpu::IPBlock::GC, 0x0987u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:10588/10589 (offset/_BASE_IDX); clear-state CSIB base low (gfx_v11_0.c:2289-2291; _BASE_IDX=1)",
+};
+
+constexpr GoldenReg kRlcCsibAddrHi = {
+    "RLC_CSIB_ADDR_HI", amdgpu::IPBlock::GC, 0x0988u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:10590/10591 (offset/_BASE_IDX); clear-state CSIB base high",
+};
+
+constexpr GoldenReg kRlcCsibLength = {
+    "RLC_CSIB_LENGTH", amdgpu::IPBlock::GC, 0x0989u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:10592/10593 (offset/_BASE_IDX); clear-state CSIB length",
+};
+
+constexpr GoldenReg kCpRb0Cntl = {
+    "CP_RB0_CNTL", amdgpu::IPBlock::GC, 0x1DE1u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:4118/4119 (offset/_BASE_IDX); ring0 control (S11 gfx ring bring-up)",
+};
+
+constexpr GoldenReg kCpRbDoorbellRangeLower = {
+    "CP_RB_DOORBELL_RANGE_LOWER", amdgpu::IPBlock::GC, 0x1DFAu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:4176/4177 (offset/_BASE_IDX); gfx ring doorbell range lower (gfx_v11_0.c:4109-4112)",
+};
+
+constexpr GoldenReg kCpRbDoorbellRangeUpper = {
+    "CP_RB_DOORBELL_RANGE_UPPER", amdgpu::IPBlock::GC, 0x1DFBu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:4178/4179 (offset/_BASE_IDX); gfx ring doorbell range upper",
+};
+
+constexpr GoldenReg kCpMecDoorbellRangeLower = {
+    "CP_MEC_DOORBELL_RANGE_LOWER", amdgpu::IPBlock::GC, 0x1DFCu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:4180/4181 (offset/_BASE_IDX); MEC doorbell range lower (gfx_v11_0.c:3759-3763)",
+};
+
+constexpr GoldenReg kCpMecDoorbellRangeUpper = {
+    "CP_MEC_DOORBELL_RANGE_UPPER", amdgpu::IPBlock::GC, 0x1DFDu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:4182/4183 (offset/_BASE_IDX); MEC doorbell range upper",
+};
+
 constexpr GoldenReg kSdma0Queue0RbCntl = {
     "SDMA0_QUEUE0_RB_CNTL", amdgpu::IPBlock::SDMA0, 0x0080u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
@@ -275,6 +539,11 @@ constexpr GoldenReg kSdma0Queue0RbBaseHi = {
     "SDMA0_QUEUE0_RB_BASE_HI", amdgpu::IPBlock::SDMA0, 0x0082u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
     "gc_11_0_0_offset.h:194/195 (offset/_BASE_IDX); queue0 ring base, high",
+};
+constexpr GoldenReg kSdma0Queue0RbRptr = {
+    "SDMA0_QUEUE0_RB_RPTR", amdgpu::IPBlock::SDMA0, 0x0083u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "gc_11_0_0_offset.h:196/197 (offset/_BASE_IDX); queue0 read pointer (T-E golden supplement)",
 };
 
 constexpr GoldenReg kSdma0Queue0RbRptrAddrLo = {
@@ -337,21 +606,10 @@ constexpr GoldenReg kSdma0StatusReg = {
     "gc_11_0_0_offset.h:58/59 (offset/_BASE_IDX); SDMA status, cross evidence (S7)",
 };
 
-/* D3/§8.2 version observations. Linux amdgpu does not read either register; they are
- * project-defined evidence, never gates, and never preflight probes (preflight is the
- * segment-base gate, not an observation collector). */
-constexpr GoldenReg kRlcF32UcodeVersion = {
-    "RLC_F32_UCODE_VERSION", amdgpu::IPBlock::GC, 0x4c03u, 1u,
-    Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "gc_11_0_0_offset.h:9802-9803 (offset/_BASE_IDX); version observation, "
-    "not a gate (Linux driver does not read it; D3/§8.2)",
-};
-
 constexpr GoldenReg kSdma0Version = {
     "SDMA0_VERSION", amdgpu::IPBlock::SDMA0, 0x0035u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "gc_11_0_0_offset.h:84-85 (offset/_BASE_IDX); version observation, "
-    "not a gate (Linux driver does not read it; D3/§8.2)",
+    "gc_11_0_0_offset.h:84/85 (offset/_BASE_IDX); version observation, not a gate (Linux driver does not read it; D3/§8.2)",
 };
 
 constexpr GoldenReg kSdma0Utcl1Cntl = {
@@ -384,6 +642,143 @@ constexpr GoldenReg kMmmcVmFbLocationTop = {
     "mmhub_3_0_1_offset.h:1670/1671 (offset/_BASE_IDX); machine-config.md:51 fb_mc_top=0x80ffffffff; raw = fb_mc >> 24, FB_TOP mask 0x00FFFFFF (mmhub_3_0_1_sh_mask.h:7222-7223)",
 };
 
+constexpr GoldenReg kMmmcVmAgpTop = {
+    "MMMC_VM_AGP_TOP", amdgpu::IPBlock::MMHUB, 0x08EEu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1672/1673 (offset/_BASE_IDX); MMHUB AGP top (mmhub_v3_0_1.c:183-186 system aperture group)",
+};
+
+constexpr GoldenReg kMmmcVmAgpBot = {
+    "MMMC_VM_AGP_BOT", amdgpu::IPBlock::MMHUB, 0x08EFu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1674/1675 (offset/_BASE_IDX); MMHUB AGP bottom",
+};
+
+constexpr GoldenReg kMmmcVmAgpBase = {
+    "MMMC_VM_AGP_BASE", amdgpu::IPBlock::MMHUB, 0x08F0u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1676/1677 (offset/_BASE_IDX); MMHUB AGP base",
+};
+
+constexpr GoldenReg kMmmcVmSystemApertureLowAddr = {
+    "MMMC_VM_SYSTEM_APERTURE_LOW_ADDR", amdgpu::IPBlock::MMHUB, 0x08F1u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1678/1679 (offset/_BASE_IDX); MMHUB system aperture low (mmhub_v3_0_1.c:183-186)",
+};
+
+constexpr GoldenReg kMmmcVmSystemApertureHighAddr = {
+    "MMMC_VM_SYSTEM_APERTURE_HIGH_ADDR", amdgpu::IPBlock::MMHUB, 0x08F2u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1680/1681 (offset/_BASE_IDX); MMHUB system aperture high",
+};
+
+constexpr GoldenReg kMmmcVmSystemApertureDefaultAddrLsb = {
+    "MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_LSB", amdgpu::IPBlock::MMHUB, 0x08D8u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1628/1629 (offset/_BASE_IDX); MMHUB system aperture default page, LSB",
+};
+
+constexpr GoldenReg kMmmcVmSystemApertureDefaultAddrMsb = {
+    "MMMC_VM_SYSTEM_APERTURE_DEFAULT_ADDR_MSB", amdgpu::IPBlock::MMHUB, 0x08D9u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1630/1631 (offset/_BASE_IDX); MMHUB system aperture default page, MSB",
+};
+
+constexpr GoldenReg kMmvmContext0Cntl = {
+    "MMVM_CONTEXT0_CNTL", amdgpu::IPBlock::MMHUB, 0x0740u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1118/1119 (offset/_BASE_IDX); MMHUB VM_CONTEXT0 enable (S7/S8 root back-fill)",
+};
+
+constexpr GoldenReg kMmvmContext0PageTableBaseAddrLo32 = {
+    "MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_LO32", amdgpu::IPBlock::MMHUB, 0x07ABu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1332/1333 (offset/_BASE_IDX); MMHUB context0 page-table base low",
+};
+
+constexpr GoldenReg kMmvmContext0PageTableBaseAddrHi32 = {
+    "MMVM_CONTEXT0_PAGE_TABLE_BASE_ADDR_HI32", amdgpu::IPBlock::MMHUB, 0x07ACu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1334/1335 (offset/_BASE_IDX); MMHUB context0 page-table base high",
+};
+
+constexpr GoldenReg kMmvmContext0PageTableStartAddrLo32 = {
+    "MMVM_CONTEXT0_PAGE_TABLE_START_ADDR_LO32", amdgpu::IPBlock::MMHUB, 0x07CBu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1396/1397 (offset/_BASE_IDX); MMHUB context0 page-table start low",
+};
+
+constexpr GoldenReg kMmvmContext0PageTableStartAddrHi32 = {
+    "MMVM_CONTEXT0_PAGE_TABLE_START_ADDR_HI32", amdgpu::IPBlock::MMHUB, 0x07CCu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1398/1399 (offset/_BASE_IDX); MMHUB context0 page-table start high",
+};
+
+constexpr GoldenReg kMmvmContext0PageTableEndAddrLo32 = {
+    "MMVM_CONTEXT0_PAGE_TABLE_END_ADDR_LO32", amdgpu::IPBlock::MMHUB, 0x07EBu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1460/1461 (offset/_BASE_IDX); MMHUB context0 page-table end low",
+};
+
+constexpr GoldenReg kMmvmContext0PageTableEndAddrHi32 = {
+    "MMVM_CONTEXT0_PAGE_TABLE_END_ADDR_HI32", amdgpu::IPBlock::MMHUB, 0x07ECu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1462/1463 (offset/_BASE_IDX); MMHUB context0 page-table end high",
+};
+
+constexpr GoldenReg kMmvmContext8Cntl = {
+    "MMVM_CONTEXT8_CNTL", amdgpu::IPBlock::MMHUB, 0x0748u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1134/1135 (offset/_BASE_IDX); MMHUB VM_CONTEXT8 enable (S9 vmid8 test)",
+};
+
+constexpr GoldenReg kMmvmContext8PageTableBaseAddrLo32 = {
+    "MMVM_CONTEXT8_PAGE_TABLE_BASE_ADDR_LO32", amdgpu::IPBlock::MMHUB, 0x07BBu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1364/1365 (offset/_BASE_IDX); MMHUB context8 page-table base low",
+};
+
+constexpr GoldenReg kMmvmContext8PageTableBaseAddrHi32 = {
+    "MMVM_CONTEXT8_PAGE_TABLE_BASE_ADDR_HI32", amdgpu::IPBlock::MMHUB, 0x07BCu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1366/1367 (offset/_BASE_IDX); MMHUB context8 page-table base high",
+};
+
+constexpr GoldenReg kMmvmContext8PageTableStartAddrLo32 = {
+    "MMVM_CONTEXT8_PAGE_TABLE_START_ADDR_LO32", amdgpu::IPBlock::MMHUB, 0x07DBu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1428/1429 (offset/_BASE_IDX); MMHUB context8 page-table start low",
+};
+
+constexpr GoldenReg kMmvmContext8PageTableStartAddrHi32 = {
+    "MMVM_CONTEXT8_PAGE_TABLE_START_ADDR_HI32", amdgpu::IPBlock::MMHUB, 0x07DCu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1430/1431 (offset/_BASE_IDX); MMHUB context8 page-table start high",
+};
+
+constexpr GoldenReg kMmvmContext8PageTableEndAddrLo32 = {
+    "MMVM_CONTEXT8_PAGE_TABLE_END_ADDR_LO32", amdgpu::IPBlock::MMHUB, 0x07FBu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1492/1493 (offset/_BASE_IDX); MMHUB context8 page-table end low",
+};
+
+constexpr GoldenReg kMmvmContext8PageTableEndAddrHi32 = {
+    "MMVM_CONTEXT8_PAGE_TABLE_END_ADDR_HI32", amdgpu::IPBlock::MMHUB, 0x07FCu, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1494/1495 (offset/_BASE_IDX); MMHUB context8 page-table end high",
+};
+constexpr GoldenReg kMmvmInvalidateEng17Sem = {
+    "MMVM_INVALIDATE_ENG17_SEM", amdgpu::IPBlock::MMHUB, 0x0762u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1222/1223 (offset/_BASE_IDX); MMHUB invalidate engine 17 semaphore (T-E golden supplement)",
+};
+
+constexpr GoldenReg kMmvmInvalidateEng17Req = {
+    "MMVM_INVALIDATE_ENG17_REQ", amdgpu::IPBlock::MMHUB, 0x0774u, 1u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "mmhub_3_0_1_offset.h:1258/1259 (offset/_BASE_IDX); MMHUB invalidate engine 17 request (T-E golden supplement)",
+};
+
 constexpr GoldenReg kIhRbCntl = {
     "IH_RB_CNTL", amdgpu::IPBlock::OSSSYS, 0x0080u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
@@ -400,6 +795,60 @@ constexpr GoldenReg kIhRbWptr = {
     "IH_RB_WPTR", amdgpu::IPBlock::OSSSYS, 0x0084u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
     "osssys_6_0_0_offset.h:120/121 (offset/_BASE_IDX); IH write pointer (read-only snapshot)",
+};
+
+constexpr GoldenReg kIhRbBase = {
+    "IH_RB_BASE", amdgpu::IPBlock::OSSSYS, 0x0081u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:114/115 (offset/_BASE_IDX); IH ring base low (ih_v6_0.c:54-57)",
+};
+
+constexpr GoldenReg kIhRbBaseHi = {
+    "IH_RB_BASE_HI", amdgpu::IPBlock::OSSSYS, 0x0082u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:116/117 (offset/_BASE_IDX); IH ring base high",
+};
+
+constexpr GoldenReg kIhRbWptrAddrHi = {
+    "IH_RB_WPTR_ADDR_HI", amdgpu::IPBlock::OSSSYS, 0x0085u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:122/123 (offset/_BASE_IDX); WPTR writeback address high (D8 ih_rptr_wb)",
+};
+
+constexpr GoldenReg kIhRbWptrAddrLo = {
+    "IH_RB_WPTR_ADDR_LO", amdgpu::IPBlock::OSSSYS, 0x0086u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:124/125 (offset/_BASE_IDX); WPTR writeback address low",
+};
+
+constexpr GoldenReg kIhDoorbellRptr = {
+    "IH_DOORBELL_RPTR", amdgpu::IPBlock::OSSSYS, 0x0087u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:126/127 (offset/_BASE_IDX); IH rptr doorbell (ih_v6_0.c:54-57)",
+};
+
+constexpr GoldenReg kIhRbCntlRing1 = {
+    "IH_RB_CNTL_RING1", amdgpu::IPBlock::OSSSYS, 0x008Cu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:130/131 (offset/_BASE_IDX); IH ring1 control (osssys_6_0_0 layout)",
+};
+
+constexpr GoldenReg kIhRbRptrRing1 = {
+    "IH_RB_RPTR_RING1", amdgpu::IPBlock::OSSSYS, 0x008Fu, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:136/137 (offset/_BASE_IDX); IH ring1 read pointer",
+};
+
+constexpr GoldenReg kIhRbWptrRing1 = {
+    "IH_RB_WPTR_RING1", amdgpu::IPBlock::OSSSYS, 0x0090u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:138/139 (offset/_BASE_IDX); IH ring1 write pointer",
+};
+
+constexpr GoldenReg kIhDoorbellRptrRing1 = {
+    "IH_DOORBELL_RPTR_RING1", amdgpu::IPBlock::OSSSYS, 0x0093u, 0u,
+    Gate::RecordOnly, 0x00000000u, 0x00000000u,
+    "osssys_6_0_0_offset.h:140/141 (offset/_BASE_IDX); IH ring1 rptr doorbell",
 };
 
 constexpr GoldenReg kBifBx0PcieIndex2 = {
@@ -438,6 +887,7 @@ constexpr const GoldenReg *const kRegs[] = {
     &kCpMesPrgrmCntrStartHi,
     &kCpMesGp3Lo,
     &kRlcCpSchedulers,
+    &kRlcF32UcodeVersion,
     &kCpStat,
     &kRlcRlcsBootloadStatus,
     &kRlcGpmStat,
@@ -450,9 +900,53 @@ constexpr const GoldenReg *const kRegs[] = {
     &kGcvmL2ProtectionFaultAddrLo32,
     &kGcvmL2ProtectionFaultAddrHi32,
     &kGcmcVmFbOffset,
+    &kGcmcVmFbLocationBase,
+    &kGcmcVmFbLocationTop,
+    &kGcmcVmAgpTop,
+    &kGcmcVmAgpBot,
+    &kGcmcVmAgpBase,
+    &kGcmcVmSystemApertureLowAddr,
+    &kGcmcVmSystemApertureHighAddr,
+    &kGcmcVmSystemApertureDefaultAddrLsb,
+    &kGcmcVmSystemApertureDefaultAddrMsb,
+    &kGcvmL2Cntl,
+    &kGcvmL2Cntl2,
+    &kGcvmL2Cntl3,
+    &kGcvmL2Cntl4,
+    &kGcvmInvalidateCntl,
+    &kGcvmInvalidateEng17Sem,
+    &kGcvmInvalidateEng17Req,
+    &kGcvmInvalidateEng17Ack,
+    &kGcvmL2ProtectionFaultCntl,
+    &kGcvmL2ProtectionFaultCntl2,
+    &kGcvmL2ProtectionFaultDefaultAddrLo32,
+    &kGcvmL2ProtectionFaultDefaultAddrHi32,
+    &kGcvmContext0Cntl,
+    &kGcvmContext0PageTableBaseAddrLo32,
+    &kGcvmContext0PageTableBaseAddrHi32,
+    &kGcvmContext0PageTableStartAddrLo32,
+    &kGcvmContext0PageTableStartAddrHi32,
+    &kGcvmContext0PageTableEndAddrLo32,
+    &kGcvmContext0PageTableEndAddrHi32,
+    &kGcvmContext8Cntl,
+    &kGcvmContext8PageTableBaseAddrLo32,
+    &kGcvmContext8PageTableBaseAddrHi32,
+    &kGcvmContext8PageTableStartAddrLo32,
+    &kGcvmContext8PageTableStartAddrHi32,
+    &kGcvmContext8PageTableEndAddrLo32,
+    &kGcvmContext8PageTableEndAddrHi32,
+    &kRlcCsibAddrLo,
+    &kRlcCsibAddrHi,
+    &kRlcCsibLength,
+    &kCpRb0Cntl,
+    &kCpRbDoorbellRangeLower,
+    &kCpRbDoorbellRangeUpper,
+    &kCpMecDoorbellRangeLower,
+    &kCpMecDoorbellRangeUpper,
     &kSdma0Queue0RbCntl,
     &kSdma0Queue0RbBase,
     &kSdma0Queue0RbBaseHi,
+    &kSdma0Queue0RbRptr,
     &kSdma0Queue0RbRptrAddrLo,
     &kSdma0Queue0RbRptrAddrHi,
     &kSdma0Queue0IbCntl,
@@ -463,14 +957,47 @@ constexpr const GoldenReg *const kRegs[] = {
     &kSdma0SemWaitFailTimerCntl,
     &kSdma0WatchdogCntl,
     &kSdma0StatusReg,
+    &kSdma0Version,
     &kSdma0Utcl1Cntl,
     &kSdma0Utcl1Page,
     &kMmmcVmFbOffset,
     &kMmmcVmFbLocationBase,
     &kMmmcVmFbLocationTop,
+    &kMmmcVmAgpTop,
+    &kMmmcVmAgpBot,
+    &kMmmcVmAgpBase,
+    &kMmmcVmSystemApertureLowAddr,
+    &kMmmcVmSystemApertureHighAddr,
+    &kMmmcVmSystemApertureDefaultAddrLsb,
+    &kMmmcVmSystemApertureDefaultAddrMsb,
+    &kMmvmContext0Cntl,
+    &kMmvmContext0PageTableBaseAddrLo32,
+    &kMmvmContext0PageTableBaseAddrHi32,
+    &kMmvmContext0PageTableStartAddrLo32,
+    &kMmvmContext0PageTableStartAddrHi32,
+    &kMmvmContext0PageTableEndAddrLo32,
+    &kMmvmContext0PageTableEndAddrHi32,
+    &kMmvmContext8Cntl,
+    &kMmvmContext8PageTableBaseAddrLo32,
+    &kMmvmContext8PageTableBaseAddrHi32,
+    &kMmvmContext8PageTableStartAddrLo32,
+    &kMmvmContext8PageTableStartAddrHi32,
+    &kMmvmContext8PageTableEndAddrLo32,
+    &kMmvmContext8PageTableEndAddrHi32,
+    &kMmvmInvalidateEng17Sem,
+    &kMmvmInvalidateEng17Req,
     &kIhRbCntl,
     &kIhRbRptr,
     &kIhRbWptr,
+    &kIhRbBase,
+    &kIhRbBaseHi,
+    &kIhRbWptrAddrHi,
+    &kIhRbWptrAddrLo,
+    &kIhDoorbellRptr,
+    &kIhRbCntlRing1,
+    &kIhRbRptrRing1,
+    &kIhRbWptrRing1,
+    &kIhDoorbellRptrRing1,
     &kBifBx0PcieIndex2,
     &kBifBx0PcieData2,
 };

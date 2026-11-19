@@ -13,11 +13,17 @@
 #include "rdna3_integration.h"
 #include "rdna3_wmanifest.h"
 #include "rdna3_teardown.h"
+#include "rdna3_layout.h"
+#include "amd/gmc_v11_0.h"
+#include "amd/mes_v11_0.h"
+#include "amd/pm4_v11.h"
+#include "amd/amdgpu_sysmem.h"
 
 #include <IOKit/IOLocks.h>
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSDictionary.h>
 #include <libkern/c++/OSNumber.h>
@@ -333,6 +339,23 @@ bool NaviR3Bringup::confirmD0(bool *measured) {
     return v == 0;
 }
 
+// T-E: the GMC sysmem allocator (the gmc_v11_0.h:120-123 contract): the integration layer
+// binds one allocator per driver instance before the stage ladder runs; host tests bind a
+// fake. The callback's SysMem is a local: on return the IOBufferMemoryDescriptor pointer is
+// dropped ON PURPOSE -- the bring-up page tables live for the whole kext lifetime, the same
+// "never unbound and never freed" pattern as fastcopy's staging buffer
+// (Navi48Bringup.cpp:2502/2915). SysMem has no destructor (amdgpu_sysmem.h:15-21) and the
+// descriptor's refcount stays 1, so nothing releases it early; a failed sysmem_alloc
+// releases internally (amdgpu_sysmem.cpp:18,22) and the callback reports 0 (fail closed).
+static uint64_t r3_sysmem_alloc_cb(void *ctx, uint64_t bytes, void **cpu) {
+    (void)ctx;
+    amdgpu::SysMem m {};
+    if (amdgpu::sysmem_alloc(m, bytes, 4096) != KERN_SUCCESS || !m.valid()) return 0;
+    *cpu = m.cpu;
+    return m.bus;
+}
+static const amdgpu::GmcSysmemAlloc g_r3_sysmem_alloc = { nullptr, r3_sysmem_alloc_cb };
+
 bool NaviR3Bringup::start(IOService *provider) {
     if (!super::start(provider)) return false;
 
@@ -446,6 +469,9 @@ bool NaviR3Bringup::start(IOService *provider) {
     // D-01: start() runs only survey + preflight (stages 0-1). The five power-up substeps
     // are triggered separately via the user client or n48r3-auto=1. This prevents an
     // automatic power-up that, if it crashes, would reboot on every boot.
+    // T-E: bind the GMC sysmem allocator before the ladder runs (rdna3_survey.h:602).
+    // Without it prepare_stage2 fails closed with prep:no-sysmem-alloc.
+    r3_stages_set_sysmem_allocator(&g_r3_sysmem_alloc);
     const StageResult r = bringup_r3(1u, table, ctx, &hooks);
     state_.gate_ok = (r == kStageOk) && io_ok;
     if (!io_ok) {
@@ -579,6 +605,392 @@ IOReturn NaviR3Bringup::triggerPowerUp() {
           (int)r, integ_.rt.ready_bits, integ_.rt.latch_bits,
           (unsigned long long)r3_writeguard_deny_count());
     return r == kStageOk ? kIOReturnSuccess : kIOReturnInternalError;
+}
+
+// ---- BO tracking (UMA/GTT dual-domain pool, A-07/C-04/F-03/G-02) -------------
+// UMA BOs are carved out of the D7 ("test_buf") grant page by page — the layout
+// allocator stays the single authority over carveout addresses; this pool only
+// *accounts* for pages of that grant (first pages 0..2 are reserved for the S7/S8/
+// S9/S13 verification pages, so UMA allocation starts at page 3). The GPU address
+// is the MC aperture address (fb_mc_base + D7 offset + page offset); CPU access is
+// mapped by the user via IOConnectMapMemory64(handle) through a BAR0 window slice
+// (see r3BoMemory). GTT BOs are backed by GART-table PTE-mapped sysmem pages (gmc
+// mechanism via gmc_v11_0_gart_* helpers); their CP consumption path is deferred to
+// stage 4/5 (E6/F5). All io->bus() calls take carveout byte offsets (C-08).
+// ---- grant lookup helper (tag-based, same pattern as compute_v11.cpp) -------
+static const R3Grant* find_grant(const R3LayoutPlan &plan, const char *tag) {
+    for (uint32_t i = 0; i < plan.grant_count && i < R3_LAYOUT_MAX_GRANTS; i++) {
+        if (strcmp(plan.grants[i].tag, tag) == 0) {
+            return &plan.grants[i];
+        }
+    }
+    return nullptr;
+}
+
+
+namespace {
+struct BOEntry {
+    uint32_t domain;       // kN48R3DomainUMA / kN48R3DomainGTT
+    uint64_t size;         // bytes, page-aligned
+    uint64_t gpu_va;       // canonical GPU address (UMA: fb_mc_base+D7 off; GTT: GART VA)
+    uint64_t off;          // UMA: carveout byte offset inside D7 (BAR0 slice start)
+    uint64_t gart_va;      // GTT: GART VA start (== gpu_va raw); 0 for UMA
+    uint64_t sysmem_phys;  // GTT: sysmem physical page start; 0 for UMA
+    void    *sysmem_cpu;   // GTT: sysmem CPU pointer; nullptr for UMA
+    uint32_t pages;        // page count
+    bool     in_use;
+};
+static constexpr uint32_t kABIMaxBOs = 64u;
+static BOEntry s_bo_pool[kABIMaxBOs] = {};
+static IOLock *s_bo_lock = nullptr;
+
+// UMA: page accounting bitmap over the D7 grant (1 MiB = 256 pages).
+// Pages 0..2 are owned by the S7/S8/S9/S13 verification pages of the substeps.
+static constexpr uint32_t kUmaMaxPages = 256u;
+/* Page bitmap: bit i set = page i owned (incl. pages 0..2 pre-owned by the
+ * S7/S8/S9/S13 verification pages of the substeps, bitmap starts 0x7). */
+static uint32_t s_uma_bmp[8] = { 0x7u, 0, 0, 0, 0, 0, 0, 0 };
+
+static bool uma_alloc_pages(uint32_t pages, uint64_t *page_off) {
+    uint32_t run = 0;
+    for (uint32_t i = 0; i < kUmaMaxPages; i++) {
+        if (s_uma_bmp[i >> 5] & (1u << (i & 31u))) { run = 0; continue; }
+        run++;
+        if (run == pages) {
+            const uint32_t start = i - pages + 1u;
+            for (uint32_t k = start; k <= i; k++)
+                s_uma_bmp[k >> 5] |= (1u << (k & 31u));
+            *page_off = start;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void uma_free_pages(uint64_t page_off, uint32_t pages) {
+    for (uint32_t k = 0; k < pages; k++) {
+        const uint32_t i = static_cast<uint32_t>(page_off) + k;
+        if (i < kUmaMaxPages)
+            s_uma_bmp[i >> 5] &= ~(1u << (i & 31u));
+    }
+}
+
+// GTT: GART VA accounting. S7 occupies GART VA 0 .. 1 MiB (kGmcGartTestPages=256),
+// so GTT BOs are allocated from VA 1 MiB upward; freed VAs are recycled on a stack.
+static constexpr uint64_t kGartVaStart = 0x100000ull;
+static uint64_t s_gart_next_va = kGartVaStart;
+static uint64_t s_gart_free_va[kABIMaxBOs] = {};
+static uint32_t s_gart_free_n = 0;
+
+static uint64_t gart_alloc_va(uint32_t pages) {
+    if (s_gart_free_n > 0) return s_gart_free_va[--s_gart_free_n];
+    const uint64_t va = s_gart_next_va;
+    s_gart_next_va += static_cast<uint64_t>(pages) * 4096ull;
+    return va;
+}
+
+static void gart_free_va(uint64_t va) {
+    if (s_gart_free_n < kABIMaxBOs) s_gart_free_va[s_gart_free_n++] = va;
+}
+
+static uint64_t bo_next_slot() {
+    for (uint32_t i = 0; i < kABIMaxBOs; i++) {
+        if (!s_bo_pool[i].in_use) {
+            s_bo_pool[i].in_use = true;
+            return static_cast<uint64_t>(i) + 1ull;
+        }
+    }
+    return 0ull;
+}
+
+static BOEntry *bo_by_slot(uint64_t slot) {
+    if (slot == 0 || slot > kABIMaxBOs) return nullptr;
+    const uint32_t i = static_cast<uint32_t>(slot - 1ull);
+    if (!s_bo_pool[i].in_use) return nullptr;
+    return &s_bo_pool[i];
+}
+
+// C-05: stage-3 minimal coverage check — the IB VA must fall inside an allocated BO.
+static BOEntry *bo_by_va(uint64_t va) {
+    const uint64_t s = n48r3_va_strip(va);
+    for (uint32_t i = 0; i < kABIMaxBOs; i++) {
+        BOEntry *e = &s_bo_pool[i];
+        if (!e->in_use) continue;
+        const uint64_t bs = n48r3_va_strip(e->gpu_va);
+        if (s >= bs && s < bs + e->size) return e;
+    }
+    return nullptr;
+}
+} // namespace
+
+IOReturn NaviR3Bringup::r3AllocBO(uint32_t domain, uint64_t size,
+                                   uint64_t *gpu_va, uint64_t *handle) {
+    if (!gpu_va || !handle) return kIOReturnBadArgument;
+    if (n48r3_bo_alloc_args(size, domain) != 0) return kIOReturnBadArgument;
+    if (!s_bo_lock) s_bo_lock = IOLockAlloc();
+    if (!s_bo_lock) return kIOReturnNoMemory;
+
+    const uint32_t pages = static_cast<uint32_t>((size + 4095ull) >> 12);
+    const uint64_t aligned = static_cast<uint64_t>(pages) << 12;
+
+    IOLockLock(s_bo_lock);
+    const uint64_t slot = bo_next_slot();
+    if (slot == 0) { IOLockUnlock(s_bo_lock); return kIOReturnNoMemory; }
+    BOEntry *e = &s_bo_pool[slot - 1];
+    *e = BOEntry{};
+
+    IOReturn ret = kIOReturnSuccess;
+    const R3LayoutPlan &plan = integ_.rt.layout;
+
+    if (domain == kN48R3DomainUMA) {
+        // UMA: carve D7 grant page-by-page; GPU VA = MC aperture address.
+        const R3Grant *tb = find_grant(plan, "test_buf");
+        if (!tb) { ret = kIOReturnInternalError; }
+        else {
+            uint64_t page_off = 0;
+            if (!uma_alloc_pages(pages, &page_off)) {
+                ret = kIOReturnNoMemory;
+            } else {
+                e->domain = kN48R3DomainUMA;
+                e->size   = aligned;
+                e->pages  = pages;
+                e->off    = tb->start + (page_off << 12);
+                e->gpu_va = n48r3_uma_gpu_va_canonical(integ_.env.fb_mc_base, e->off);
+            }
+        }
+    } else {
+        // GTT: sysmem pages via the gmc allocator + GART-table PTE programming.
+        void *cpu = nullptr;
+        const uint64_t phys = amdgpu::gmc_v11_0_sysmem_alloc_pages(pages, &cpu);
+        const uint64_t gart_va = gart_alloc_va(pages);
+        if (phys == 0) {
+            ret = kIOReturnNoMemory;
+        } else if (gart_va == 0) {
+            amdgpu::gmc_v11_0_sysmem_free_pages(phys);
+            ret = kIOReturnNoMemory;
+        } else if (amdgpu::gmc_v11_0_gart_map_va(gart_va, phys, pages) < 0) {
+            amdgpu::gmc_v11_0_sysmem_free_pages(phys);
+            gart_free_va(gart_va);
+            ret = kIOReturnInternalError;
+        } else {
+            e->domain     = kN48R3DomainGTT;
+            e->size       = aligned;
+            e->pages      = pages;
+            e->gart_va    = gart_va;
+            e->gpu_va     = gart_va;   // GART VA is already canonical (top 17 bits 0)
+            e->sysmem_phys = phys;
+            e->sysmem_cpu  = cpu;
+        }
+    }
+
+    if (ret != kIOReturnSuccess) {
+        e->in_use = false;
+        IOLockUnlock(s_bo_lock);
+        return ret;
+    }
+    *gpu_va  = e->gpu_va;
+    *handle  = slot;
+    IOLockUnlock(s_bo_lock);
+    return kIOReturnSuccess;
+}
+
+IOReturn NaviR3Bringup::r3FreeBO(uint64_t gpu_va) {
+    if (!s_bo_lock) return kIOReturnNotReady;
+    IOLockLock(s_bo_lock);
+    BOEntry *e = bo_by_va(gpu_va);
+    if (!e) { IOLockUnlock(s_bo_lock); return kIOReturnBadArgument; }
+    if (e->domain == kN48R3DomainUMA) {
+        const R3Grant *tb = find_grant(integ_.rt.layout, "test_buf");
+        if (tb) uma_free_pages((e->off - tb->start) >> 12, e->pages);
+    } else {
+        amdgpu::gmc_v11_0_gart_unmap_va(e->gart_va, e->pages);
+        amdgpu::gmc_v11_0_sysmem_free_pages(e->sysmem_phys);
+        gart_free_va(e->gart_va);
+    }
+    e->in_use = false;
+    *e = BOEntry{};
+    IOLockUnlock(s_bo_lock);
+    return kIOReturnSuccess;
+}
+
+IOReturn NaviR3Bringup::r3SubmitIB(const struct N48R3CsIb *ibs, uint32_t num_ibs,
+                                    uint64_t *fence) {
+    if (!ibs || !fence) return kIOReturnBadArgument;
+    if (num_ibs < 1u || num_ibs > N48R3_CS_IB_MAX) return kIOReturnBadArgument;
+    if (!s_bo_lock) return kIOReturnNotReady;
+
+    const R3LayoutPlan &plan = integ_.rt.layout;
+    const uint64_t fb_mc_base = integ_.env.fb_mc_base;
+    const R3Grant *mes_grant = find_grant(plan, "mes");
+    const R3Grant *fence_ro  = find_grant(plan, "fence_ro");
+    if (!mes_grant || !fence_ro) return kIOReturnInternalError;
+
+    // C-05 stage-3 consensus: the ABI layer (NaviR3UserClient::doSubmit) already ran
+    // n48r3_cs_in_validate; re-check IB validity and the BO coverage rule here so the
+    // kext alone also refuses stray VAs. EXECUTABLE tracking is a stage-5 item (F8);
+    // this stage's minimal rule: the IB VA must fall inside an allocated BO.
+    IOLockLock(s_bo_lock);
+    for (uint32_t i = 0; i < num_ibs; i++) {
+        if (n48r3_cs_ib_valid(&ibs[i]) != 0) { IOLockUnlock(s_bo_lock); return kIOReturnBadArgument; }
+        BOEntry *e = bo_by_va(ibs[i].va_start);
+        if (!e) { IOLockUnlock(s_bo_lock); return kIOReturnBadArgument; }
+        // GTT BOs are PTE-mapped but their CP consumption path is a stage 4/5 item (E6/F5);
+        // the stage-3 ABI only submits IBs backed by UMA BOs (MC aperture VAs).
+        if (e->domain == kN48R3DomainGTT) {
+            IOLockUnlock(s_bo_lock);
+            IOLog("N48R3LOG submit: GTT BO 0x%llx: CP consumption deferred to stage 4/5 (E6/F5)\n",
+                  (unsigned long long)e->gpu_va);
+            return kIOReturnUnsupported;
+        }
+    }
+    IOLockUnlock(s_bo_lock);
+
+    const uint64_t ring_off  = mes_grant->start + amdgpu::kMesCmpRingOff;  // carveout byte off (C-08)
+    const uint64_t wb_off    = mes_grant->start + amdgpu::kMesCmpWbOff;
+    const uint64_t fence_off = wb_off + amdgpu::kMesWbFenceOff;
+    const uint64_t fence_mc  = fb_mc_base + fence_off;   // PM4-packet MC address only
+    const uint32_t doorbell_idx = amdgpu::kMesDoorbellCompute;
+    const uint32_t ring_dwords = amdgpu::kMesCmpRingDwords;
+    const R3Io *io = &integ_.io;
+
+    // C-09: persistent compute-ring wptr. Each submit appends one INDIRECT_BUFFER packet
+    // per IB (4 dwords each) plus one RELEASE_MEM (8 dwords). When the tail would
+    // straddle the ring boundary we pad to the end with NO_OP so no packet crosses the
+    // wrap point (Linux amdgpu rings use the same NOP padding, gfx_v11 insert_nop).
+    uint32_t wptr = cmp_wptr_;
+    if (wptr == 0u) {
+        // First ABI submit after the ladder: resume where the previous consumer
+        // (S13, compute_v11.cpp) left the compute ring — read its wptr back from
+        // the WB wptr-shadow page the MES ring contract uses (kMesWbWptrOff).
+        // Restarting at 0 would make the MES re-execute the S13 packets that are
+        // still in flight between rptr and the old wptr.
+        uint64_t shadow = 0;
+        if (!io->bus(io->ctx, R3_IO_BAR_VRAM, wb_off + amdgpu::kMesWbWptrOff,
+                     &shadow, false, 2) ||
+            shadow >= ring_dwords ||
+            (shadow & 3u) != 0u)  /* 4-dword 对齐，保证回绕填充 NOP 对不越界 */
+            return kIOReturnIOError;
+        wptr = static_cast<uint32_t>(shadow);
+    }
+    uint32_t total_dw = 0;
+    for (uint32_t i = 0; i < num_ibs; i++)
+        total_dw += 4u;
+    total_dw += 8u;
+    if (total_dw > ring_dwords) return kIOReturnNoSpace;
+
+    if (wptr + total_dw > ring_dwords) {
+        // Fill with complete NO_OP packets (2 dwords: header + 0 body, see
+        // N48R3_PM4_NOP_PAIR). wptr stays a multiple of 4 (each submit appends
+        // 4-dword INDIRECT_BUFFERs and an 8-dword RELEASE_MEM, and the initial
+        // shadow is 4-dword aligned), so pad is always even — write pairs.
+        uint64_t nop_pair = N48R3_PM4_NOP_PAIR;
+        const uint32_t pad = ring_dwords - wptr;
+        for (uint32_t i = 0; i < pad; i += 2) {
+            if (!io->bus(io->ctx, R3_IO_BAR_VRAM, ring_off + (wptr + i) * 4ull,
+                         &nop_pair, true, 2)) return kIOReturnIOError;
+        }
+        wptr = 0;  // wrap: next packet starts at ring head
+    }
+
+    uint64_t seq = 0;
+    { static uint64_t s_fence_seq = 1; seq = ++s_fence_seq; }
+
+    // Each IB: INDIRECT_BUFFER pointing at the user BO (PM4 MC address inside the packet).
+    for (uint32_t i = 0; i < num_ibs; i++) {
+        uint32_t pkt[4];
+        const uint32_t n = amdgpu::pm4_indirect_buffer(pkt, ibs[i].va_start,
+                                                       ibs[i].ib_bytes / 4u, 0u, true);
+        if (n == 0) return kIOReturnBadArgument;
+        for (uint32_t k = 0; k < n; k++) {
+            uint64_t v = pkt[k];
+            if (!io->bus(io->ctx, R3_IO_BAR_VRAM, ring_off + (wptr + k) * 4ull, &v, true, 1))
+                return kIOReturnIOError;
+        }
+        wptr += n;
+    }
+
+    // Fence: RELEASE_MEM targeting the WB fence slot (MC address inside the packet).
+    uint32_t rm_pkt[8];
+    const uint32_t rm_n = amdgpu::pm4_release_mem(rm_pkt, fence_mc, static_cast<uint32_t>(seq));
+    for (uint32_t i = 0; i < rm_n; i++) {
+        uint64_t v = rm_pkt[i];
+        if (!io->bus(io->ctx, R3_IO_BAR_VRAM, ring_off + (wptr + i) * 4ull, &v, true, 1))
+            return kIOReturnIOError;
+    }
+    wptr += rm_n;
+
+    if (!amdgpu::pm4_submit_tail(io, ring_off, wb_off, doorbell_idx, wptr))
+        return kIOReturnIOError;
+    cmp_wptr_ = wptr;
+
+    // Fence page (D6, fence_ro): publish the seq the user can map read-only and poll
+    // (裁决 §2.4; grant is ReadOnly for the user side, the kext writes it per submit).
+    uint64_t seq_val = seq;
+    if (!io->bus(io->ctx, R3_IO_BAR_VRAM, fence_ro->start, &seq_val, true, 2))
+        return kIOReturnIOError;
+
+    *fence = seq;
+    return kIOReturnSuccess;
+}
+
+IOReturn NaviR3Bringup::r3WaitFence(uint64_t expected_seq, uint32_t timeout_us,
+                                     uint64_t *observed, bool *timed_out) {
+    if (!observed || !timed_out) return kIOReturnBadArgument;
+    *timed_out = false;
+
+    const R3LayoutPlan &plan = integ_.rt.layout;
+    const R3Grant *mes_grant = find_grant(plan, "mes");
+    if (!mes_grant) return kIOReturnInternalError;
+
+    const uint64_t fence_off = mes_grant->start + amdgpu::kMesCmpWbOff
+                             + amdgpu::kMesWbFenceOff;   // carveout byte offset (C-08)
+    const R3Io *io = &integ_.io;
+    uint64_t val = 0;
+    const uint64_t deadline = io->now_us(io->ctx) + static_cast<uint64_t>(timeout_us);
+
+    while (io->now_us(io->ctx) < deadline) {
+        if (!io->bus(io->ctx, R3_IO_BAR_VRAM, fence_off, &val, false, 1)) {
+            *observed = val;
+            return kIOReturnIOError;
+        }
+        if (val >= expected_seq) {
+            *observed = val;
+            return kIOReturnSuccess;
+        }
+        io->udelay(io->ctx, 100u);
+    }
+
+    io->bus(io->ctx, R3_IO_BAR_VRAM, fence_off, &val, false, 1);
+    *observed = val;
+    *timed_out = true;
+    return kIOReturnSuccess;
+}
+
+IOMemoryDescriptor *NaviR3Bringup::r3BoMemory(uint64_t handle) {
+    if (!s_bo_lock) return nullptr;
+    IOLockLock(s_bo_lock);
+    BOEntry *e = bo_by_slot(handle);
+    IOMemoryDescriptor *md = nullptr;
+    if (e) {
+        if (e->domain == kN48R3DomainUMA) {
+            // UMA: CPU access goes through the BAR0 window slice at the same carveout
+            // offset the GPU sees (B4; grant->start is an offset into the BAR0 window).
+            md = IOMemoryDescriptor::withPhysicalAddress(
+                     dev_.bar0Phys + e->off, e->size, kIODirectionInOut);
+        } else {
+            md = IOMemoryDescriptor::withPhysicalAddress(
+                     e->sysmem_phys, e->size, kIODirectionInOut);
+        }
+    }
+    IOLockUnlock(s_bo_lock);
+    return md;  // fresh descriptor; mapClientMemory64 consumes the reference
+}
+
+IOMemoryDescriptor *NaviR3Bringup::r3FenceRoMemory() {
+    const R3Grant *fence_ro = find_grant(integ_.rt.layout, "fence_ro");
+    if (!fence_ro) return nullptr;
+    return IOMemoryDescriptor::withPhysicalAddress(
+        dev_.bar0Phys + fence_ro->start, fence_ro->size, kIODirectionIn);
 }
 
 

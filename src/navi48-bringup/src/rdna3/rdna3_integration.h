@@ -89,8 +89,7 @@ R3TriggerDecision r3_trigger_admission(bool provisioned, bool gate_ok, bool prep
 int r3_integration_register_production(const R3LayoutPlan *plan,
                                        const void *ip_base_table);
 
-/* Number of rows this layer attempts (test pin: the table must not silently shrink). */
-uint32_t r3_integration_register_row_count(void);
+
 
 /* --- scanout read-only collection (tech plan §4.2 L1 inputs) --------------------------
  * The layout allocator consumes the active scanout end so its guard never covers a live

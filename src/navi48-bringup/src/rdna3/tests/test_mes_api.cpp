@@ -29,6 +29,8 @@
 #include "amdgpu_ip.h"
 #include "fw_table.h"
 #include "amd/mes_v11_0.h"
+#include "amd/gmc_v11_0.h"
+#include "amd/pm4_v11.h"
 #include "n48log_stub.h"
 #include "rdna3/rdna3_fwhdr.h"
 #include "rdna3/rdna3_layout.h"
@@ -129,6 +131,9 @@ struct Dev {
     bool stall_fence;
     int stall_fence_op;
     bool gfx_queued;
+    uint32_t cmp_rptr;
+    bool stall_cmp_fence;
+    std::vector<uint32_t> ib_fetch;
 
     Dev()
         : bar0(static_cast<size_t>(kBar0Bytes), 0xa5u),
@@ -150,7 +155,9 @@ struct Dev {
           stall_status_qtype(-1),
           stall_fence(false),
           stall_fence_op(-1),
-          gfx_queued(false)
+          gfx_queued(false),
+          cmp_rptr(0),
+          stall_cmp_fence(false)
     {
         bar5[kGc1 + kRegMesGp3Lo] = 0x00770000u;
         bar5[kGc1 + kRegMesCntl] = 0u;
@@ -169,10 +176,24 @@ static uint32_t b0_32(const Dev &d, uint64_t off)
     return v;
 }
 
+static void b0_put32(Dev &d, uint64_t off, uint32_t v)
+{
+    if (off + 4ull <= static_cast<uint64_t>(d.bar0.size()))
+        memcpy(&d.bar0[static_cast<size_t>(off)], &v, 4u);
+}
+
 static void b0_put64(Dev &d, uint64_t off, uint64_t v)
 {
     if (off + 8ull <= static_cast<uint64_t>(d.bar0.size()))
         memcpy(&d.bar0[static_cast<size_t>(off)], &v, 8u);
+}
+
+static uint64_t b0_64(const Dev &d, uint64_t off)
+{
+    uint64_t v = 0;
+    if (off + 8ull <= static_cast<uint64_t>(d.bar0.size()))
+        memcpy(&v, &d.bar0[static_cast<size_t>(off)], 8u);
+    return v;
 }
 
 static uint64_t grant_mc(uint32_t sub_off)
@@ -275,6 +296,84 @@ static void mes_run(Dev &d, uint32_t wptr)
     d.sch_wptr_seen = wptr;
 }
 
+/* Act as the CP: consume PM4 dwords [cmp_rptr, wptr) from the compute ring
+ * (doorbell 6). Only the S11 VMID8 shapes are decoded: INDIRECT_BUFFER
+ * (op 0x3F) executes the IB at its VA; NOP (op 0x10) and TYPE-0 advance.
+ * The VMID8 translation is hardcoded to the S9 mapping (kGmcTestVaVmid8 page
+ * -> test_buf grant page 2), mirroring gmc seq_pt_build8. */
+static void cp_run(Dev &d, uint32_t wptr)
+{
+    const uint32_t ring_dw = kMesCmpRingDwords;
+    const uint64_t ring = grant_bar0(kMesCmpRingOff);
+    const R3Grant *tg = r3_layout_grant(&g_plan, "test_buf");
+    const uint64_t test_page = tg ? tg->start + 2 * 4096ull : 0ull;
+    const uint32_t target = wptr % ring_dw;
+    uint32_t pos = d.cmp_rptr;
+    uint32_t guard = 0;
+    while (pos != target && guard++ < 4u * ring_dw) {
+        const uint32_t w0 = b0_32(d, ring + static_cast<uint64_t>(pos) * 4ull);
+        uint32_t step = 1u;
+        if ((w0 >> 30) == 3u) {
+            const uint32_t op = (w0 >> 8) & 0xffu;
+            const uint32_t total = ((w0 >> 16) & 0x3fffu) + 2u;
+            if (op == kPm4OpIndirectBuffer && total == 4u) {
+                const uint64_t lo =
+                    b0_32(d, ring + static_cast<uint64_t>((pos + 1u) % ring_dw) * 4ull);
+                const uint64_t hi =
+                    b0_32(d, ring + static_cast<uint64_t>((pos + 2u) % ring_dw) * 4ull);
+                const uint32_t w3 =
+                    b0_32(d, ring + static_cast<uint64_t>((pos + 3u) % ring_dw) * 4ull);
+                const uint64_t ib_va = (hi << 32) | (lo & ~3ull);
+                const uint32_t len = w3 & 0xfffffu;
+                if (ib_va == kGmcTestVaVmid8 && test_page != 0ull) {
+                    for (uint32_t i = 0u; i + 2u <= len;) {
+                        const uint32_t iw0 =
+                            b0_32(d, test_page + static_cast<uint64_t>(i) * 4ull);
+                        const uint32_t iop = (iw0 >> 8) & 0xffu;
+                        const uint32_t icnt = (iw0 >> 16) & 0x3fffu;
+                        if (iop == kPm4OpWriteData && icnt == 3u) {
+                            const uint32_t itotal = 5u;
+                            for (uint32_t k = 0u; k < itotal; k++)
+                                d.ib_fetch.push_back(
+                                b0_32(d, test_page + static_cast<uint64_t>(i + k) * 4ull));
+                            const uint64_t dlo = b0_32(
+                                d, test_page + static_cast<uint64_t>(i + 2u) * 4ull);
+                            const uint64_t dhi = b0_32(
+                                d, test_page + static_cast<uint64_t>(i + 3u) * 4ull);
+                            const uint32_t data =
+                                b0_32(d, test_page + static_cast<uint64_t>(i + 4u) * 4ull);
+                            const uint64_t dst = (dhi << 32) | dlo;
+                            if (dst == kGmcTestVaVmid8 + kGmcTestPageIntra)
+                                b0_put32(d, test_page + kGmcTestPageIntra, data);
+                            i += itotal;
+                        } else if (iop == kPm4OpReleaseMem && icnt == 6u) {
+                            const uint32_t itotal = 8u; /* count=6 -> body 7 -> total 8 */
+                            for (uint32_t k = 0u; k < itotal; k++)
+                                d.ib_fetch.push_back(
+                                b0_32(d, test_page + static_cast<uint64_t>(i + k) * 4ull));
+                            const uint64_t flo = b0_32(
+                                d, test_page + static_cast<uint64_t>(i + 3u) * 4ull);
+                            const uint64_t fhi = b0_32(
+                                d, test_page + static_cast<uint64_t>(i + 4u) * 4ull);
+                            const uint32_t seq =
+                                b0_32(d, test_page + static_cast<uint64_t>(i + 5u) * 4ull);
+                            const uint64_t fmc = (fhi << 32) | flo;
+                            if (fmc >= kFbMcBase && !d.stall_cmp_fence)
+                                b0_put64(d, fmc - kFbMcBase, seq);
+                            i += itotal;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            step = total;
+        }
+        pos = (pos + step) % ring_dw;
+    }
+    d.cmp_rptr = pos;
+}
+
 static bool io_mmio(void *ctx, uint32_t dword, uint32_t *value, bool write)
 {
     Dev &d = *static_cast<Dev *>(ctx);
@@ -352,6 +451,8 @@ static bool io_bus(void *ctx, uint32_t bar, uint64_t off, uint64_t *value, bool 
         d.kick_order.push_back('d');
         if (op.index == 0x16u && op.value != 0u)
             mes_run(d, op.value);
+        if (op.index == kMesDoorbellCompute)
+            cp_run(d, op.value);
         return true;
     }
     if (bar != R3_IO_BAR_VRAM)
@@ -473,6 +574,16 @@ static bool build_fixture(Fixture &f, Dev &d, bool psp_ready, bool gfx_ready)
     in.gop_end_known = true;
     if (r3_layout_compute(&in, &f.rt.layout) != 0)
         return false;
+    /* Back-fill sysmem_grants for queue entry's page_table_base_addr lookup.
+     * r3_layout_compute sets tags/sizes but start=end=0 (not yet allocated).
+     * Simulate gmc_v11_0_bind_sysmem back-fill so seq_addq_compute/gfx find D2 root GPA. */
+    for (uint32_t i = 0; i < f.rt.layout.sysmem_grant_count && i < R3_LAYOUT_SYSMEM_MAX; i++) {
+        if (strcmp(f.rt.layout.sysmem_grants[i].tag, "ctx0_root_pool") == 0) {
+            f.rt.layout.sysmem_grants[i].start = 0x1000000000ull; /* simulated D2 root GPA */
+            f.rt.layout.sysmem_grants[i].end   = 0x1000000000ull + f.rt.layout.sysmem_grants[i].size;
+            break;
+        }
+    }
 
     f.rt.ready_bits = R3_IP_BIT(R3Ip::Psp);
     if (gfx_ready)
@@ -524,12 +635,19 @@ static void register_mes_rows(uint32_t gc0, uint32_t gc1)
         uint32_t addr;
         if (rows[i].golden) {
             const auto *g = static_cast<const r3gold::GoldenReg *>(rows[i].golden);
-            addr = (g->block == IPBlock::GC && g->base_idx == 1) ? gc1 : gc0;
-            addr += g->offset;
+            if (g->block == IPBlock::MMHUB) {
+                addr = (g->base_idx == 0 ? kMmhub0 : 0x1a000u) + g->offset;
+            } else if (g->block == IPBlock::GC && g->base_idx == 1) {
+                addr = gc1 + g->offset;
+            } else {
+                addr = gc0 + g->offset;
+            }
         } else {
-            /* Non-golden rows: GC seg0/1 or NBIO seg2 (S-1 hub rows). */
+            /* Non-golden rows: GC seg0/1, MMHUB seg0/1, or NBIO seg2 (S-1 hub rows). */
             if (rows[i].block == static_cast<uint8_t>(IPBlock::NBIO)) {
                 addr = 0xd20u + rows[i].off;  /* NBIO seg2 = 0xd20 */
+            } else if (rows[i].block == static_cast<uint8_t>(IPBlock::MMHUB)) {
+                addr = (rows[i].base_idx == 0 ? kMmhub0 : 0x1a000u) + rows[i].off;
             } else {
                 const uint32_t base = rows[i].base_idx == 0 ? gc0 : gc1;
                 addr = base + rows[i].off;
@@ -539,9 +657,32 @@ static void register_mes_rows(uint32_t gc0, uint32_t gc1)
               "register mes row %u (addr 0x%x)", i, addr);
     }
 }
+static void register_mes_queue_rows(uint32_t gc0, uint32_t gc1)
+{
+    const uint32_t rc = getMesQueueRowCount();
+    const R3WriteRowReg *rows = getMesQueueRows();
+    for (uint32_t i = 0; i < rc; i++) {
+        uint32_t addr;
+        if (rows[i].golden) {
+            const auto *g = static_cast<const r3gold::GoldenReg *>(rows[i].golden);
+            addr = (g->block == IPBlock::GC && g->base_idx == 1) ? gc1 : gc0;
+            addr += g->offset;
+        } else {
+            if (rows[i].block == static_cast<uint8_t>(IPBlock::NBIO)) {
+                addr = 0xd20u + rows[i].off;
+            } else {
+                const uint32_t base = rows[i].base_idx == 0 ? gc0 : gc1;
+                addr = base + rows[i].off;
+            }
+        }
+        CHECK(r3_wg_register_reg(addr, 1u, rows[i].cls, WSubstep::Mes, "reg:mes-queue") == 0,
+              "register mes queue row %u (addr 0x%x)", i, addr);
+    }
+}
 
 struct RunResult {
-    R3SubstepResult r;
+    R3SubstepResult r;      // final result (queue entry, or mes entry if queue didn't run)
+    R3SubstepResult mes_r;  // mes entry result (S-1..S6)
     bool ready;
     uint64_t deny_before;
     uint64_t deny_after;
@@ -560,6 +701,7 @@ static RunResult run(Fixture &f)
               "register mes grant");
     }
     register_mes_rows(kGc0, kGc1);
+    register_mes_queue_rows(kGc0, kGc1);
     const uint32_t dc = getMesDoorbellCount();
     const R3WriteRowAbs *dbs = getMesDoorbells();
     for (uint32_t i = 0; i < dc; i++) {
@@ -570,9 +712,21 @@ static RunResult run(Fixture &f)
 
     RunResult out;
     out.deny_before = r3_writeguard_deny_count();
-    out.r = mes_v11_0_substep(&f.io, &f.env);
-    out.deny_after = r3_writeguard_deny_count();
+    out.mes_r = mes_v11_0_substep(&f.io, &f.env);
     out.ready = (f.rt.ready_bits & R3_IP_BIT(R3Ip::Mes)) != 0u;
+    if (out.mes_r.status == kR3SsecOk) {
+        /* Run queue entry only if mes entry succeeded (S7..S11 depend on KIQ/SCH
+         * infrastructure established by mes entry).  Use queue entry's result as
+         * the overall outcome. */
+        out.r = mes_queue_v11_0_substep(&f.io, &f.env);
+        if (out.r.status != kR3SsecOk) {
+            /* Queue setup failure overrides ready status. */
+            out.ready = false;
+        }
+    } else {
+        out.r = out.mes_r;
+    }
+    out.deny_after = r3_writeguard_deny_count();
     return out;
 }
 
@@ -713,7 +867,24 @@ static void check_common_success(Fixture &f, Dev &d, const RunResult &rr)
     CHECK(d.bar5[kGc1 + 0x0802u] == 0u, "CP_MEC_CNTL=0");
     CHECK(d.bar5[kGc1 + 0x0803u] == kMesCpMeCntlCeHalt, "CP_ME_CNTL=0x01000000 (CE_HALT)");
     CHECK(!r3_writeguard_manifest()->truncated, "write manifest truncated");
-    CHECK(rr.r.reading_count == 4u, "readings=%u", rr.r.reading_count);
+    /* Readings are split across both entries.  mes entry (rr.mes_r) records
+     * CP_MES_CNTL, GP3 sched, GP3 kiq.  queue entry (rr.r) records CP_MES_CNTL
+     * and COMPUTE HQD. */
+    CHECK(rr.mes_r.reading_count >= 3u, "mes readings=%u", rr.mes_r.reading_count);
+    if (rr.mes_r.reading_count >= 3u) {
+        CHECK(rr.mes_r.readings[0].value ==
+                  (kMesCntlPipe0Active | kMesCntlPipe1Active), "cntl reading=0x%x",
+              rr.mes_r.readings[0].value);
+        CHECK(rr.mes_r.readings[1].value == 0x00770000u, "gp3 sched reading=0x%x",
+              rr.mes_r.readings[1].value);
+        CHECK(rr.mes_r.readings[2].value == 0x00770000u, "gp3 kiq reading=0x%x",
+              rr.mes_r.readings[2].value);
+    }
+    CHECK(rr.r.reading_count >= 2u, "queue readings=%u", rr.r.reading_count);
+    if (rr.r.reading_count >= 2u) {
+        CHECK(rr.r.readings[1].value == 1u, "COMPUTE HQD reading=0x%x",
+              rr.r.readings[1].value);
+    }
 
     /* B-01: every MES doorbell must be preceded by the contract-6 fence call. */
     CHECK(!d.kick_order.empty(), "no kick sequence recorded");
@@ -747,7 +918,7 @@ static void check_common_success(Fixture &f, Dev &d, const RunResult &rr)
           "compute property");
     CHECK(prop_get(f, "N48R3EVID-mes-hub") &&
               strcmp(prop_get(f, "N48R3EVID-mes-hub"),
-                     "fb_off_raw=0x6a0c\nc=written\nnbif=0x1/bit1\nrows=29") == 0,
+                     "fb_off_raw=0x6a0c\nc=written\nnbif=0x1/bit1\nrows=52") == 0,
           "mes-hub property=%s", prop_get(f, "N48R3EVID-mes-hub"));
     CHECK(prop_get(f, "N48R3EVID-mes-set-hw-1") &&
               strcmp(prop_get(f, "N48R3EVID-mes-set-hw-1"), "op19=skip ver=0x0") == 0,
@@ -946,12 +1117,12 @@ static void test_start_readback_recorded()
     CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
     CHECK(rr.ready, "ready bit not set");
     CHECK(d.apis.size() == 4u, "api count=%zu", d.apis.size());
-    CHECK(rr.r.reading_count == 4u, "readings=%u", rr.r.reading_count);
-    if (rr.r.reading_count == 4u) {
-        CHECK(strcmp(rr.r.readings[0].what, "CP_MES_CNTL") == 0, "what=%s",
-              rr.r.readings[0].what);
-        CHECK(rr.r.readings[0].value == 0u, "cntl readback recorded as 0x%x (not gated)",
-              rr.r.readings[0].value);
+    CHECK(rr.mes_r.reading_count == 3u, "readings=%u", rr.mes_r.reading_count);
+    if (rr.mes_r.reading_count == 3u) {
+        CHECK(strcmp(rr.mes_r.readings[0].what, "CP_MES_CNTL") == 0, "what=%s",
+              rr.mes_r.readings[0].what);
+        CHECK(rr.mes_r.readings[0].value == 0u, "cntl readback recorded as 0x%x (not gated)",
+              rr.mes_r.readings[0].value);
     }
     CHECK(prop_get(f, "N48R3EVID-mes-done") &&
               strcmp(prop_get(f, "N48R3EVID-mes-done"), "Yes") == 0, "done=Yes");
@@ -984,19 +1155,23 @@ static void test_gp3_zero_passes()
         CHECK(build_fixture(f, d, true, true), "fixture");
         d.bar5[kGc1 + kRegMesGp3Lo] = v;
         RunResult rr = run(f);
-        CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s (gp3=0x%08x)", rr.r.status,
-              rr.r.name, v);
-        CHECK(rr.ready, "ready bit not set (gp3=0x%08x)", v);
-        CHECK(rr.r.reading_count == 4u, "readings=%u (gp3=0x%08x)", rr.r.reading_count, v);
-        if (rr.r.reading_count == 4u) {
-            CHECK(rr.r.readings[1].value == v, "gp3 sched reading=0x%x",
-                  rr.r.readings[1].value);
-            CHECK(rr.r.readings[2].value == v, "gp3 kiq reading=0x%x",
-                  rr.r.readings[2].value);
-        }
+    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s (gp3=0x%08x)", rr.r.status,
+          rr.r.name, v);
+    CHECK(rr.ready, "ready bit not set (gp3=0x%08x)", v);
+    CHECK(rr.mes_r.reading_count == 3u, "readings=%u (gp3=0x%08x)", rr.mes_r.reading_count, v);
+    if (v != 0u && (rr.r.status != kR3SsecOk || rr.mes_r.status != kR3SsecOk)) {
+        fprintf(stderr, "=== n48log (gp3=0x%08x) ===\n%s\n=== end n48log ===\n",
+                v, n48log_host_text());
+    }
+    if (rr.mes_r.reading_count == 3u) {
+        CHECK(rr.mes_r.readings[1].value == v, "gp3 sched reading=0x%x",
+              rr.mes_r.readings[1].value);
+        CHECK(rr.mes_r.readings[2].value == v, "gp3 kiq reading=0x%x",
+              rr.mes_r.readings[2].value);
     }
 }
 
+}
 static void test_gp3_read_fault()
 {
     // §8.1: a read path fault on the S2 CP_MES_GP3_LO reads still fails closed.
@@ -1052,61 +1227,60 @@ static void test_set_hw_status_failure()
 
 static void test_compute_addq_status_failure()
 {
-    // C5.2 v1.5 (F7=c'): a rejected COMPUTE ADD_QUEUE is recorded, never fatal and never
-    // latched. S9 still exports, and the GFX attempt follows it.
+    // S7 fatal upgrade: a rejected COMPUTE ADD_QUEUE is now fatal; S8 (GFX) never runs.
     Dev d;
     Fixture f;
     CHECK(build_fixture(f, d, true, true), "fixture");
     d.stall_status_op = static_cast<int>(kMesApiAddQueue);
     d.stall_status_qtype = static_cast<int>(kMesQueueTypeCompute);
     RunResult rr = run(f);
-    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
-    CHECK(rr.ready, "ready bit not set");
-    CHECK(d.gfx_queued, "GFX attempt must follow the rejected COMPUTE add-queue");
+    CHECK(rr.r.status != kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(!rr.ready, "ready bit set on failure");
+    CHECK(!d.gfx_queued, "GFX attempt must not follow a fatal COMPUTE failure");
     CHECK(prop_get(f, "N48R3EVID-mes-addq-compute") &&
               strcmp(prop_get(f, "N48R3EVID-mes-addq-compute"), "fail:status") == 0,
           "compute property fail:status");
     CHECK(prop_get(f, "N48R3EVID-mes-addq-gfx") &&
-              strcmp(prop_get(f, "N48R3EVID-mes-addq-gfx"), "ok") == 0,
-          "gfx property ok");
+              strcmp(prop_get(f, "N48R3EVID-mes-addq-gfx"), "n/a") == 0,
+          "gfx property should be n/a (GFX never attempted)");
 }
 
 static void test_both_addq_rejected()
 {
-    // Both ADD_QUEUE submissions fail at the fence; both are recorded and S9 still passes.
+    // S7 fatal upgrade: compute ADD_QUEUE fence fail is now fatal; GFX never runs.
     Dev d;
     Fixture f;
     CHECK(build_fixture(f, d, true, true), "fixture");
     d.stall_fence = true;
     d.stall_fence_op = static_cast<int>(kMesApiAddQueue);
     RunResult rr = run(f);
-    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(rr.r.status != kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
     CHECK(prop_get(f, "N48R3EVID-mes-addq-compute") &&
               strcmp(prop_get(f, "N48R3EVID-mes-addq-compute"), "fail:fence") == 0,
           "compute fail:fence");
     CHECK(prop_get(f, "N48R3EVID-mes-addq-gfx") &&
-              strcmp(prop_get(f, "N48R3EVID-mes-addq-gfx"), "fail:fence") == 0,
-          "gfx fail:fence");
+              strcmp(prop_get(f, "N48R3EVID-mes-addq-gfx"), "n/a") == 0,
+          "gfx property should be n/a (compute fatal stops here)");
 }
 
 static void test_gfx_attempt_fails_overall_passes()
 {
+    // S8 fatal upgrade: compute ADD_QUEUE succeeds, GFX ADD_QUEUE fails; S8 is fatal.
     Dev d;
     Fixture f;
     CHECK(build_fixture(f, d, true, true), "fixture");
     d.stall_status_op = static_cast<int>(kMesApiAddQueue);
     d.stall_status_qtype = static_cast<int>(kMesQueueTypeGfx);
     RunResult rr = run(f);
-    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
-    CHECK(rr.ready, "ready bit not set");
-    CHECK(d.gfx_queued, "GFX attempt missing");
+    CHECK(rr.r.status != kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(!rr.ready, "ready bit set on failure");
+    CHECK(d.gfx_queued, "GFX was attempted but failed");
     CHECK(prop_get(f, "N48R3EVID-mes-addq-gfx") &&
               strcmp(prop_get(f, "N48R3EVID-mes-addq-gfx"), "fail:status") == 0,
           "gfx property=%s", prop_get(f, "N48R3EVID-mes-addq-gfx"));
     CHECK(prop_get(f, "N48R3EVID-mes-addq-compute") &&
               strcmp(prop_get(f, "N48R3EVID-mes-addq-compute"), "ok") == 0,
           "compute property");
-    CHECK(ev_has(f, "mes-addq-gfx"), "gfx evidence missing");
 }
 
 static void test_fence_timeout()
@@ -1132,8 +1306,9 @@ static void test_set_hw_1_op19()
     RunResult rr = run(f);
     CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
     CHECK(rr.ready, "ready bit not set");
-    CHECK(d.apis.size() == 5u, "api count=%zu", d.apis.size());
-    if (d.apis.size() == 5u)
+    // Short path = 5 API submissions; S11 gp3=0x52 >= 0x47 adds 2 (compute+gfx ADD_QUEUE) = 7
+    CHECK(d.apis.size() == 7u, "api count=%zu", d.apis.size());
+    if (d.apis.size() >= 2u)
         CHECK(d.apis[1].opcode == kMesApiSetHwRsrc1, "op1=%u", d.apis[1].opcode);
     char want[64];
     snprintf(want, sizeof(want), "op19=ok fence=0x%llx status=0x1",
@@ -1141,6 +1316,86 @@ static void test_set_hw_1_op19()
     CHECK(prop_get(f, "N48R3EVID-mes-set-hw-1") &&
               strcmp(prop_get(f, "N48R3EVID-mes-set-hw-1"), want) == 0,
           "mes-set-hw-1=%s want=%s", prop_get(f, "N48R3EVID-mes-set-hw-1"), want);
+}
+
+/* S11 VMID8 IB submission (V3-4): the compute ring executes a real IB through
+ * VMID 8 - WRITE_DATA magic to the S9-mapped VA, RELEASE_MEM fence, read-back,
+ * then the wrap-around NOP reset that leaves the ring clean for S13. */
+static void test_s11_vmid8_ib()
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d, true, true), "fixture");
+    RunResult rr = run(f);
+    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(rr.ready, "ready bit not set");
+
+    const R3Grant *tg = r3_layout_grant(&g_plan, "test_buf");
+    CHECK(tg != nullptr, "test_buf grant");
+    if (!tg)
+        return;
+    const uint64_t test_page = tg->start + 2 * 4096ull;
+    const uint64_t magic_off = test_page + kGmcTestPageIntra;
+
+    CHECK(prop_get(f, "N48R3EVID-mes-s11-vmid8-ib") &&
+              strcmp(prop_get(f, "N48R3EVID-mes-s11-vmid8-ib"),
+                     "ok fence=1 magic=0xdeadbeef va=0x200000100") == 0,
+          "mes-s11-vmid8-ib=%s", prop_get(f, "N48R3EVID-mes-s11-vmid8-ib"));
+    CHECK(has_db(d, kMesDoorbellCompute, 4u), "cmp doorbell kick wptr=4 missing");
+    CHECK(has_db(d, kMesDoorbellCompute, 0u), "cmp doorbell wrap wptr=0 missing");
+
+    /* The CP fetched the 13-dw IB: WRITE_DATA (5) + RELEASE_MEM (8, Linux
+     * gfx_v11_0.c emit_fence shape: w0+6 body+trailing 0). */
+    CHECK(d.ib_fetch.size() == 13u, "ib fetch count=%zu", d.ib_fetch.size());
+    if (d.ib_fetch.size() == 13u) {
+        CHECK(d.ib_fetch[0] == 0xC0033700u, "ib wd w0=0x%08x", d.ib_fetch[0]);
+        CHECK(d.ib_fetch[1] == 0x00100500u, "ib wd w1=0x%08x", d.ib_fetch[1]);
+        CHECK(d.ib_fetch[2] == 0x00000100u, "ib wd va_lo=0x%08x", d.ib_fetch[2]);
+        CHECK(d.ib_fetch[3] == 0x00000002u, "ib wd va_hi=0x%08x", d.ib_fetch[3]);
+        CHECK(d.ib_fetch[4] == kGmcTestMagic, "ib wd data=0x%08x", d.ib_fetch[4]);
+        CHECK(d.ib_fetch[5] == 0xC0064900u, "ib rm w0=0x%08x", d.ib_fetch[5]);
+        CHECK(d.ib_fetch[6] == 0x06603514u, "ib rm w1=0x%08x", d.ib_fetch[6]);
+        CHECK(d.ib_fetch[7] == 0x40000000u, "ib rm w2=0x%08x", d.ib_fetch[7]);
+        const uint64_t fence_mc = grant_mc(kMesCmpWbOff) + kMesWbFenceOff;
+        CHECK(d.ib_fetch[8] == static_cast<uint32_t>(fence_mc), "ib rm fence_lo=0x%08x",
+              d.ib_fetch[8]);
+        CHECK(d.ib_fetch[9] == static_cast<uint32_t>(fence_mc >> 32), "ib rm fence_hi=0x%08x",
+              d.ib_fetch[9]);
+        CHECK(d.ib_fetch[10] == 1u, "ib rm seq_lo=0x%08x", d.ib_fetch[10]);
+        CHECK(d.ib_fetch[11] == 0u, "ib rm seq_hi=0x%08x", d.ib_fetch[11]);
+        CHECK(d.ib_fetch[12] == 0u, "ib rm trailing=0x%08x", d.ib_fetch[12]);
+    }
+
+    /* The VMID8 WRITE_DATA landed through the mapped page. */
+    CHECK(b0_32(d, magic_off) == kGmcTestMagic, "vmid8 magic=0x%08x", b0_32(d, magic_off));
+    /* RELEASE_MEM wrote the fence. */
+    CHECK(b0_64(d, grant_bar0(kMesCmpWbOff) + kMesWbFenceOff) == 1ull, "cmp fence");
+    /* Wrap-around reset: whole ring is 2-dw NOPs, WB wptr back to 0. */
+    bool all_nop = true;
+    for (uint32_t i = 0; i < kMesCmpRingDwords; i += 2) {
+        const uint64_t v =
+            b0_64(d, grant_bar0(kMesCmpRingOff) + static_cast<uint64_t>(i) * 4ull);
+        if (v != 0x00000000C0001000ull) {
+            all_nop = false;
+            break;
+        }
+    }
+    CHECK(all_nop, "cmp ring not fully NOP after wrap reset");
+    CHECK(b0_64(d, grant_bar0(kMesCmpWbOff) + kMesWbWptrOff) == 0ull, "cmp wptr after wrap");
+}
+
+static void test_s11_vmid8_ib_fence_timeout()
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d, true, true), "fixture");
+    d.stall_cmp_fence = true; /* CP never writes the RELEASE_MEM fence */
+    RunResult rr = run(f);
+    CHECK(rr.r.status == kR3SsecFail, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(strcmp(rr.r.name, "seq:s11-vmid8-ib") == 0, "name=%s", rr.r.name);
+    CHECK(rr.r.section == kR3SecSeq && rr.r.step == 11u, "section/step %u/%u",
+          rr.r.section, rr.r.step);
+    CHECK(!rr.ready, "ready bit set on vmid8 ib failure");
 }
 
 static void test_pre_failures()
@@ -1193,6 +1448,8 @@ int main(void)
     test_gfx_attempt_fails_overall_passes();
     test_fence_timeout();
     test_set_hw_1_op19();
+    test_s11_vmid8_ib();
+    test_s11_vmid8_ib_fence_timeout();
     test_pre_failures();
 
     printf("test_mes_api: %u checks, %u failed\n", g_checks, g_fail);

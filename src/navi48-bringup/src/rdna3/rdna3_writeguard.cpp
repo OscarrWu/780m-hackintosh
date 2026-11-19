@@ -162,7 +162,8 @@ bool valid_class(WClass c)
 bool valid_owner(WSubstep s)
 {
     return s == WSubstep::Psp || s == WSubstep::Smu || s == WSubstep::Gfx ||
-           s == WSubstep::Sdma || s == WSubstep::Mes;
+           s == WSubstep::Sdma || s == WSubstep::Mes || s == WSubstep::Gmc ||
+           s == WSubstep::Ih || s == WSubstep::Abi;
 }
 
 
@@ -183,6 +184,17 @@ WVerdict note_deny(const char *ctx, uint32_t addr, uint32_t dwords, WClass cls,
         g.log_fn(g.log_user, line);
     }
     return WVerdict::Deny;
+}
+void log_grant_cap(const char *what, uint32_t used, uint32_t need)
+{
+    if (!g.log_fn)
+        return;
+    char line[128];
+    snprintf(line, sizeof line,
+             "N48R3LOG writeguard: GRANT-FULL %s used=%u need=%u cap=%u",
+             what ? what : "?", used, need,
+             static_cast<uint32_t>(R3_WG_GRANT_MAX));
+    g.log_fn(g.log_user, line);
 }
 
 } // namespace
@@ -312,29 +324,50 @@ int r3_wg_register_grant(const R3WgGrant *grant)
             return -1;
     }
 
-    if (g.grant_count >= R3_WG_GRANT_MAX)
+    if (g.grant_count >= R3_WG_GRANT_MAX) {
+        log_grant_cap("register", g.grant_count, 1u);
         return -2;
+    }
     g.grants[g.grant_count++] = *grant;
+    return 0;
+}
+
+int r3_wg_reserve(uint32_t rows)
+{
+    if (rows == 0u)
+        return -1;
+    if (g.grant_count > R3_WG_GRANT_MAX ||
+        rows > R3_WG_GRANT_MAX - g.grant_count) {
+        log_grant_cap("reserve", g.grant_count, rows);
+        return -2;
+    }
     return 0;
 }
 
 int r3_wg_register_layout(uint32_t start, uint32_t dwords, WSubstep owner, const char *tag)
 {
-    const R3WgGrant grant = { start, dwords, WClass::Data, owner, tag, true, false };
+    const R3WgGrant grant = { start, dwords, WClass::Data, owner, tag, true, false, false };
+    return r3_wg_register_grant(&grant);
+}
+
+int r3_wg_register_layout_readonly(uint32_t start, uint32_t dwords, WSubstep owner,
+                                   const char *tag)
+{
+    const R3WgGrant grant = { start, dwords, WClass::Data, owner, tag, true, false, true };
     return r3_wg_register_grant(&grant);
 }
 
 int r3_wg_register_reg(uint32_t addr, uint32_t dwords, WClass cls, WSubstep owner,
                        const char *tag)
 {
-    const R3WgGrant grant = { addr, dwords, cls, owner, tag, false, false };
+    const R3WgGrant grant = { addr, dwords, cls, owner, tag, false, false, false };
     return r3_wg_register_grant(&grant);
 }
 
 int r3_wg_register_shared_reg(uint32_t addr, uint32_t dwords, WClass cls, WSubstep owner,
                               const char *tag)
 {
-    const R3WgGrant grant = { addr, dwords, cls, owner, tag, false, true };
+    const R3WgGrant grant = { addr, dwords, cls, owner, tag, false, true, false };
     return r3_wg_register_grant(&grant);
 }
 
@@ -412,6 +445,9 @@ WVerdict r3_wg_classify(uint64_t pa, uint32_t size, WClass cls, const char *ctx)
         const uint64_t end = static_cast<uint64_t>(gr.start) + gr.dwords - 1u;
         if (pa < gr.start || hi > end)
             continue;
+        if (gr.readonly)
+            // D6 read-only fence page: every write is refused, whatever the class.
+            return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, gr.tag);
         if (gr.owner == g.owner && cls == WClass::Data)
             // A5: aggregate the whole grant interval, not each dword address.
             return note_allow(&gr, ctx, gr.start, gr.dwords, WClass::Data, gr.tag);
@@ -476,6 +512,9 @@ const char *r3_wg_substep_name(WSubstep s)
     case WSubstep::Gfx: return "gfx";
     case WSubstep::Sdma: return "sdma";
     case WSubstep::Mes: return "mes";
+    case WSubstep::Gmc: return "gmc";
+    case WSubstep::Ih: return "ih";
+    case WSubstep::Abi: return "abi";
     }
     return "?";
 }
@@ -491,8 +530,16 @@ int r3_wg_expect_writes(const R3WriteRowReg *rows, uint32_t count,
                         const R3WriteRowLayout *layouts, uint32_t layout_count,
                         WSubstep owner)
 {
-    if (!rows && count > 0)
+    if (!rows && count > 0) {
+        /* 参数早退同样必须显式复位：拒绝路径若残留 expect_armed=true 与旧集合，
+         * 后续 verify/classify 会继续消费陈旧集合（§9.2）。合法调用无行为差异。 */
+        g.expect_armed = false;
+        g.expect_row_count = 0;
+        g.expect_layout_count = 0;
+        g.expect_addr_count = 0;
+        g.expect_extra_count = 0;
         return -1;
+    }
     for (uint32_t i = 0; i < R3_WG_EXPECT_MAX; i++) {
         g.expect_met[i] = false;
         g.expect_layout_met[i] = false;
@@ -501,10 +548,22 @@ int r3_wg_expect_writes(const R3WriteRowReg *rows, uint32_t count,
     }
     g.expect_abs = nullptr;
     g.expect_abs_count = 0;
+    /* 超限拒绝（fail closed）：超过 R3_WG_EXPECT_MAX 的期望集合不再静默截断，
+     * 而是显式失败并复位状态——截断后的"部分集合"被当作完整契约消费是
+     * expect 静默漏检的根源（boot5 同批缺陷）。拒绝路径必须复位 expect_armed
+     * 等五个字段：本函数进入时的清理并不清它们，不清则陈旧集合继续可用。 */
+    if (count > R3_WG_EXPECT_MAX || layout_count > R3_WG_EXPECT_MAX) {
+        g.expect_armed = false;
+        g.expect_row_count = 0;
+        g.expect_layout_count = 0;
+        g.expect_addr_count = 0;
+        g.expect_extra_count = 0;
+        return -1;
+    }
     g.expect_rows = rows;
-    g.expect_row_count = count < R3_WG_EXPECT_MAX ? count : R3_WG_EXPECT_MAX;
+    g.expect_row_count = count;
     g.expect_layouts = layouts;
-    g.expect_layout_count = layout_count < R3_WG_EXPECT_MAX ? layout_count : R3_WG_EXPECT_MAX;
+    g.expect_layout_count = layout_count;
     g.expect_owner = owner;
     /* The declared address set is supplied separately by r3_wg_expect_declared_addrs():
      * the substep resolves its declaration rows through the IP base table at expect time.
@@ -519,7 +578,8 @@ int r3_wg_expect_writes(const R3WriteRowReg *rows, uint32_t count,
 
 int r3_wg_expect_declared_addrs(const uint32_t *addrs, uint32_t count)
 {
-    if (!g.expect_armed || (!addrs && count > 0) || count != g.expect_row_count)
+    if (!g.expect_armed || (!addrs && count > 0) || count != g.expect_row_count ||
+        count > R3_WG_EXPECT_MAX)
         return -1;
     for (uint32_t i = 0; i < count; i++)
         g.expect_addrs[i] = addrs[i];
@@ -565,8 +625,12 @@ int r3_wg_expect_abs_writes(const R3WriteRowAbs *rows, uint32_t count, WSubstep 
 {
     if (!g.expect_armed || owner != g.expect_owner || (!rows && count > 0))
         return -1;
+    /* 与 expect_writes 同形：超限拒不截断（原为静默截断，是漏检根源之一）；
+     * abs 计数归零即拒绝路径复位，不会残留半初始化集合。 */
+    if (count > R3_WG_EXPECT_MAX)
+        return -1;
     g.expect_abs = rows;
-    g.expect_abs_count = count < R3_WG_EXPECT_MAX ? count : R3_WG_EXPECT_MAX;
+    g.expect_abs_count = count;
     return 0;
 }
 

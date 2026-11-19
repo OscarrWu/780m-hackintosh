@@ -1029,10 +1029,13 @@ R3SubstepResult psp_v13_0_substep(const R3Io *io, const R3SubstepEnv *env)
     }
 
     r3_wg_arm_substep(WSubstep::Psp);
-    r3_wg_expect_writes(getPspRows(), getPspRowCount(), getPspLayouts(), getPspLayoutCount(), WSubstep::Psp);
+    if (r3_wg_expect_writes(getPspRows(), getPspRowCount(), getPspLayouts(),
+                            getPspLayoutCount(), WSubstep::Psp) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     uint32_t declared[R3_WG_EXPECT_MAX];
     r3_wg_resolve_row_addrs(env->ip, getPspRows(), getPspRowCount(), declared);
-    r3_wg_expect_declared_addrs(declared, getPspRowCount());
+    if (r3_wg_expect_declared_addrs(declared, getPspRowCount()) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     R3SubstepResult r = pre(p);
     if (r.status == kR3SsecOk)
         r = seq(p);
@@ -1142,10 +1145,10 @@ constexpr R3WriteRowReg kPspRows[] = {
     {&r3gold::kMp0SmnC2pmsg71, static_cast<uint8_t>(IPBlock::MP0), 0, 0, 1, WClass::State,    WNeed::Required, "s3-ring-size"},
     {&r3gold::kMp0SmnC2pmsg67, static_cast<uint8_t>(IPBlock::MP0), 0, 0, 1, WClass::Protocol, WNeed::Required, "s3-wptr-reset"},
 };
-constexpr uint32_t kPspRowCount = sizeof(kPspRows) / sizeof(kPspRows[0]);
-constexpr uint32_t kPspLayoutCount = sizeof(kPspLayouts) / sizeof(kPspLayouts[0]);
-static_assert(kPspRowCount == 5, "psp declaration table must have 5 rows");
-static_assert(kPspLayoutCount == 5, "psp layout declaration table must have 5 layouts");
+static_assert(sizeof(kPspRows) / sizeof(kPspRows[0]) == kPspRowCount,
+              "psp declaration table must have 5 rows");
+static_assert(sizeof(kPspLayouts) / sizeof(kPspLayouts[0]) == kPspLayoutCount,
+              "psp layout declaration table must have 5 layouts");
 } // anonymous namespace
 
 const R3WriteRowReg* getPspRows(void) { return kPspRows; }

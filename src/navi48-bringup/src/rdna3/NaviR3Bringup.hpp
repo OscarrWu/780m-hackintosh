@@ -30,10 +30,10 @@ static inline bool r3_auto_mode(bool *rejected = nullptr) {
     return R3_AUTO_PHASE_OPEN != 0 && requested;
 }
 
-// n48r3-depth accepts 0..5 (T1..T6). Any other value falls back to 0 (T1, the
+// n48r3-depth accepts 0..14 (T1..T15). Any other value falls back to 0 (T1, the
 // conservative default). Pure, so the host test can exercise it without IOKit.
 static inline uint32_t r3_depth_clamp(uint32_t raw) {
-    return raw <= 5u ? raw : 0u;
+    return raw <= 14u ? raw : 0u;
 }
 
 // The resolution start() performs: parse n48r3-depth (BootArgFamily supplies the
@@ -60,9 +60,13 @@ static inline R3DepthSel r3_depth_select(void) {
 #include "rdna3_wmanifest.h"
 #include "rdna3_integration.h"
 
+#include "../Navi48R3ABI.h"   /* C-10: the ABI contract header the kext and n48r3test both include */
+
 class IOPCIDevice;
 class IOMemoryMap;
 class IOUserClient;
+class IOBufferMemoryDescriptor;
+class IOMemoryDescriptor;
 
 class NaviR3Bringup : public IOService {
     OSDeclareDefaultStructors(NaviR3Bringup)
@@ -78,7 +82,19 @@ public:
 
     const char *surveyText() const { return state_.text; }
     IOReturn   triggerPowerUp();  /* D-01: user-client trigger entry (selector 1) */
-
+    /* T-E / C-05 / C-08 / C-09: ABI selectors 2-5 — BO alloc/free, IB submit, fence wait.
+     * Every io->bus call takes carveout byte offsets (grant->start + sub-offset);
+     * fb_mc_base only ever appears inside PM4 packet payloads (see compute_v11.cpp S13). */
+    IOReturn   r3AllocBO(uint32_t domain, uint64_t size, uint64_t *gpu_va, uint64_t *handle);
+    IOReturn   r3FreeBO(uint64_t gpu_va);
+    IOReturn   r3SubmitIB(const struct N48R3CsIb *ibs, uint32_t num_ibs, uint64_t *fence);
+    IOReturn   r3WaitFence(uint64_t expected_seq, uint32_t timeout_us,
+                           uint64_t *observed, bool *timed_out);
+    /* clientMemoryForType backing: a fresh device descriptor slice of the BO's backing
+     * memory (UMA: BAR0 window; GTT: sysmem pages), or the D6 fence page. The descriptor
+     * reference is handed to IOUserClient::mapClientMemory64 (Navi48UserClient.cpp:31-41). */
+    IOMemoryDescriptor *r3BoMemory(uint64_t handle);
+    IOMemoryDescriptor *r3FenceRoMemory();
 private:
     static bool setPropertyThunk(void *user, const char *key, const char *bytes, size_t len);
     static void wgLogThunk(void *user, const char *line);
@@ -126,6 +142,7 @@ private:
     char                  rdm_buf_[R3_MANIFEST_BYTES] {}; /* B5/T16: read-manifest text (was stack) */
     bool                  fired_ { false };              /* D-01: power-up substeps ran this boot */
     bool                  started_ { false };
+    uint32_t              cmp_wptr_ { 0 };               /* C-09: compute ring wptr, persistent across submits */
 };
 
 #endif // KERNEL

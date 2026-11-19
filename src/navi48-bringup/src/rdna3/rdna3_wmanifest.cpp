@@ -19,8 +19,13 @@ size_t r3_wm_format(const R3WManifest *m, char *out, size_t cap)
         return 0;
 
     size_t used = 0;
-    for (uint32_t i = 0; i < m->count; i++) {
-        if (used + 1 >= cap)
+    uint32_t i = 0;
+    for (; i < m->count; i++) {
+        /* Once real text is on the buffer keep the tail free so the truncation
+         * markers can always be appended. An empty buffer still tries the first
+         * line and falls into the fill-to-cap-1 path below, preserving the
+         * "as much as fits, NUL-terminated" contract for tiny buffers. */
+        if (used > 0 && cap - used <= 40u)
             break;
         const R3WMEntry &e = m->entries[i];
         const uint32_t len = e.end_off - e.addr + 1u;
@@ -36,6 +41,14 @@ size_t r3_wm_format(const R3WManifest *m, char *out, size_t cap)
             break;
         }
         used += (size_t)n;
+    }
+    /* The table may be intact while the TEXT buffer ran out: that loss is
+     * reported separately from m->truncated (table-full dropped count). */
+    if (i < m->count) {
+        const int n = snprintf(out + used, cap - used, "text-truncated=%u\n",
+                               m->count - i);
+        if (n > 0 && (size_t)n < cap - used)
+            used += (size_t)n;
     }
 
     if (m->truncated && used + 1 < cap) {

@@ -174,7 +174,7 @@ static void fill_ip(IPBaseTable *ip)
     ip->setBase(IPBlock::MP1, 1, 0x70000u);
     /* The golden-resolved consumers use MP0/MMHUB segment 1 explicitly (A-01). */
     ip->setBase(IPBlock::MP0, 1, 0x60000u);
-    ip->setBase(IPBlock::MMHUB, 1, 0x80000u);
+    ip->setBase(IPBlock::MMHUB, 1, 0x1a000u);
     /* NBIO seg2 for MES S-1 doorbell aperture row. */
     ip->setBase(IPBlock::NBIO, 2, 0xd20u);
 }
@@ -212,9 +212,11 @@ static void test_registration()
     const int rc = r3_integration_register_production(&plan, &ip);
     CHECK(rc == 0, "register_production failed");
 
-    /* Step2: runtime expected row count (GFX=0). */
+    /* Step2: runtime expected row count (GFX=0).
+     * SDMA regs+layout + MES rows+layout+doorbells + QUEUE rows + PSP rows+layouts + SMU rows */
     const uint32_t expected = getSdmaRowCount() + 1u +          // SDMA regs + layout
                               getMesRowCount() + 1u + amdgpu::getMesDoorbellCount() +
+                              amdgpu::getMesQueueRowCount() +   // T-E split: queue rows (S7-S11)
                               getPspRowCount() + getPspLayoutCount() +
                               getSmuRowCount();
     {
@@ -298,10 +300,16 @@ static void test_registration()
                 uint32_t addr;
                 if (rows[i].golden) {
                     const auto *g = static_cast<const r3gold::GoldenReg *>(rows[i].golden);
-                    addr = (g->base_idx == 0 ? 0x10000u : 0x20000u) + g->offset;
+                    if (g->block == IPBlock::MMHUB) {
+                        addr = (g->base_idx == 0 ? 0x30000u : 0x1a000u) + g->offset;
+                    } else {
+                        addr = (g->base_idx == 0 ? 0x10000u : 0x20000u) + g->offset;
+                    }
                 } else if (rows[i].block == static_cast<uint8_t>(IPBlock::NBIO)) {
                     /* NBIO seg2 = 0xd20 (方案 v3 §6.2.3 row 29). */
                     addr = 0xd20u + rows[i].off;
+                } else if (rows[i].block == static_cast<uint8_t>(IPBlock::MMHUB)) {
+                    addr = (rows[i].base_idx == 0 ? 0x30000u : 0x1a000u) + rows[i].off;
                 } else {
                     const uint32_t base = rows[i].base_idx == 0 ? 0x10000u : 0x20000u;
                     addr = base + rows[i].off;
@@ -584,7 +592,7 @@ static void test_layout_reachable()
     const int rc = r3_layout_compute(&in, &plan);
     CHECK(rc == 0 && plan.ok, "layout must succeed for the machine profile (rc=%d,%s)", rc,
           plan.fail_reason ? plan.fail_reason : "-");
-    CHECK(plan.grant_count == 7u, "grant_count=%u", plan.grant_count);
+    CHECK(plan.grant_count == 13u, "grant_count=%u", plan.grant_count);
     const R3Grant *tmr = r3_layout_grant(&plan, "tmr");
     CHECK(tmr && tmr->start == 0x08000000ull, "TMR slot start");
     CHECK(tmr && tmr->size == 64ull * 1024ull * 1024ull, "TMR slot size");

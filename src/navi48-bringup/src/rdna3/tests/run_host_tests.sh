@@ -28,6 +28,12 @@ $CXX $FLAGS -o "$out/test_writeguard" "$here/test_writeguard.cpp" "$src/rdna3/rd
     "$src/rdna3/rdna3_wmanifest.cpp" "$src/rdna3/rdna3_substep.cpp" "$STUB"
 "$out/test_writeguard"
 
+echo "== test_write_budget"
+$CXX $FLAGS -o "$out/test_write_budget" "$here/test_write_budget.cpp" \
+    "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$STUB"
+"$out/test_write_budget"
+
 echo "== test_discovery"
 $CXX $FLAGS -o "$out/test_discovery" "$here/test_discovery.cpp" \
     "$src/rdna3/rdna3_discovery.cpp" "$src/ipdiscovery.cpp"
@@ -96,12 +102,30 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_sdma_msg" \
 
 echo "== test_mes_api (K8, MES scheduler)"
 $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_mes_api" \
-    "$here/test_mes_api.cpp" "$src/amd/mes_v11_0.cpp" \
+    "$here/test_mes_api.cpp" "$src/amd/mes_v11_0.cpp" "$src/amd/pm4_v11.cpp" \
     "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_fwhdr.cpp" \
     "$src/rdna3/rdna3_layout.cpp" "$src/rdna3/rdna3_writeguard.cpp" \
     "$src/rdna3/rdna3_wmanifest.cpp" "$src/rdna3/fw_table_rdna3.cpp" \
     "$out"/fw_*.o "$STUB"
 "$out/test_mes_api"
+echo "== test_compute_v11 (S12/S13, ABI + compute chain)"
+$CXX $FLAGS -include stdio.h -include string.h -o "$out/test_compute_v11" \
+    "$here/test_compute_v11.cpp" "$src/amd/compute_v11.cpp" "$src/amd/pm4_v11.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" "$STUB"
+"$out/test_compute_v11"
+
+echo "== test_ih_v6_0 (K10, IH 6.0.1 ring + decoder)"
+$CXX $FLAGS -include stdio.h -include string.h -o "$out/test_ih_v6_0" \
+    "$here/test_ih_v6_0.cpp" "$src/amd/ih_v6_0.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" \
+    "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" "$STUB"
+"$out/test_ih_v6_0"
+
+echo "== test_pm4_v11 (K11, PM4 packets + submit tail)"
+$CXX $FLAGS -include stdio.h -include string.h -o "$out/test_pm4_v11" \
+    "$here/test_pm4_v11.cpp" "$src/amd/pm4_v11.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$STUB"
+"$out/test_pm4_v11"
 
 echo "== test_teardown (K9, dump + reverse teardown)"
 $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_teardown" \
@@ -109,7 +133,7 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_teardown" \
     "$src/rdna3/rdna3_teardown.cpp" "$src/rdna3/rdna3_writeguard.cpp" \
     "$src/rdna3/rdna3_wmanifest.cpp" "$src/rdna3/rdna3_substep.cpp" \
     "$src/rdna3/rdna3_layout.cpp" "$src/rdna3/rdna3_integration.cpp" \
-    "$src/amd/sdma_v6_0.cpp" "$src/amd/mes_v11_0.cpp" \
+    "$src/amd/sdma_v6_0.cpp" "$src/amd/mes_v11_0.cpp" "$src/amd/pm4_v11.cpp" \
     "$src/amd/psp_v13_0.cpp" "$src/amd/smu_v13_0.cpp" \
     "$src/rdna3/rdna3_fwhdr.cpp" "$src/rdna3/fw_table_rdna3.cpp" \
     "$out"/fw_*.o "$src/common/StageRunner.cpp" "$STUB"
@@ -121,11 +145,19 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_integration" \
     "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" \
     "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" \
     "$src/rdna3/rdna3_dump.cpp" "$src/amd/sdma_v6_0.cpp" \
-    "$src/amd/mes_v11_0.cpp" "$src/amd/psp_v13_0.cpp" \
+    "$src/amd/mes_v11_0.cpp" "$src/amd/pm4_v11.cpp" "$src/amd/psp_v13_0.cpp" \
     "$src/amd/smu_v13_0.cpp" \
     "$src/rdna3/rdna3_fwhdr.cpp" "$src/rdna3/fw_table_rdna3.cpp" \
     "$out"/fw_*.o "$src/common/StageRunner.cpp" "$STUB"
 "$out/test_integration"
+
+echo "== test_gmc (T-B, S6..S9 substeps + pure functions)"
+$CXX $FLAGS -include stdio.h -include string.h -o "$out/test_gmc" \
+    "$here/test_gmc.cpp" "$src/amd/gmc_v11_0.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" \
+    "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" \
+    "$STUB"
+"$out/test_gmc"
 
 
 echo "== test_golden_values (T18, P1 address mechanism)"
@@ -138,7 +170,7 @@ echo "== test_userclient_info (S3 info offset-chunked read)"
 # any real defect. ucmock/ models the offset-chunked call shape (tmp/main/技术方案-S3-info分块读取改造.md);
 # dalshim/ supplies the real kIOReturn values.
 UCFLAGS="-std=c++17 -Wall -Werror -g -O1 -fno-omit-frame-pointer \
-         -fsanitize=address,undefined -I$here/ucmock -I$root/tests/dalshim \
+         -fsanitize=address,undefined -DN48R3_HOST_TEST -I$here/ucmock -I$root/tests/dalshim \
          -I$src -I$src/rdna3"
 $CXX $UCFLAGS -o "$out/test_userclient_info" "$here/test_userclient_info.cpp"
 "$out/test_userclient_info"

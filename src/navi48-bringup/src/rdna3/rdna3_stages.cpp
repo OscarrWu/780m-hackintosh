@@ -14,6 +14,20 @@
 // stage-2 failure uses the K9 dump, whose available set is declared per failing substep and
 // which never touches IH (stage 2 does not initialise it).
 #include "rdna3_survey.h"
+#include "common/BootArgFamily.h"
+#include "amd/gmc_v11_0.h"
+
+/* Forward declarations for substep entries declared by T-B/C/D. */
+namespace amdgpu {
+R3SubstepResult uma_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult gart_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult gpuvm0_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult vmid8_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult ih_v6_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult mes_queue_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult abi_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+R3SubstepResult compute_v11_0_substep(const R3Io *, const R3SubstepEnv *);
+} // namespace amdgpu
 #include "rdna3_writeguard.h"
 #include "common/TargetConfig.h"
 #include "rdna3_dump.h"
@@ -38,8 +52,10 @@ constexpr uint64_t R3_TMR_LAYOUT_RESERVE = 64ull * 1024ull * 1024ull;
 
 // Selected stage-0 depth (0..5 = T1..T6). Set once by the entry class before the ladder runs;
 // the survey module reads it through r3_stage0_depth(). Out-of-range input falls back to T1.
-static uint32_t g_stage0_depth = 0;
-
+/* GmcSysmemAlloc: bound by the driver before the ladder runs; used in
+ * tables (D1-D3). */
+static uint32_t g_stage0_depth = 0;   // T-E: 0..R3_STAGE0_MAX_DEPTH (default 0 = T1)
+static const amdgpu::GmcSysmemAlloc *g_sysmem_alloc = nullptr;
 static void emit(StageCtx &ctx, const char *text) {
     if (ctx.log) ctx.log(ctx.user, text);
 }
@@ -209,8 +225,14 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
         r3_integration_note_prep_failure(ic, "prep:whitelist-arm");
         return false;
     }
-    if (r3_integration_register_production(&plan, &d.ip) != 0) {
-        r3_integration_note_prep_failure(ic, "prep:whitelist-register");
+    const int reg_rc = r3_integration_register_production(&plan, &d.ip);
+    if (reg_rc != 0) {
+        /* -2 = 写守卫 grant 表满/预算不足（编译期断言与 r3_wg_reserve 已拦截，
+         * 走到这里说明预算契约与实际注册量失配）；其余 = 参数错/段增量不符。 */
+        r3_integration_note_prep_failure(ic, reg_rc == -2 ? "prep:whitelist-budget"
+                                                           : "prep:whitelist-register");
+        emitf(ctx, "stage2 prep: register_production rc=%d used=%u cap=%u", reg_rc,
+              r3_wg_grant_count(), static_cast<uint32_t>(R3_WG_GRANT_MAX));
         return false;
     }
 
@@ -230,6 +252,14 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
     bool hdp_ok = false;
     const amdgpu::RegRef hdp_ref{amdgpu::IPBlock::NBIO, 0x012Du, 2u};
     if (d.ip.resolve(hdp_ref, &hdp_addr)) {
+        /* HDP 共享行有独立预算：表满在入口预检失败，不要落到 prep:hdp-window
+         * （那是窗口发现失败，语义不同）。 */
+        if (r3_wg_reserve(amdgpu::kHdpGrantCount) != 0) {
+            r3_integration_note_prep_failure(ic, "prep:hdp-budget");
+            emitf(ctx, "stage2 prep: HDP grant budget used=%u cap=%u",
+                  r3_wg_grant_count(), static_cast<uint32_t>(R3_WG_GRANT_MAX));
+            return false;
+        }
         hdp_remap = amdgpu::RREG32(d, hdp_addr);
         hdp_ok = r3_hdp_flush_window(hdp_remap, ic->window.bar5_bytes, &hdp_dw) &&
                  r3_wg_register_shared_reg(hdp_dw, 1u, WClass::Protocol, WSubstep::Psp,
@@ -251,6 +281,21 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
     ic->env.hdp_flush_dword = hdp_dw;
     ic->env.hdp_flush_valid = true;
     ic->env.strict_expect = false;
+
+    /* T-E: bind the sysmem allocator so GMC substeps (S6-S9) can allocate
+     * D1-D3 system memory. The allocator was set up by the driver via
+     * r3_stages_set_sysmem_allocator() before the ladder started. */
+    if (g_sysmem_alloc) {
+        if (amdgpu::gmc_v11_0_bind_sysmem(g_sysmem_alloc) != 0) {
+            r3_integration_note_prep_failure(ic, "prep:sysmem-bind");
+            emitf(ctx, "stage2 prep: gmc_v11_0_bind_sysmem failed");
+            return false;
+        }
+    } else {
+        r3_integration_note_prep_failure(ic, "prep:no-sysmem-alloc");
+        emitf(ctx, "stage2 prep: no sysmem allocator (g_sysmem_alloc=null)");
+        return false;
+    }
 
     // Read manifest: the substeps' MMIO wrappers note every read; stage 0 already exported
     // its own. Nothing to do here beyond keeping the manifest object addressable.
@@ -341,6 +386,101 @@ static StageResult stage4_sdma(StageCtx &ctx) {
 }
 static StageResult stage5_mes(StageCtx &ctx) {
     return run_substep(ctx, R3Ip::Mes, amdgpu::mes_v11_0_substep, "mes");
+}
+
+// ---- stage 6-13: new T-E substeps (GMC/IH/MES-queue/ABI/compute) -----------
+
+/* enabled predicate for the new stages. The kill leaf groups stages by their
+ * kill-switch cluster: "gart" for S6-S9 (uma/gart/gpuvm0/vmid8), "mes" for S10
+ * (doorbell/IH), "queue" for S11-S13 (queue/abi/compute).  All stages 6+
+ * additionally require mes (S5) to have completed (ready_bits). */
+static bool enabled_by_leaf(const StageCtx &ctx, const char *leaf)
+{
+    R3IntegrationCtx *ic = integ_ctx(const_cast<StageCtx &>(ctx));
+    if (!ic || !ic->prep_ok)
+        return false;
+    /* All new stages depend on mes (S5) having completed. */
+    if (!(ic->rt.ready_bits & R3_IP_BIT(R3Ip::Mes)))
+        return false;
+    return r3_kill_state(leaf) != kR3KillOff;
+}
+
+static bool stage6_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "gart"); }
+static bool stage7_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "gart"); }
+static bool stage8_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "gart"); }
+static bool stage9_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "gart"); }
+static bool stage10_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "mes"); }
+static bool stage11_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "queue"); }
+static bool stage12_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "queue"); }
+static bool stage13_enabled(const StageCtx &ctx) { return enabled_by_leaf(ctx, "queue"); }
+
+/* Readings are the failing substep's fixed 8-slot snapshot; export them on the
+ * failure path so a boot log carries the same values the substep saw. Both the
+ * stage log (N48R3LOG) and the n48log ring get the line; neither is a new
+ * buffer (IO-7). */
+static void emit_readings(StageCtx &ctx, R3IntegrationCtx *ic, const char *name,
+                          const R3SubstepResult &r)
+{
+    for (uint32_t i = 0; i < r.reading_count; i++) {
+        const R3SubstepReading &e = r.readings[i];
+        emitf(ctx, "stage %s: reading[%u] %s addr=0x%x value=0x%x", name, i,
+              e.what, e.addr, e.value);
+        char line[192];
+        snprintf(line, sizeof line, "reading[%u] %s addr=0x%x value=0x%x", i,
+                 e.what, e.addr, e.value);
+        r3_ev_add(&ic->ev, "stage", line);
+    }
+}
+
+/* run_substep wrapper for stages that have an R3Io+R3SubstepEnv entry.
+ * These stages do not map to an R3Ip (no ready_bits/latch_bits), so on
+ * success we do NOT set ready_bits (the IP layer already tracked completion
+ * through the substep's own evidence). */
+static StageResult run_generic(StageCtx &ctx, R3SubstepFn fn, const char *name)
+{
+    R3IntegrationCtx *ic = integ_ctx(ctx);
+    if (!ic || !ic->prep_ok) {
+        emitf(ctx, "stage %s: FAIL prep_chain=%s", name,
+              ic ? ic->prep_chain : "prep:missing");
+        return kStageFail;
+    }
+    emitf(ctx, "stage %s: running %s", name, name);
+    R3SubstepResult r = fn(&ic->io, &ic->env);
+    if (r3_substep_ok(&r)) {
+        emitf(ctx, "stage %s: PASS (%s step %u)", name,
+              r.name ? r.name : "?", r.step);
+        return kStageOk;
+    }
+    emitf(ctx, "stage %s: FAIL reason=%s step=%u (readings=%u)", name,
+          r.name ? r.name : "?", r.step, r.reading_count);
+    emit_readings(ctx, ic, name, r);
+    ic->failed = true;
+    return kStageFail;
+}
+
+static StageResult stage6_uma(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::uma_v11_0_substep, "uma");
+}
+static StageResult stage7_gart(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::gart_v11_0_substep, "gart");
+}
+static StageResult stage8_gpuvm0(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::gpuvm0_v11_0_substep, "gpuvm0");
+}
+static StageResult stage9_vmid8(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::vmid8_v11_0_substep, "vmid8");
+}
+static StageResult stage10_doorbell(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::ih_v6_0_substep, "doorbell");
+}
+static StageResult stage11_queue(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::mes_queue_v11_0_substep, "queue");
+}
+static StageResult stage12_abi(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::abi_v11_0_substep, "abi");
+}
+static StageResult stage13_compute(StageCtx &ctx) {
+    return run_generic(ctx, amdgpu::compute_v11_0_substep, "compute");
 }
 
 // D-02: the read-only gate between the survey and the first power-up write. It samples the
@@ -535,7 +675,8 @@ static StageResult stage0_survey(StageCtx &ctx) {
         return kStageFail;
     }
 
-    // C0.9: every run is judged on its own products (the trigger path re-runs stage 0).
+    // C0.9: every run is judged on its own products (the trigger path starts at the first
+    // power-up substep and never re-runs stage 0; StageRunner bringup_r3_from).
     // Clear the previous run's marks and the base table: a failed discovery is caught by the
     // report count and by sentinel bases, never by stale data from an earlier run.
     if (st->hw.disc) st->hw.disc->ip_count = 0u;
@@ -692,6 +833,14 @@ static const StageDef kStages[] = {
     {"gfx",  stage3_gfx,  stage3_enabled},
     {"sdma", stage4_sdma, stage4_enabled},
     {"mes",  stage5_mes,  stage5_enabled},
+    {"uma",      stage6_uma,       stage6_enabled},
+    {"gart",     stage7_gart,       stage7_enabled},
+    {"gpuvm0",   stage8_gpuvm0,    stage8_enabled},
+    {"vmid8",    stage9_vmid8,     stage9_enabled},
+    {"doorbell", stage10_doorbell,  stage10_enabled},
+    {"queue",    stage11_queue,     stage11_enabled},
+    {"abi",      stage12_abi,       stage12_enabled},
+    {"compute",  stage13_compute,   stage13_enabled},
 };
 
 } // namespace
@@ -720,7 +869,7 @@ void r3_dump_failure_state(StageCtx &ctx) {
 void r3_stage0_set_depth(uint32_t depth) {
     const uint32_t clamped = r3_stage_depth_clamp(depth);
     if (depth != clamped) {
-        IOLog("N48R3LOG stage0: depth %u out of range 0..%u; using 0 (T1)\n",
+        IOLog("N48R3LOG stage0: depth %u out of range 0..%u (15 stages); using 0 (T1)\n",
               depth, R3_STAGE0_MAX_DEPTH);
     }
     g_stage0_depth = clamped;
@@ -728,4 +877,10 @@ void r3_stage0_set_depth(uint32_t depth) {
 
 uint32_t r3_stage0_depth(void) {
     return g_stage0_depth;
+}
+
+/* ---- sysmem allocator (used by prepare_stage2 for GMC substeps) --------- */
+void r3_stages_set_sysmem_allocator(const amdgpu::GmcSysmemAlloc *alloc)
+{
+    g_sysmem_alloc = alloc;
 }

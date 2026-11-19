@@ -314,7 +314,8 @@ R3SubstepResult gfx_v11_0_substep(const R3Io *io, const R3SubstepEnv *env)
     // (the deny count must stay 0; the test asserts it).
     r3_wg_arm_substep(WSubstep::Gfx);
     r3_wg_expect_writes(nullptr, 0, nullptr, 0, WSubstep::Gfx);
-    r3_wg_expect_declared_addrs(nullptr, 0);   /* GFX declares zero register rows */
+    if (r3_wg_expect_declared_addrs(nullptr, 0) != 0)   /* GFX declares zero register rows */
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     R3SubstepResult r = pre(g);
     if (r.status == kR3SsecOk)
         r = seq(g);

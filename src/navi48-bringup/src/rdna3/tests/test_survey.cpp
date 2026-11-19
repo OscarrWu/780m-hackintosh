@@ -514,10 +514,10 @@ static void test_tmr_addr(void) {
 }
 
 struct TierCtx {
-    uint32_t ran[8];
+    uint32_t ran[16];
     uint32_t n;
-    uint32_t done[8];
-    bool     done_ok[8];
+    uint32_t done[16];
+    bool     done_ok[16];
     uint32_t nd;
     uint32_t fail_tier;
 };
@@ -529,6 +529,8 @@ struct TierCtx {
         return c->fail_tier != (N);                                             \
     }
 TIER_FN(1) TIER_FN(2) TIER_FN(3) TIER_FN(4) TIER_FN(5) TIER_FN(6)
+TIER_FN(7) TIER_FN(8) TIER_FN(9) TIER_FN(10) TIER_FN(11) TIER_FN(12)
+TIER_FN(13) TIER_FN(14) TIER_FN(15)
 #undef TIER_FN
 
 static void tier_cb(void *u, uint32_t tier, bool ok) {
@@ -542,6 +544,9 @@ static void test_depth_gate_matrix(void) {
     const R3SurveyItem items[] = {
         {"t1", tier_fn1, 1}, {"t2", tier_fn2, 2}, {"t3", tier_fn3, 3},
         {"t4", tier_fn4, 4}, {"t5", tier_fn5, 5}, {"t6", tier_fn6, 6},
+        {"t7", tier_fn7, 7}, {"t8", tier_fn8, 8}, {"t9", tier_fn9, 9},
+        {"t10", tier_fn10, 10}, {"t11", tier_fn11, 11}, {"t12", tier_fn12, 12},
+        {"t13", tier_fn13, 13}, {"t14", tier_fn14, 14}, {"t15", tier_fn15, 15},
     };
     // depth N runs T1..T(N+1); out-of-range depth falls back to T1.
     for (uint32_t depth = 0; depth <= R3_STAGE0_MAX_DEPTH; depth++) {
@@ -549,7 +554,7 @@ static void test_depth_gate_matrix(void) {
         R3SurveyLines lines {};
         r3_lines_init(&lines);
         R3SurveySummary s {};
-        r3_survey_run_tiered(items, 6, depth, &c, &lines, nullptr, tier_cb, &s);
+        r3_survey_run_tiered(items, 15, depth, &c, &lines, nullptr, tier_cb, &s);
         CHECK(c.n == depth + 1);
         for (uint32_t i = 0; i < c.n; i++) CHECK(c.ran[i] == i + 1);
         CHECK(c.nd == depth + 1);
@@ -558,15 +563,15 @@ static void test_depth_gate_matrix(void) {
             CHECK(c.done_ok[i]);
         }
         CHECK(s.ok == depth + 1 && s.failed == 0);
-        CHECK(s.total == 6);
+        CHECK(s.total == 15);
     }
-    const uint32_t bad[] = {6u, 7u, 42u, 0xFFFFFFFFu};
+    const uint32_t bad[] = {15u, 42u, 0xFFFFFFFFu};
     for (uint32_t depth : bad) {
         TierCtx c {};
         R3SurveyLines lines {};
         r3_lines_init(&lines);
         R3SurveySummary s {};
-        r3_survey_run_tiered(items, 6, depth, &c, &lines, nullptr, tier_cb, &s);
+        r3_survey_run_tiered(items, 15, depth, &c, &lines, nullptr, tier_cb, &s);
         CHECK(c.n == 1 && c.ran[0] == 1);
     }
 }

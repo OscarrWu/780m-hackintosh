@@ -32,6 +32,7 @@
 
 #include "amdgpu_ip.h"
 #include "rdna3_ip_entries.h"
+#include "rdna3_layout.h"
 #include "rdna3_writeguard.h"
 
 namespace {
@@ -39,7 +40,15 @@ namespace {
 using amdgpu::IPBaseTable;
 using amdgpu::IPBlock;
 
-/* The reverse power-up order (§9: mes -> sdma -> gfx -> smu). */
+/* The reverse power-up order (existing IPs only; full spec order compute/abi->queue->
+ * doorbell/IH->vmid8->gpuvm0->gart->mes->sdma->gfx->smu->psp is the T-E target when all
+ * S6-S13 stages are wired). T-D adds IH disable (td_ih) as a separate OSSSYS call before
+ * the IP loop since IH does not map to a power-up R3Ip.
+ * REMOVE_QUEUE via MES API is not performed here: the teardown is register-only (GRBM/GPUIO
+ * via R3Io). The S11 ADD_QUEUE queues are HW-deactivated via CP_HQD_ACTIVE=0 in td_mes
+ * (register-level reverse of program_hqd). A MES API REMOVE_QUEUE would need SCH-ring/
+ * doorbell infrastructure (mes_v11_0.cpp) and is deferred to when the teardown gains a
+ * bus-level submission path. */
 constexpr R3Ip kOrder[4] = {R3Ip::Mes, R3Ip::Sdma, R3Ip::Gfx, R3Ip::Smu};
 
 /* Bounded deactivate wait: Linux mes_v11_0_destroy_queue polls usec_timeout x 1 us; a
@@ -150,6 +159,56 @@ uint32_t grbm_select(uint32_t me, uint32_t pipe)
     return (pipe << amdgpu::kGrbmPipeIdShift) | (me << amdgpu::kGrbmMeIdShift);
 }
 
+/* --- IH -------------------------------------------------------------------------------- */
+/* Reverse of the IH enable in S10 (ih_v6_0.cpp): IH_RB_CNTL=0 (RB_ENABLE=0),
+ * IH_RB_RPTR=0, IH_RB_WPTR=0. Uses the same writeguard rows (WSubstep::Ih) that
+ * power-up registered. D-09: only reuses rows the power-up substep already registered. */
+bool td_ih(TdLog &l)
+{
+    const IPBaseTable *ip = td_ip(l.env);
+    if (!ip || !ip->isResolved(IPBlock::OSSSYS, 0)) {
+        td_line(l, "teardown: ih fail (OSSSYS base unresolved)");
+        return false;
+    }
+    const uint32_t osssys0 = ip->getBase(IPBlock::OSSSYS, 0);
+    /* Offsets from osssys_6_0_0_offset.h (IH v6, not v7). IH_RB_CNTL=0x0080 (same
+     * in both); IH_RB_RPTR=0x0083, IH_RB_WPTR=0x0084 (v6-specific, differ from v7). */
+    const uint32_t rb_cntl = osssys0 + 0x0080u;
+    const uint32_t rb_rptr = osssys0 + 0x0083u;
+    const uint32_t rb_wptr = osssys0 + 0x0084u;
+
+    if (!td_ensure_reg(rb_cntl, WClass::State, WSubstep::Ih, "reg:teardown-ih")) {
+        td_line(l, "teardown: ih skip (no reversible object; power-up IH rows absent)");
+        return true;
+    }
+
+    r3_wg_arm_substep(WSubstep::Ih);
+    bool ok = true;
+    const char *ctx = "teardown:ih";
+
+    /* IH_RB_CNTL = 0: RB_ENABLE=0, all other fields zero. */
+    uint32_t before = 0, after = 0;
+    if (!td_read(l.env, rb_cntl, &before)) {
+        td_line(l, "teardown: ih RB_CNTL unreadable");
+        ok = false;
+    } else if (!td_write(l, rb_cntl, 0u, ctx, "ih-rb-cntl", &after)) {
+        ok = false;
+    } else {
+        td_line(l, "teardown: ih RB_CNTL 0x%08x -> 0x%08x (disabled)", before, after);
+    }
+
+    /* IH_RB_RPTR = 0. */
+    if (!td_write(l, rb_rptr, 0u, ctx, "ih-rb-rptr", nullptr))
+        ok = false;
+
+    /* IH_RB_WPTR = 0. */
+    if (!td_write(l, rb_wptr, 0u, ctx, "ih-rb-wptr", nullptr))
+        ok = false;
+
+    r3_wg_disarm_substep();
+    return ok;
+}
+
 /* --- MES ------------------------------------------------------------------------------ */
 bool td_mes_queue(TdLog &l, uint32_t grbm, uint32_t active, uint32_t pipe, const char *name)
 {
@@ -192,6 +251,12 @@ bool td_mes(TdLog &l)
     const uint32_t grbm = gc1 + amdgpu::kRegGrbmGfxCntl;
     const uint32_t active = gc0 + amdgpu::kRegCpHqdActive;
     const uint32_t cntl = gc1 + amdgpu::kRegMesCntl;
+    /* Local copies of doorbell range offsets (mes_v11_0.h has them under amdgpu but
+     * we avoid cross-layer include; the values must match mes_v11_0.h). */
+    constexpr uint32_t kDbRangeLo = 0x1dfa;
+    constexpr uint32_t kDbRangeHi = 0x1dfb;
+    const uint32_t dbr_lo = gc0 + kDbRangeLo;
+    const uint32_t dbr_hi = gc0 + kDbRangeHi;
 
     if (!td_ensure_reg(grbm, WClass::State, WSubstep::Mes, "reg:teardown-mes") ||
         !td_ensure_reg(active, WClass::State, WSubstep::Mes, "reg:teardown-mes") ||
@@ -206,6 +271,17 @@ bool td_mes(TdLog &l)
     /* Reverse of seq_sch then seq_kiq (SCH = pipe0, KIQ = pipe1). */
     ok &= td_mes_queue(l, grbm, active, 0u, "sch");
     ok &= td_mes_queue(l, grbm, active, 1u, "kiq");
+
+    /* Doorbell range disable: CP_RB_DOORBELL_RANGE_LOWER/UPPER = 0 stops new doorbell
+     * ring events before MES firmware reset. These are OnSuccessPath rows registered
+     * by S11; td_ensure_reg checks presence first (OK if S11 was skipped). */
+    if (td_ensure_reg(dbr_lo, WClass::State, WSubstep::Mes, "reg:teardown-dbr-lo")) {
+        ok &= td_write(l, dbr_lo, 0u, "teardown:mes", "mes-dbr-lo", nullptr);
+    }
+    if (td_ensure_reg(dbr_hi, WClass::State, WSubstep::Mes, "reg:teardown-dbr-hi")) {
+        ok &= td_write(l, dbr_hi, 0u, "teardown:mes", "mes-dbr-hi", nullptr);
+    }
+
     ok &= td_write(l, grbm, grbm_select(0u, 0u), "teardown:mes", "mes-grbm-deselect",
                    nullptr);
 
@@ -374,6 +450,8 @@ R3TeardownReport r3_teardown_run(const R3TeardownEnv *env)
                 rep.none |= bit;
             if (!ok)
                 rep.write_fail |= bit;
+            /* Reverse-order IH teardown after MES (S10 IH before S11 MES in power-up). */
+            td_ih(l);
             break;
         }
         case R3Ip::Sdma: {

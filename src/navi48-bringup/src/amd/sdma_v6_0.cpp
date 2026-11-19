@@ -783,11 +783,13 @@ R3SubstepResult sdma_v6_0_substep(const R3Io *io, const R3SubstepEnv *env)
     s.env = env;
 
     r3_wg_arm_substep(WSubstep::Sdma);
-    r3_wg_expect_writes(getSdmaRows(), getSdmaRowCount(), nullptr, 0, WSubstep::Sdma);
+    if (r3_wg_expect_writes(getSdmaRows(), getSdmaRowCount(), nullptr, 0, WSubstep::Sdma) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     uint32_t declared[R3_WG_EXPECT_MAX];
     r3_wg_resolve_row_addrs(env ? env->ip : nullptr, getSdmaRows(), getSdmaRowCount(),
                             declared);
-    r3_wg_expect_declared_addrs(declared, getSdmaRowCount());
+    if (r3_wg_expect_declared_addrs(declared, getSdmaRowCount()) != 0)
+        return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
 
     R3SubstepResult r = pre(s);
     if (r.status == kR3SsecOk)
@@ -868,8 +870,8 @@ constexpr R3WriteRowReg kSdmaRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0Doorbell, 1, WClass::State,         WNeed::OnSuccessPath, "s5-doorbell"},
     {&r3gold::kSdma0F32Cntl,            static_cast<uint8_t>(IPBlock::SDMA0), 1, 0, 1, WClass::State,    WNeed::Required,      "s5-f32-unhalt"},
 };
-constexpr uint32_t kSdmaRowCount = sizeof(kSdmaRows) / sizeof(kSdmaRows[0]);
-static_assert(kSdmaRowCount == 17, "sdma declaration table must have 17 rows");
+static_assert(sizeof(kSdmaRows) / sizeof(kSdmaRows[0]) == kSdmaRowCount,
+              "sdma declaration table must have 17 rows");
 constexpr const char *kSdmaLayoutTag = "sdma";
 } // anonymous namespace
 

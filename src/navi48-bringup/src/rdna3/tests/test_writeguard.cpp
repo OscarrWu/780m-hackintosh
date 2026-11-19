@@ -423,6 +423,35 @@ static void test_stage2_disarm(void)
     CHECK(r3_writeguard_txn_count() == 1, "txn count kept across disarm");
 }
 
+/* ReadOnly layout grant: every write inside it is denied regardless of class;
+ * reads do not pass through the writeguard at all. */
+static void test_stage2_readonly(void)
+{
+    CHECK(strcmp(r3_wg_substep_name(WSubstep::Gmc), "gmc") == 0, "substep name gmc");
+    CHECK(strcmp(r3_wg_substep_name(WSubstep::Ih), "ih") == 0, "substep name ih");
+    CHECK(strcmp(r3_wg_substep_name(WSubstep::Abi), "abi") == 0, "substep name abi");
+
+    r3_writeguard_install(SEG);
+    CHECK(r3_wg_register_layout_readonly(FW_START, FW_LEN, WSubstep::Abi,
+                                         "layout:fence-ro") == 0,
+          "readonly layout registered");
+    r3_wg_arm_substep(WSubstep::Abi);
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::Data, "x") == WVerdict::Deny,
+          "readonly data write denied");
+    CHECK(r3_wg_classify(FW_START + 4u, 2u, WClass::Protocol, "x") == WVerdict::Deny,
+          "readonly protocol write denied");
+    CHECK(r3_wg_classify(FW_START + FW_LEN - 1u, 1u, WClass::State, "x") == WVerdict::Deny,
+          "readonly state write denied");
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::Access, "x") == WVerdict::Deny,
+          "readonly access write denied");
+    /* Outside the grant the normal owner rules apply (Abi owns nothing else). */
+    CHECK(r3_wg_classify(FW_START + FW_LEN, 1u, WClass::Data, "x") == WVerdict::Deny,
+          "outside readonly grant denied");
+    CHECK(r3_writeguard_deny_count() == 5, "five readonly denies");
+    CHECK(r3_writeguard_txn_count() == 0, "no readonly write allowed");
+    r3_wg_disarm_substep();
+}
+
 /* ------------------------------------------------------------------------- manifest (T10) */
 
 static const R3WMEntry *find_entry(const R3WManifest *m, WSubstep owner, WClass cls,
@@ -630,9 +659,10 @@ static void test_manifest_truncated(void)
 }
 
 /* Capacity: the worst-case full-chain success path must fit without truncation.
- * Estimate (tmp/programmer/S2-EVID/容量核算.md): PSP 49 + SMU 18 + SDMA 21 + MES 41 = 129
- * entries plus a DENY/boundary margin. The table must hold at least 160 and the text buffer
- * must hold 160 lines of the longest realistic line (~124 bytes). */
+ * The old 129/160 estimate was superseded by the boot5 206-entry measurement
+ * (tmp/general/boot5-s3r1/, writeguard grant/expect chain); this assertion only
+ * verifies the manifest's facade capacity, not the whole-chain total (which the
+ * compile-time budget contract in rdna3_ip_entries.h owns). */
 static void test_manifest_capacity(void)
 {
     char text[R3_WM_TEXT_BYTES];
@@ -1078,6 +1108,7 @@ int main(void)
     test_stage2_layout_edge();
     test_stage2_owner();
     test_stage2_disarm();
+    test_stage2_readonly();
     test_manifest_merge();
     test_manifest_deny_each();
     test_manifest_truncated();

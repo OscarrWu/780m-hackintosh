@@ -163,9 +163,25 @@ uint32_t register_mes(const R3LayoutPlan *plan, const IPBaseTable *ip)
     return n;
 }
 
-/* Step2: kExpectedRows=87 (MES 53 regs + 2 doorbells = 55; GFX=0).
- * PSP(5+5) + SMU(3) + SDMA(1+17) + MES(1+55) = 10+3+18+56 = 87 */
-constexpr uint32_t kExpectedRows = 5u + 5u + 3u + 1u + 17u + 1u + 55u;
+/* Queue substep rows (S7..S11, mes_queue_v11_0_substep). T-E split: these rows were
+ * previously part of the MES set and are now registered by a separate entry. Doorbells
+ * stay under register_mes (single registration in the production table). */
+uint32_t register_queue(const R3LayoutPlan *plan, const IPBaseTable *ip)
+{
+    (void)plan;
+    uint32_t n = 0;
+    const uint32_t rc = amdgpu::getMesQueueRowCount();
+    const R3WriteRowReg *rows = amdgpu::getMesQueueRows();
+    for (uint32_t i = 0; i < rc; i++) {
+        uint32_t addr = 0;
+        if (row_addr(ip, rows[i], &addr) &&
+            r3_wg_register_reg(addr, rows[i].dwords, rows[i].cls,
+                               WSubstep::Mes, "reg:mes-queue") == 0)
+            n++;
+    }
+    return n;
+}
+
 } /* namespace */
 
 
@@ -250,10 +266,7 @@ R3TriggerDecision r3_trigger_admission(bool provisioned, bool gate_ok, bool prep
     return d;
 }
 
-uint32_t r3_integration_register_row_count(void)
-{
-    return kExpectedRows;
-}
+
 
 int r3_integration_register_production(const R3LayoutPlan *plan,
                                        const void *ip_base_table)
@@ -270,7 +283,9 @@ int r3_integration_register_production(const R3LayoutPlan *plan,
         return -1;
     if (register_sdma(plan, ip) != 1u + 17u)
         return -1;
-    if (register_mes(plan, ip) != 1u + 55u)
+    if (register_mes(plan, ip) != 1u + amdgpu::getMesRowCount() + amdgpu::getMesDoorbellCount())
+        return -1;
+    if (register_queue(plan, ip) != amdgpu::getMesQueueRowCount())
         return -1;
     return 0;
 }

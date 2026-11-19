@@ -166,7 +166,7 @@ int main() {
     }
 
     // 2. Every in-range value passes through unchanged, and present is reported.
-    for (uint32_t v = 0; v <= 5; v++) {
+    for (uint32_t v = 0; v <= 14; v++) {
         set_parse(true, v);
         const R3DepthSel sel = r3_depth_select();
         CHECK(sel.present);
@@ -175,7 +175,7 @@ int main() {
     }
 
     // 3. Out-of-range values clamp to 0 (T1), including the 32-bit extremes.
-    const uint32_t bad[] = { 6u, 7u, 42u, 0xffffffffu };
+    const uint32_t bad[] = { 15u, 42u, 0xffffffffu };
     for (uint32_t v : bad) {
         set_parse(true, v);
         check_u("out-of-range depth clamps to 0", parse_depth(), 0);
@@ -183,8 +183,8 @@ int main() {
 
     // 4. The clamp itself (independent of the parser).
     check_u("clamp 0", r3_depth_clamp(0), 0);
-    check_u("clamp 5", r3_depth_clamp(5), 5);
-    check_u("clamp 6", r3_depth_clamp(6), 0);
+    check_u("clamp 14", r3_depth_clamp(14), 14);
+    check_u("clamp 15", r3_depth_clamp(15), 0);
 
     // ---- D-01: trigger two-form and D-04 marker logic -------------------------------
 
@@ -222,11 +222,12 @@ int main() {
         const std::vector<std::string> stages =
             parse_kstages(read_text(dir + "/../rdna3_stages.cpp"));
         const std::vector<std::string> want = {
-            "survey", "preflight", "psp", "smu", "gfx", "sdma", "mes"
+            "survey", "preflight", "psp", "smu", "gfx", "sdma", "mes",
+            "uma", "gart", "gpuvm0", "vmid8", "doorbell", "queue", "abi", "compute"
         };
         CHECK(stages == want);
 
-        // stage=1 -> target = min(1+1, 6) = 2. bringup_r3_from(2, 2) runs psp only.
+        // stage=1 -> target = min(1+1, 14) = 2. bringup_r3_from(2, 2) runs psp only.
         // survey+preflight already ran in start() and are NOT re-fired by the trigger.
         {
             const std::string t2 = run_ladder_from(stages, kFirstSubstep, 2u);
@@ -237,9 +238,17 @@ int main() {
             CHECK(!ladder_ran(t2, "gfx"));
             CHECK(!ladder_ran(t2, "sdma"));
             CHECK(!ladder_ran(t2, "mes"));
+            CHECK(!ladder_ran(t2, "uma"));
+            CHECK(!ladder_ran(t2, "gart"));
+            CHECK(!ladder_ran(t2, "gpuvm0"));
+            CHECK(!ladder_ran(t2, "vmid8"));
+            CHECK(!ladder_ran(t2, "doorbell"));
+            CHECK(!ladder_ran(t2, "queue"));
+            CHECK(!ladder_ran(t2, "abi"));
+            CHECK(!ladder_ran(t2, "compute"));
         }
 
-        // stage=5 -> target = min(5+1, 6) = 6. bringup_r3_from(2, 6) runs all 5 substeps.
+        // stage=5 -> target = min(5+1, 14) = 6. bringup_r3_from(2, 6) runs psp..mes.
         {
             const std::string t6 = run_ladder_from(stages, kFirstSubstep, 6u);
             CHECK(!ladder_ran(t6, "survey"));     // start() already ran these
@@ -249,15 +258,31 @@ int main() {
             CHECK(ladder_ran(t6, "gfx"));
             CHECK(ladder_ran(t6, "sdma"));
             CHECK(ladder_ran(t6, "mes"));
+            CHECK(!ladder_ran(t6, "uma"));
+            CHECK(!ladder_ran(t6, "gart"));
+            CHECK(!ladder_ran(t6, "gpuvm0"));
+            CHECK(!ladder_ran(t6, "vmid8"));
+            CHECK(!ladder_ran(t6, "doorbell"));
+            CHECK(!ladder_ran(t6, "queue"));
+            CHECK(!ladder_ran(t6, "abi"));
+            CHECK(!ladder_ran(t6, "compute"));
         }
 
-        // stage=0 -> target = min(0+1, 6) = 1 < kFirstSubstep → trigger fires no substeps.
+        // stage=0 -> target = min(0+1, 14) = 1 < kFirstSubstep → trigger fires no substeps.
         // (r3_trigger_admission returns NoSubsteps; this test verifies the ladder is no-op.)
         {
             const std::string t0 = run_ladder_from(stages, kFirstSubstep, 1u);
             CHECK(!ladder_ran(t0, "psp"));        // first substep never reached
             CHECK(!ladder_ran(t0, "smu"));
             CHECK(!ladder_ran(t0, "mes"));
+            CHECK(!ladder_ran(t0, "uma"));
+            CHECK(!ladder_ran(t0, "gart"));
+            CHECK(!ladder_ran(t0, "gpuvm0"));
+            CHECK(!ladder_ran(t0, "vmid8"));
+            CHECK(!ladder_ran(t0, "doorbell"));
+            CHECK(!ladder_ran(t0, "queue"));
+            CHECK(!ladder_ran(t0, "abi"));
+            CHECK(!ladder_ran(t0, "compute"));
         }
     }
 
