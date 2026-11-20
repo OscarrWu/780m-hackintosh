@@ -371,7 +371,7 @@ struct FakeFb {
 static uint32_t fake_fb_read(void *user, R3FbCopy copy, uint32_t reg) {
     FakeFb *f = static_cast<FakeFb *>(user);
     static const uint32_t gc_off[5] = {0x1678u, 0x1679u, 0x15a7u, 0x167du, 0x167eu};
-    static const uint32_t mm_off[5] = {0x08ecu, 0x08edu, 0x08d7u, 0u, 0u};
+    static const uint32_t mm_off[5] = {0x08ecu, 0x08edu, 0x08d7u, 0x08f1u, 0x08f2u};
     const bool mm = copy == R3_FB_COPY_MMHUB;
     const uint32_t *off = mm ? mm_off : gc_off;
     const uint32_t *val = mm ? f->mm : f->gc;
@@ -389,8 +389,9 @@ static uint32_t fake_fb_read(void *user, R3FbCopy copy, uint32_t reg) {
 
 static void test_fb_dual_copy() {
     // Fake discovery: both copies resolved with distinct words. The survey must read the GC
-    // copy at its five offsets and the MMHUB copy at 0x8ec/0x8ed/0x8d7, then emit one line
-    // per copy (D-01). MMHUB is the selected copy (Linux gmc_v11_0.c:661); GC is fallback.
+    // copy at its five offsets and the MMHUB copy at 0x8ec/0x8ed/0x8d7 plus its own aperture
+    // pair 0x8f1/0x8f2, then emit one line per copy (D-01). MMHUB is the selected copy
+    // (Linux gmc_v11_0.c:661); GC is fallback.
     FakeFb f {};
     f.gc[0] = 0x00123456u;
     f.gc[1] = 0x00123457u;
@@ -400,16 +401,19 @@ static void test_fb_dual_copy() {
     f.mm[0] = 0x00120000u;
     f.mm[1] = 0x00120001u;
     f.mm[2] = 0x00000020u;
+    f.mm[3] = 0x00100000u;
+    f.mm[4] = 0x00105fffu;
 
     R3SurveyLines lines {};
     r3_lines_init(&lines);
     uint64_t mc_base = 0;
     CHECK(r3_fb_item(&lines, fake_fb_read, &f, true, true, &mc_base));
     CHECK(f.n_gc == 5);
-    CHECK(f.n_mm == 3);
+    CHECK(f.n_mm == 5);
     CHECK(f.seen_gc[0] == 0x1678u && f.seen_gc[1] == 0x1679u && f.seen_gc[2] == 0x15a7u &&
           f.seen_gc[3] == 0x167du && f.seen_gc[4] == 0x167eu);
-    CHECK(f.seen_mm[0] == 0x08ecu && f.seen_mm[1] == 0x08edu && f.seen_mm[2] == 0x08d7u);
+    CHECK(f.seen_mm[0] == 0x08ecu && f.seen_mm[1] == 0x08edu && f.seen_mm[2] == 0x08d7u &&
+          f.seen_mm[3] == 0x08f1u && f.seen_mm[4] == 0x08f2u);
     CHECK(lines.count == 2);
     CHECK(count_lines_containing(&lines, "copy=GC(gfxhub)") == 1);
     CHECK(count_lines_containing(&lines, "copy=MMHUB") == 1);
@@ -417,7 +421,8 @@ static void test_fb_dual_copy() {
                                  "authoritative copy: MMHUB per gmc_v11_0.c:661, GC fallback") == 2);
     CHECK(mc_base == ((uint64_t)0x00120000u << 24));   // selected copy (MMHUB) wins
     CHECK(count_lines_containing(&lines, "fb_mc_base=0x120000000000") == 1);
-    CHECK(count_lines_containing(&lines, "system_aperture=not-read") == 1);
+    CHECK(count_lines_containing(&lines, "raw_ap=0x00200000/0x00205fff") == 1);
+    CHECK(count_lines_containing(&lines, "raw_ap=0x00100000/0x00105fff") == 1);
 
     // An unresolved copy is reported, not silently dropped, and is never read.
     f.n_gc = f.n_mm = 0;
@@ -470,7 +475,6 @@ static void test_fb_mc_zero_rejected() {
 static void test_fb_aperture_conversion() {
     R3FbCopyWords w {};
     w.resolved = true;
-    w.has_aperture = true;
     w.fb_base = 0x00123456u;
     w.fb_top  = 0x00123457u;
     w.fb_off  = 0x00000010u;
@@ -488,7 +492,7 @@ static void test_fb_aperture_conversion() {
     CHECK(std::strstr(out, "gtt_size=0x17ffc0000") != nullptr);
     CHECK(std::strstr(out, "raw_ap=0x00200000/0x00205fff") != nullptr);
     CHECK(std::strstr(out, "aperture >>18 per gfxhub_v3_0.c:161-164/"
-                           "mmhub_v3_0.c:178-181 (archived)") != nullptr);
+                           "mmhub_v3_0_1.c:183-185") != nullptr);
 
     // LOGICAL_ADDR_MASK is 0x3FFFFFFF (gc_11_0_0_sh_mask.h:11351-11355): the upper two bits
     // are not part of the page number, and the conversion shifts left by 18.
@@ -498,6 +502,42 @@ static void test_fb_aperture_conversion() {
     CHECK(std::strstr(out, "gtt_lo=0xfffffffc0000") != nullptr);
     CHECK(std::strstr(out, "gtt_hi=0x0") != nullptr);
     CHECK(std::strstr(out, "gtt_size=0x0") != nullptr);
+}
+
+static void test_fb_bad_aperture_rejected() {
+    // #9: both copies carry an aperture pair. An all-ones aperture word means the
+    // register block is untrustworthy, so that copy fails the gate and the other
+    // copy is selected; aperture values never choose a copy by themselves.
+    FakeFb f {};
+    f.gc[0] = 0x00123456u;
+    f.gc[1] = 0x00123457u;
+    f.gc[2] = 0x00000010u;
+    f.gc[3] = 0x00200000u;
+    f.gc[4] = 0x00205fffu;
+    f.mm[0] = 0x00120000u;
+    f.mm[1] = 0x00120001u;
+    f.mm[2] = 0x00000020u;
+    f.mm[3] = 0x00100000u;
+    f.mm[4] = 0xFFFFFFFFu;   // MMHUB SYSTEM_APERTURE_HIGH_ADDR read failed
+
+    R3SurveyLines lines {};
+    r3_lines_init(&lines);
+    uint64_t mc_base = 0;
+    CHECK(r3_fb_item(&lines, fake_fb_read, &f, true, true, &mc_base));
+    CHECK(f.n_mm == 5);
+    CHECK(count_lines_containing(
+              &lines, "FAIL copy=MMHUB register read returned 0xffffffff") == 1);
+    CHECK(count_lines_containing(&lines, "ap=0x00100000/0xffffffff") == 1);
+    CHECK(count_lines_containing(&lines, "copy=GC(gfxhub)") == 1);
+    CHECK(mc_base == ((uint64_t)0x00123456u << 24));   // GC fallback
+
+    // MMHUB-only with a bad aperture leaves no valid copy.
+    r3_lines_init(&lines);
+    mc_base = 0xdeadbeefu;
+    CHECK(!r3_fb_item(&lines, fake_fb_read, &f, false, true, &mc_base));
+    CHECK(mc_base == 0);
+    CHECK(count_lines_containing(
+              &lines, "FAIL copy=MMHUB register read returned 0xffffffff") == 1);
 }
 
 static void test_frame_delta_wrap() {
@@ -685,6 +725,7 @@ int main() {
     test_fb_dual_copy();
     test_fb_mc_zero_rejected();
     test_fb_aperture_conversion();
+    test_fb_bad_aperture_rejected();
     test_frame_delta_wrap();
     test_uma_d0_source();
     test_baseline();

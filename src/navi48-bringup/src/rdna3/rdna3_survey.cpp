@@ -182,8 +182,9 @@ static bool r3_aux_export(const TgtLogSink *sink, const R3AuxEvidence *ev) {
 // nullarc follows the same order, so MMHUB is primary and GC the fallback; both
 // are still read and labelled. A selected copy whose MC base is zero is not a
 // valid FB location and fails the gate. The system aperture is a logical page
-// number ( >>18 per gfxhub_v3_0.c:161-164 / mmhub_v3_0.c:178-181 ); the MMHUB
-// aperture offset is not archived, so only the GC copy carries the gtt conversion.
+// number ( >>18 per gfxhub_v3_0.c:161-164 / mmhub_v3_0_1.c:183-185 ); both
+// copies carry their own aperture pair (GC 0x167d/0x167e, MMHUB 0x08f1/0x08f2,
+// mmhub_3_0_1_offset.h:1678-1681).
 // ---------------------------------------------------------------------------
 
 static bool bad_word(uint32_t v) { return v == 0xFFFFFFFFu; }
@@ -199,7 +200,7 @@ struct R3FbCopyWords {
     uint32_t fb_base;
     uint32_t fb_top;
     uint32_t fb_off;
-    bool     has_aperture;  // false when the aperture offset is not archived
+    bool     has_aperture;  // this copy carries a system aperture pair
     uint32_t ap_lo;
     uint32_t ap_hi;
 };
@@ -214,32 +215,23 @@ static void r3_fb_line(char *out, size_t cap, R3FbCopy copy, const R3FbCopyWords
     const uint64_t mc_top  = ((uint64_t)(w.fb_top & 0x00ffffffu) << 24) | 0xffffffu;
     const uint64_t fb_size = (mc_top >= mc_base) ? (mc_top - mc_base + 1) : 0;
     if (mc_base_out) *mc_base_out = mc_base;
-    if (w.has_aperture) {
-        // LOGICAL_ADDR_MASK=0x3FFFFFFF, SHIFT=0 (gc_11_0_0_sh_mask.h:11351-11355);
-        // the hardware stores the MC address right-shifted by 18.
-        const uint64_t gtt_lo = (uint64_t)(w.ap_lo & 0x3fffffffu) << 18;
-        const uint64_t gtt_hi = (uint64_t)(w.ap_hi & 0x3fffffffu) << 18;
-        const uint64_t gtt_size = (gtt_hi >= gtt_lo) ? (gtt_hi - gtt_lo) : 0;
-        snprintf(out, cap,
-                 "PASS copy=%s fb_mc_base=0x%llx fb_mc_top=0x%llx fb_size=0x%llx "
-                 "fb_offset=0x%llx gtt_lo=0x%llx gtt_hi=0x%llx gtt_size=0x%llx "
-                 "raw_ap=0x%08x/0x%08x (aperture >>18 per gfxhub_v3_0.c:161-164/"
-                 "mmhub_v3_0.c:178-181 (archived); authoritative copy: MMHUB per "
-                 "gmc_v11_0.c:661, GC fallback)",
-                 r3_fb_copy_label(copy), (unsigned long long)mc_base,
-                 (unsigned long long)mc_top, (unsigned long long)fb_size,
-                 (unsigned long long)((uint64_t)(w.fb_off & 0x00ffffffu) << 24),
-                 (unsigned long long)gtt_lo, (unsigned long long)gtt_hi,
-                 (unsigned long long)gtt_size, w.ap_lo, w.ap_hi);
-    } else {
-        snprintf(out, cap,
-                 "PASS copy=%s fb_mc_base=0x%llx fb_mc_top=0x%llx fb_size=0x%llx "
-                 "fb_offset=0x%llx system_aperture=not-read (MMHUB aperture offset not "
-                 "archived); authoritative copy: MMHUB per gmc_v11_0.c:661, GC fallback",
-                 r3_fb_copy_label(copy), (unsigned long long)mc_base,
-                 (unsigned long long)mc_top, (unsigned long long)fb_size,
-                 (unsigned long long)((uint64_t)(w.fb_off & 0x00ffffffu) << 24));
-    }
+    // LOGICAL_ADDR_MASK=0x3FFFFFFF, SHIFT=0 (gc_11_0_0_sh_mask.h:11351-11355;
+    // mmhub_3_0_1_sh_mask.h:7233-7238); the hardware stores the MC address
+    // right-shifted by 18.
+    const uint64_t gtt_lo = (uint64_t)(w.ap_lo & 0x3fffffffu) << 18;
+    const uint64_t gtt_hi = (uint64_t)(w.ap_hi & 0x3fffffffu) << 18;
+    const uint64_t gtt_size = (gtt_hi >= gtt_lo) ? (gtt_hi - gtt_lo) : 0;
+    snprintf(out, cap,
+             "PASS copy=%s fb_mc_base=0x%llx fb_mc_top=0x%llx fb_size=0x%llx "
+             "fb_offset=0x%llx gtt_lo=0x%llx gtt_hi=0x%llx gtt_size=0x%llx "
+             "raw_ap=0x%08x/0x%08x (aperture >>18 per gfxhub_v3_0.c:161-164/"
+             "mmhub_v3_0_1.c:183-185; authoritative copy: MMHUB per "
+             "gmc_v11_0.c:661, GC fallback)",
+             r3_fb_copy_label(copy), (unsigned long long)mc_base,
+             (unsigned long long)mc_top, (unsigned long long)fb_size,
+             (unsigned long long)((uint64_t)(w.fb_off & 0x00ffffffu) << 24),
+             (unsigned long long)gtt_lo, (unsigned long long)gtt_hi,
+             (unsigned long long)gtt_size, w.ap_lo, w.ap_hi);
 }
 
 // Emits one line per copy for evidence. Selection follows the Linux order:
@@ -266,8 +258,9 @@ static bool r3_fb_emit(R3SurveyLines *lines, const R3FbCopyWords *copies,
             (w.has_aperture && (bad_word(w.ap_lo) || bad_word(w.ap_hi)))) {
             addf(lines, "d3-fb",
                  "FAIL copy=%s register read returned 0xffffffff "
-                 "(base=0x%08x top=0x%08x off=0x%08x)",
-                 r3_fb_copy_label(copy), w.fb_base, w.fb_top, w.fb_off);
+                 "(base=0x%08x top=0x%08x off=0x%08x ap=0x%08x/0x%08x)",
+                 r3_fb_copy_label(copy), w.fb_base, w.fb_top, w.fb_off,
+                 w.ap_lo, w.ap_hi);
             continue;
         }
         char text[R3_SURVEY_LINE_CHARS];
@@ -296,7 +289,8 @@ typedef uint32_t (*R3FbReadWord)(void *user, R3FbCopy copy, uint32_t reg);
 // The per-copy register map lives here so the host test can drive the whole dual-read with
 // a fake discovery/reader and catch a regression back to a single copy or wrong offsets.
 // MMHUB uses MMMC_VM_* in segment 1 (0x1a000 + 0x8ec/0x8ed/0x8d7, PhxNativeABI.h:68-70);
-// its aperture offset is not archived, so it carries no gtt conversion.
+// its aperture pair is MMMC_VM_SYSTEM_APERTURE_LOW/HIGH_ADDR (0x08f1/0x08f2,
+// mmhub_3_0_1_offset.h:1678-1681).
 static bool r3_fb_item(R3SurveyLines *lines, R3FbReadWord read, void *user,
                        bool gc_available, bool mmhub_available, uint64_t *mc_base_out) {
     struct Plan {
@@ -307,7 +301,8 @@ static bool r3_fb_item(R3SurveyLines *lines, R3FbReadWord read, void *user,
         uint32_t ap_lo_reg, ap_hi_reg;
     };
     const Plan plans[R3_FB_COPY_COUNT] = {
-        {R3_FB_COPY_MMHUB, mmhub_available, 0x08ecu, 0x08edu, 0x08d7u, false, 0u, 0u},
+        {R3_FB_COPY_MMHUB, mmhub_available, 0x08ecu, 0x08edu, 0x08d7u, true,
+         0x08f1u, 0x08f2u},
         {R3_FB_COPY_GC,    gc_available,    0x1678u, 0x1679u, 0x15a7u, true,
          0x167du, 0x167eu},
     };
