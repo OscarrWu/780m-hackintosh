@@ -19,6 +19,11 @@ STUB="$here/n48log_stub.cpp"   # host stand-in for the n48log ring (see n48log_s
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 
+# The CSIB table is generated, not hand-maintained: fail if the committed
+# header has drifted from the Linux clearstate source (tools/gen_csb_gfx11.py).
+echo "== gen_csb_gfx11 --check (S11 CSIB freshness)"
+python3 "$root/tools/gen_csb_gfx11.py" --check
+
 echo "== test_ip_expect"
 $CXX $FLAGS -o "$out/test_ip_expect" "$here/test_ip_expect.cpp"
 "$out/test_ip_expect"
@@ -126,6 +131,10 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_pm4_v11" \
     "$here/test_pm4_v11.cpp" "$src/amd/pm4_v11.cpp" \
     "$src/rdna3/rdna3_substep.cpp" "$STUB"
 "$out/test_pm4_v11"
+
+echo "== test_csb_gfx11 (S11, RLC clear-state table)"
+$CXX $FLAGS -o "$out/test_csb_gfx11" "$here/test_csb_gfx11.cpp"
+"$out/test_csb_gfx11"
 
 echo "== test_teardown (K9, dump + reverse teardown)"
 $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_teardown" \
