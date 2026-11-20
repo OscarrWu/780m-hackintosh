@@ -401,6 +401,27 @@ R3SubstepResult pre(Ih &s)
             return r3_substep_fail(kR3SecPre, 8, "pre:ih-teardown-register");
         }
     }
+
+    /* Input grants (IH incremental #2): S10.1 writes IH_CHICKEN and S10.2 writes
+     * RB_BASE/RB_BASE_HI, RB_WPTR_ADDR_LO/HI and DOORBELL_RPTR; every reg_write
+     * is gated by r3_wg_classify (ih_v6_0.cpp:189), so without these grants
+     * the real-hardware run dies at S10.1/S10.2 with pre-classify DENY. Tags
+     * mirror the S10 write contexts; RB_CNTL/RPTR/WPTR are already covered by
+     * the teardown grants above (same addresses). */
+    struct { uint32_t addr; const char *tag; } ig[6] = {
+        {s.rb_base, "reg:ih-ring-base"},
+        {s.rb_base_hi, "reg:ih-ring-base"},
+        {s.wptr_addr_lo, "reg:ih-wptr-addr"},
+        {s.wptr_addr_hi, "reg:ih-wptr-addr"},
+        {s.doorbell_rptr, "reg:ih-doorbell-rptr"},
+        {s.chicken, "reg:ih-chicken"},
+    };
+    for (uint32_t i = 0; i < 6u; i++) {
+        if (r3_wg_register_reg(ig[i].addr, 1u, WClass::State, WSubstep::Ih, ig[i].tag) != 0) {
+            evf(s.env, "ih-pre", "P3 input grant %s rejected", ig[i].tag);
+            return r3_substep_fail(kR3SecPre, 9, "pre:ih-input-register");
+        }
+    }
     (void)r;
     return r;
 }

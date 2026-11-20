@@ -287,7 +287,14 @@ static bool build_fixture(Fixture &f, Dev &d, bool psp_ready)
 }
 
 /* Step2: register the write set from the declaration table. All IH rows are
- * OSSSYS base_idx 0 (golden) or the chicken fallback row. */
+ * OSSSYS base_idx 0 (golden) or the chicken fallback row.
+ *
+ * Two registration layers, on purpose: this fixture layer builds the S10 grant
+ * set from the declaration table without going through the production pre(),
+ * so the S10 write assertions do not depend on the code under test for
+ * classification. The production layer (pre()) registers the same nine
+ * addresses for real hardware; test_pre_registers_all_input_rows() below proves
+ * that layer is self-sufficient, so the two are not a tautology. */
 static void register_ih_rows(void)
 {
     const uint32_t rc = getIhRowCount();
@@ -560,6 +567,82 @@ static void test_grant_missing(void)
     CHECK(d.writes.empty(), "no writes on pre failure");
 }
 
+/* Production-only registration: deliberately no register_ih_rows() call. If
+ * pre() misses any S10 input row (CHICKEN, RB_BASE/HI, WPTR_ADDR_LO/HI,
+ * DOORBELL_RPTR, RB_CNTL/RPTR/WPTR), the writeguard denies that write and the
+ * substep fails with a named pre-classify error on real hardware. */
+static void test_pre_registers_all_input_rows(void)
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d, true), "fixture");
+
+    g_plan_layout = f.rt.layout;
+    r3_writeguard_install_mm();
+    const R3Grant *ring = r3_layout_grant(&g_plan_layout, "ih_ring");
+    const R3Grant *wb = r3_layout_grant(&g_plan_layout, "ih_rptr_wb");
+    if (ring) {
+        CHECK(r3_wg_register_layout(static_cast<uint32_t>(ring->start >> 2),
+                                    static_cast<uint32_t>(ring->size >> 2),
+                                    WSubstep::Ih, "layout:ih-ring") == 0,
+              "register ih_ring grant");
+    }
+    if (wb) {
+        CHECK(r3_wg_register_layout(static_cast<uint32_t>(wb->start >> 2),
+                                    static_cast<uint32_t>(wb->size >> 2),
+                                    WSubstep::Ih, "layout:ih-wb") == 0,
+              "register ih_rptr_wb grant");
+    }
+    g_rb_cntl = kOsssys0 + r3gold::kIhRbCntl.offset;
+    g_rb_wptr = kOsssys0 + r3gold::kIhRbWptr.offset;
+    g_ring_off = ring ? ring->start : 0ull;
+    g_wb_off = wb ? wb->start : 0ull;
+
+    const uint64_t deny_before = r3_writeguard_deny_count();
+    const R3SubstepResult r = ih_v6_0_substep(&f.io, &f.env);
+    const uint64_t deny_after = r3_writeguard_deny_count();
+    CHECK(r3_substep_ok(&r), "S10 with only production grants: %s", r.name);
+    CHECK(deny_before == deny_after, "deny count changed");
+}
+
+/* Named failure when the input-grant registration cannot fit: leave exactly
+ * four free slots, then pre() cannot register all six input rows. Whatever the
+ * order of the teardown vs input blocks, at least one input registration
+ * overflows, and the substep must report pre:ih-input-register rather than a
+ * bare DENY or a silent skip (and must not panic). */
+static void test_input_grant_register_fails_named(void)
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d, true), "fixture");
+
+    g_plan_layout = f.rt.layout;
+    r3_writeguard_install_mm();
+    const R3Grant *ring = r3_layout_grant(&g_plan_layout, "ih_ring");
+    const R3Grant *wb = r3_layout_grant(&g_plan_layout, "ih_rptr_wb");
+    if (ring) {
+        CHECK(r3_wg_register_layout(static_cast<uint32_t>(ring->start >> 2),
+                                    static_cast<uint32_t>(ring->size >> 2),
+                                    WSubstep::Ih, "layout:ih-ring") == 0,
+              "register ih_ring grant");
+    }
+    if (wb) {
+        CHECK(r3_wg_register_layout(static_cast<uint32_t>(wb->start >> 2),
+                                    static_cast<uint32_t>(wb->size >> 2),
+                                    WSubstep::Ih, "layout:ih-wb") == 0,
+              "register ih_rptr_wb grant");
+    }
+    while (r3_wg_grant_count() + 4u < R3_WG_GRANT_MAX) {
+        const uint32_t addr = 0x6000u + r3_wg_grant_count() * 4u;
+        CHECK(r3_wg_register_reg(addr, 1u, WClass::State, WSubstep::Ih,
+                                 "reg:fill") == 0,
+              "fill grant %u", r3_wg_grant_count());
+    }
+    const R3SubstepResult r = ih_v6_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecFail, "status");
+    CHECK(strcmp(r.name, "pre:ih-input-register") == 0, "name %s", r.name);
+}
+
 static void test_fb_offset_zero(void)
 {
     Fixture f;
@@ -621,6 +704,8 @@ int main(void)
     test_happy_path();
     test_psp_not_ready();
     test_grant_missing();
+    test_pre_registers_all_input_rows();
+    test_input_grant_register_fails_named();
     test_fb_offset_zero();
     test_readback_fault();
     test_entry_extra();

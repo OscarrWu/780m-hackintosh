@@ -31,9 +31,10 @@ namespace amdgpu {
 // 不小于全链总预算，否则编译期断言直接失败——而不是像 boot5 那样真机运行到
 // S7 第 4 行才表满返回 -2（被折叠成 pre:register）。每一常量由 amd/*.cpp 的
 // 反证 static_assert 机械核对（删本地 sizeof 常量处），总和与 R3_WG_GRANT_MAX
-// 在此比较。IH 的输入行（9 行）只参与 expect 集（<= R3_WG_EXPECT_MAX），
-// 不参与 grant 预算，故保留本地（ih_v6_0.cpp），未在此重复；IH 的拆除行（3 行）
-// 参与 grant 预算，见 kIhTeardownRowCount。
+// 在此比较。IH 的输入行与拆除行同址共用：拆除行（3 条）覆盖 RB_CNTL/RPTR/WPTR，
+// 另 6 条输入行（CHICKEN/RB_BASE/HI/WPTR_ADDR_LO/HI/DOORBELL_RPTR）由
+// ih_v6_0.cpp pre() 注册——每条 reg_write 都经 r3_wg_classify（ih_v6_0.cpp:189）
+// 需要 grant，故 9 行全部计入 grant 预算。
 
 // ---- 阶段2（prep 生产注册，S2..S11）常量 ----
 constexpr uint32_t kPspLayoutCount   = 5u;   // psp_v13_0.cpp kPspLayouts[]（5 项 layout）
@@ -60,6 +61,9 @@ constexpr uint32_t kGfxTeardownRowCount = 2u;   // CP_ME_CNTL + CP_MEC_CNTL，gf
 // IH 拆除行由 ih_v6_0.cpp pre() 注册（reg:teardown:ih-*）：关断只写 CNTL/RPTR/WPTR 三个。
 constexpr uint32_t kIhTeardownRowCount  = 3u;   // IH_RB_CNTL + IH_RB_RPTR + IH_RB_WPTR，ih_v6_0.cpp "reg:teardown:ih-*"
 
+// IH 输入行由 ih_v6_0.cpp pre() 注册（reg:ih-*）：S10.1/S10.2 真实写点。
+constexpr uint32_t kIhInputRowCount     = 6u;   // CHICKEN + RB_BASE/HI + WPTR_ADDR_LO/HI + DOORBELL_RPTR，ih_v6_0.cpp "reg:ih-*"
+
 // ---- 派生合计（与实施蓝本附录 A 账目一一对应） ----
 constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
     kPspLayoutCount + kSdmaLayoutCount + kMesLayoutCount +
@@ -68,18 +72,18 @@ constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
     kPspRowCount + kSmuRowCount + kSdmaRowCount + kMesRowCount +
     kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
     kGartRowCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount +
-    kIhTeardownRowCount;                                             // = 156
+    kIhTeardownRowCount + kIhInputRowCount;                          // = 162
 constexpr uint32_t R3_WG_BUDGET_STAGE2 =
     kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
     kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
     kMesQueueRowCount;                                               // = 121
 constexpr uint32_t R3_WG_BUDGET_TOTAL =
-    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 170
+    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 176
 
 static_assert(R3_WG_BUDGET_STAGE2 == 121u, "阶段2 生产注册预算应为 121 项");
 static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
-static_assert(R3_WG_BUDGET_REG_TOTAL == 156u, "全链 reg 预算应为 156 项");
-static_assert(R3_WG_BUDGET_TOTAL == 170u, "全链写守卫预算应为 170 项");
+static_assert(R3_WG_BUDGET_REG_TOTAL == 162u, "全链 reg 预算应为 162 项");
+static_assert(R3_WG_BUDGET_TOTAL == 176u, "全链写守卫预算应为 176 项");
 static_assert(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
               "写守卫 grant 容量小于全链预算：请同步 R3_WG_GRANT_MAX");
 
