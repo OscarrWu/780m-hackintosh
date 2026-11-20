@@ -31,6 +31,9 @@
 #endif
 
 #include "amdgpu_ip.h"
+#include "amd/mes_v11_0.h"
+#include "amd/gfx_v11_0.h"
+#include "amd/sdma_v6_0.h"
 #include "rdna3_ip_entries.h"
 #include "rdna3_layout.h"
 #include "rdna3_writeguard.h"
@@ -107,11 +110,28 @@ bool td_read(const R3TeardownEnv *env, uint32_t addr, uint32_t *value)
     return ok;
 }
 
-/* D-09: the used-register registry only REUSES rows the power-up substep already
- * registered. It never adds new rows (teardown must not widen the whitelist beyond
- * what power-up wrote). When a row is absent (the substep did not write that register),
- * the caller skips the action and logs "no reversible object". */
+/* INV-D13: a reversible object is torn down only when the power-up substep really wrote it.
+ * Registration alone is not enough (the row may exist because the plan declares it), so the
+ * predicate is "registered for this owner/class AND at least one ALLOW write went through it".
+ * A missing row means the substep did not run: the caller skips and logs "no reversible
+ * object" instead of widening the whitelist. */
 bool td_ensure_reg(uint32_t addr, WClass cls, WSubstep owner, const char *tag)
+{
+    (void)tag;
+    const uint32_t n = r3_wg_grant_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const R3WgGrant *g = r3_wg_grant(i);
+        if (g && !g->range && g->start == addr && g->dwords == 1u &&
+            g->owner == owner && g->cls == cls)
+            return r3_wg_was_written(addr);
+    }
+    return false;
+}
+
+/* T-E.11: teardown-only rows are declared for the inverse and never written at power-up,
+ * so their precondition is registration alone (the row is the evidence that the object
+ * exists). Same shape as td_ensure_reg, different predicate — never merge the two. */
+bool td_ensure_teardown_reg(uint32_t addr, WClass cls, WSubstep owner, const char *tag)
 {
     (void)tag;
     const uint32_t n = r3_wg_grant_count();
@@ -160,15 +180,20 @@ uint32_t grbm_select(uint32_t me, uint32_t pipe)
 }
 
 /* --- IH -------------------------------------------------------------------------------- */
-/* Reverse of the IH enable in S10 (ih_v6_0.cpp): IH_RB_CNTL=0 (RB_ENABLE=0),
- * IH_RB_RPTR=0, IH_RB_WPTR=0. Uses the same writeguard rows (WSubstep::Ih) that
- * power-up registered. D-09: only reuses rows the power-up substep already registered. */
-bool td_ih(TdLog &l)
+/* T-E.7: the inverse of S10.0, matching Linux ih_v6_0_toggle_ring_interrupts(..., false)
+ * (ih_v6_0.c:127-188): a single RMW of IH_RB_CNTL clears RB_ENABLE (:137) and ENABLE_INTR
+ * (:168, ring0 only), then IH_RB_RPTR/WPTR are zeroed (:181-182). Only those bits are
+ * touched - the ring geometry and the other fields stay as power-up left them.
+ * These three addresses are also written during power-up (S10.2 base/cntl/rptr/wptr,
+ * S10.3 enable), so INV-D13 applies: td_ensure_reg requires each to have been written.
+ * Returns 1 when the action ran, 0 when they were never written (skip), -1 on a
+ * read/write/readback failure (counted by the caller, never fatal). */
+int td_ih(TdLog &l)
 {
     const IPBaseTable *ip = td_ip(l.env);
     if (!ip || !ip->isResolved(IPBlock::OSSSYS, 0)) {
         td_line(l, "teardown: ih fail (OSSSYS base unresolved)");
-        return false;
+        return -1;
     }
     const uint32_t osssys0 = ip->getBase(IPBlock::OSSSYS, 0);
     /* Offsets from osssys_6_0_0_offset.h (IH v6, not v7). IH_RB_CNTL=0x0080 (same
@@ -177,40 +202,49 @@ bool td_ih(TdLog &l)
     const uint32_t rb_rptr = osssys0 + 0x0083u;
     const uint32_t rb_wptr = osssys0 + 0x0084u;
 
-    if (!td_ensure_reg(rb_cntl, WClass::State, WSubstep::Ih, "reg:teardown-ih")) {
-        td_line(l, "teardown: ih skip (no reversible object; power-up IH rows absent)");
-        return true;
+    if (!td_ensure_reg(rb_cntl, WClass::State, WSubstep::Ih, "reg:teardown:ih-rb-cntl") ||
+        !td_ensure_reg(rb_rptr, WClass::State, WSubstep::Ih, "reg:teardown:ih-rb-rptr") ||
+        !td_ensure_reg(rb_wptr, WClass::State, WSubstep::Ih, "reg:teardown:ih-rb-wptr")) {
+        td_line(l, "teardown: ih skip (no reversible object)");
+        return 0;
     }
 
     r3_wg_arm_substep(WSubstep::Ih);
     bool ok = true;
     const char *ctx = "teardown:ih";
 
-    /* IH_RB_CNTL = 0: RB_ENABLE=0, all other fields zero. */
     uint32_t before = 0, after = 0;
     if (!td_read(l.env, rb_cntl, &before)) {
         td_line(l, "teardown: ih RB_CNTL unreadable");
         ok = false;
-    } else if (!td_write(l, rb_cntl, 0u, ctx, "ih-rb-cntl", &after)) {
-        ok = false;
     } else {
-        td_line(l, "teardown: ih RB_CNTL 0x%08x -> 0x%08x (disabled)", before, after);
+        const uint32_t value =
+            before & ~(amdgpu::kIhRbCntlRbEnable | amdgpu::kIhRbCntlEnableIntr);
+        if (!td_write(l, rb_cntl, value, ctx, "ih-rb-cntl", &after)) {
+            ok = false;
+        } else {
+            td_line(l, "teardown: ih RB_CNTL 0x%08x -> 0x%08x (interrupts off)", before,
+                    after);
+        }
     }
 
-    /* IH_RB_RPTR = 0. */
+    /* :181-182 set rptr, wptr to 0. */
     if (!td_write(l, rb_rptr, 0u, ctx, "ih-rb-rptr", nullptr))
         ok = false;
-
-    /* IH_RB_WPTR = 0. */
     if (!td_write(l, rb_wptr, 0u, ctx, "ih-rb-wptr", nullptr))
         ok = false;
 
     r3_wg_disarm_substep();
-    return ok;
+    return ok ? 1 : -1;
 }
 
 /* --- MES ------------------------------------------------------------------------------ */
-bool td_mes_queue(TdLog &l, uint32_t grbm, uint32_t active, uint32_t pipe, const char *name)
+/* T-E.3, one queue: GRBM pipe select -> read CP_HQD_ACTIVE -> if active, DEQUEUE and poll
+ * ACTIVE clear (bounded) -> close the doorbell -> clear WPTR/RPTR -> deselect. An already
+ * inactive queue is logged and left untouched (idempotent: no DEQUEUE, no pointer writes). */
+bool td_mes_queue(TdLog &l, uint32_t grbm, uint32_t active, uint32_t dequeue,
+                  uint32_t dbctl, uint32_t wptr_lo, uint32_t wptr_hi, uint32_t rptr,
+                  uint32_t pipe, const char *name)
 {
     const char *ctx = "teardown:mes";
     if (!td_write(l, grbm, grbm_select(3u, pipe), ctx, "mes-grbm-select", nullptr))
@@ -219,24 +253,53 @@ bool td_mes_queue(TdLog &l, uint32_t grbm, uint32_t active, uint32_t pipe, const
     uint32_t before = 0;
     if (!td_read(l.env, active, &before)) {
         td_line(l, "teardown: mes %s hqd-active unreadable", name);
+        (void)td_write(l, grbm, grbm_select(0u, 0u), ctx, "mes-grbm-deselect", nullptr);
         return false;
     }
-    uint32_t after = 0;
-    if (!td_write(l, active, 0u, ctx, "mes-hqd-active", &after))
-        return false;
+    if ((before & 1u) == 0u) {
+        td_line(l, "teardown: mes %s already inactive", name);
+        return td_write(l, grbm, grbm_select(0u, 0u), ctx, "mes-grbm-deselect", nullptr);
+    }
 
-    /* Linux waits for CP_HQD_ACTIVE.ACTIVE to clear after deactivate; bounded here.
-     * Without a delay callback one readback is the whole boundary. */
-    int p = 1;
-    if ((after & 1u) != 0u && l.env->io->udelay)
-        p = r3_io_poll(l.env->io, active, 1u, 0u, kHqdPolls, kHqdPollUs, &after);
-    if (p != 1) {
-        td_line(l, "teardown: mes %s hqd-active 0x%08x -> 0x%08x (not clear)",
-                name, before, after);
+    if (!td_write(l, dequeue, 1u, ctx, "mes-hqd-dequeue", nullptr)) {
+        (void)td_write(l, grbm, grbm_select(0u, 0u), ctx, "mes-grbm-deselect", nullptr);
         return false;
     }
-    td_line(l, "teardown: mes %s hqd-active 0x%08x -> 0x%08x", name, before, after);
-    return true;
+
+    uint32_t after = 0;
+    const int p = r3_io_poll(l.env->io, active, 1u, 0u, kHqdPolls, kHqdPollUs, &after);
+    bool ok = true;
+    if (p != 1) {
+        /* Linux continues after the bounded wait: the queue is not clear, but the
+         * doorbell/pointers are still closed below and the failure is reported. */
+        td_line(l, "teardown: mes %s dequeue 0x%08x -> 0x%08x (not clear; continuing)",
+                name, before, after);
+        ok = false;
+    }
+
+    uint32_t db_before = 0;
+    if (!td_read(l.env, dbctl, &db_before)) {
+        td_line(l, "teardown: mes %s doorbell-control unreadable", name);
+        ok = false;
+    } else {
+        const uint32_t db_off = (db_before & ~amdgpu::kCpHqdPqDoorbellEn) |
+                                amdgpu::kCpHqdPqDoorbellHit;
+        if (!td_write(l, dbctl, db_off, ctx, "mes-hqd-doorbell", nullptr) ||
+            !td_write(l, dbctl, 0u, ctx, "mes-hqd-doorbell-clear", nullptr))
+            ok = false;
+    }
+
+    if (!td_write(l, wptr_lo, 0u, ctx, "mes-hqd-wptr-lo", nullptr) ||
+        !td_write(l, wptr_hi, 0u, ctx, "mes-hqd-wptr-hi", nullptr) ||
+        !td_write(l, rptr, 0u, ctx, "mes-hqd-rptr", nullptr))
+        ok = false;
+
+    if (p == 1)
+        td_line(l, "teardown: mes %s hqd-active 0x%08x -> 0x%08x (dequeued)", name,
+                before, after);
+    if (!td_write(l, grbm, grbm_select(0u, 0u), ctx, "mes-grbm-deselect", nullptr))
+        ok = false;
+    return ok;
 }
 
 bool td_mes(TdLog &l)
@@ -251,15 +314,14 @@ bool td_mes(TdLog &l)
     const uint32_t grbm = gc1 + amdgpu::kRegGrbmGfxCntl;
     const uint32_t active = gc0 + amdgpu::kRegCpHqdActive;
     const uint32_t cntl = gc1 + amdgpu::kRegMesCntl;
-    /* Local copies of doorbell range offsets (mes_v11_0.h has them under amdgpu but
-     * we avoid cross-layer include; the values must match mes_v11_0.h). */
-    constexpr uint32_t kDbRangeLo = 0x1dfa;
-    constexpr uint32_t kDbRangeHi = 0x1dfb;
-    const uint32_t dbr_lo = gc0 + kDbRangeLo;
-    const uint32_t dbr_hi = gc0 + kDbRangeHi;
+    const uint32_t dequeue = gc0 + amdgpu::kCpHqdDequeue;
+    const uint32_t dbctl = gc0 + amdgpu::kRegCpHqdPqDoorbellControl;
+    const uint32_t wptr_lo = gc0 + amdgpu::kCpHqdPqWptrLo;
+    const uint32_t wptr_hi = gc0 + amdgpu::kCpHqdPqWptrHi;
+    const uint32_t rptr = gc0 + amdgpu::kRegCpHqdPqRptr;
 
+    /* Halt precondition (T-E.4): S1 wrote GRBM and CP_MES_CNTL once a MES instance exists. */
     if (!td_ensure_reg(grbm, WClass::State, WSubstep::Mes, "reg:teardown-mes") ||
-        !td_ensure_reg(active, WClass::State, WSubstep::Mes, "reg:teardown-mes") ||
         !td_ensure_reg(cntl, WClass::State, WSubstep::Mes, "reg:teardown-mes")) {
         td_line(l, "teardown: mes skip (no reversible object; power-up rows absent)");
         return true;
@@ -268,23 +330,28 @@ bool td_mes(TdLog &l)
     r3_wg_arm_substep(WSubstep::Mes);
     bool ok = true;
 
-    /* Reverse of seq_sch then seq_kiq (SCH = pipe0, KIQ = pipe1). */
-    ok &= td_mes_queue(l, grbm, active, 0u, "sch");
-    ok &= td_mes_queue(l, grbm, active, 1u, "kiq");
-
-    /* Doorbell range disable: CP_RB_DOORBELL_RANGE_LOWER/UPPER = 0 stops new doorbell
-     * ring events before MES firmware reset. These are OnSuccessPath rows registered
-     * by S11; td_ensure_reg checks presence first (OK if S11 was skipped). */
-    if (td_ensure_reg(dbr_lo, WClass::State, WSubstep::Mes, "reg:teardown-dbr-lo")) {
-        ok &= td_write(l, dbr_lo, 0u, "teardown:mes", "mes-dbr-lo", nullptr);
+    /* Queue inverse (T-E.3). DEQUEUE and the WPTR pair are declared for the inverse, so
+     * registration is the evidence (T-E.11); ACTIVE and the doorbell control were written
+     * by program_hqd, so INV-D13 needs a real power-up write. A missing queue row drops
+     * only the queue step - the halt below still runs (T-E.8). */
+    const bool queue_rows =
+        td_ensure_teardown_reg(dequeue, WClass::State, WSubstep::Mes, "reg:teardown:mes") &&
+        td_ensure_teardown_reg(wptr_lo, WClass::State, WSubstep::Mes, "reg:teardown:mes") &&
+        td_ensure_teardown_reg(wptr_hi, WClass::State, WSubstep::Mes, "reg:teardown:mes") &&
+        td_ensure_teardown_reg(rptr, WClass::State, WSubstep::Mes, "reg:teardown:mes");
+    const bool queue_objs =
+        td_ensure_reg(active, WClass::State, WSubstep::Mes, "reg:teardown-mes") &&
+        td_ensure_reg(dbctl, WClass::State, WSubstep::Mes, "reg:teardown-mes");
+    if (queue_rows && queue_objs) {
+        /* Reverse of seq_sch then seq_kiq (SCH = pipe0, KIQ = pipe1). */
+        ok &= td_mes_queue(l, grbm, active, dequeue, dbctl, wptr_lo, wptr_hi, rptr, 0u, "sch");
+        ok &= td_mes_queue(l, grbm, active, dequeue, dbctl, wptr_lo, wptr_hi, rptr, 1u, "kiq");
+    } else {
+        td_line(l, "teardown: mes queue rows absent (halt only)");
     }
-    if (td_ensure_reg(dbr_hi, WClass::State, WSubstep::Mes, "reg:teardown-dbr-hi")) {
-        ok &= td_write(l, dbr_hi, 0u, "teardown:mes", "mes-dbr-hi", nullptr);
-    }
 
-    ok &= td_write(l, grbm, grbm_select(0u, 0u), "teardown:mes", "mes-grbm-deselect",
-                   nullptr);
-
+    /* T-E.4: one RMW clears PIPE0/1_ACTIVE and sets INVALIDATE_ICACHE, PIPE0/1_RESET and
+     * HALT. The PIPE1_RESET form matches seq_start (both pipes reset on init). */
     uint32_t before = 0;
     if (!td_read(l.env, cntl, &before)) {
         td_line(l, "teardown: mes CP_MES_CNTL unreadable");
@@ -292,18 +359,19 @@ bool td_mes(TdLog &l)
     } else {
         const uint32_t want =
             (before & ~(amdgpu::kMesCntlPipe0Active | amdgpu::kMesCntlPipe1Active)) |
-            amdgpu::kMesCntlPipe0Reset | amdgpu::kMesCntlPipe1Reset;
+            amdgpu::kMesCntlPipe0Reset | amdgpu::kMesCntlPipe1Reset |
+            amdgpu::kMesCntlInvalidateIcache | amdgpu::kMesCntlHalt;
         uint32_t after = 0;
-        if (!td_write(l, cntl, want, "teardown:mes", "mes-cntl-reset", &after)) {
+        const uint32_t need = amdgpu::kMesCntlHalt | amdgpu::kMesCntlPipe0Reset |
+                              amdgpu::kMesCntlPipe1Reset;
+        if (!td_write(l, cntl, want, "teardown:mes", "mes-cntl-halt", &after)) {
             ok = false;
-        } else if ((after & (amdgpu::kMesCntlPipe0Reset | amdgpu::kMesCntlPipe1Reset)) !=
-                   (amdgpu::kMesCntlPipe0Reset | amdgpu::kMesCntlPipe1Reset)) {
-            td_line(l, "teardown: mes CP_MES_CNTL readback=0x%08x (reset bits missing)",
+        } else if ((after & need) != need) {
+            td_line(l, "teardown: mes CP_MES_CNTL readback=0x%08x (halt/reset bits missing)",
                     after);
             ok = false;
         } else {
-            td_line(l, "teardown: mes CP_MES_CNTL 0x%08x -> 0x%08x (pipes reset)",
-                    before, after);
+            td_line(l, "teardown: mes CP_MES_CNTL 0x%08x -> 0x%08x (halted)", before, after);
         }
     }
 
@@ -323,6 +391,7 @@ bool td_sdma(TdLog &l)
     const uint32_t sdma0 = ip->getBase(IPBlock::SDMA0, 0);
     const uint32_t sdma1 = ip->getBase(IPBlock::SDMA0, 1);
     const uint32_t rb = sdma0 + amdgpu::kRegSdma0Queue0RbCntl;
+    const uint32_t ib = sdma0 + amdgpu::kRegSdma0Queue0IbCntl;
     const uint32_t f32 = sdma1 + amdgpu::kRegSdma0F32Cntl;
 
     if (!td_ensure_reg(rb, WClass::State, WSubstep::Sdma, "reg:teardown-sdma") ||
@@ -353,6 +422,31 @@ bool td_sdma(TdLog &l)
         }
     }
 
+    /* T-E.2: RB -> IB -> F32. IB is OnSuccessPath (S4); when its row was never written
+     * the IB step is skipped on its own without taking RB/F32 down with it. */
+    if (td_ensure_reg(ib, WClass::State, WSubstep::Sdma, "reg:teardown-sdma")) {
+        uint32_t ib_before = 0;
+        if (!td_read(l.env, ib, &ib_before)) {
+            td_line(l, "teardown: sdma IB_CNTL unreadable");
+            ok = false;
+        } else {
+            const uint32_t ib_want = ib_before & ~amdgpu::kIbCntlIbEnableMask;
+            uint32_t ib_after = 0;
+            if (!td_write(l, ib, ib_want, "teardown:sdma", "sdma-ib-disable", &ib_after)) {
+                ok = false;
+            } else if ((ib_after & amdgpu::kIbCntlIbEnableMask) != 0u) {
+                td_line(l, "teardown: sdma IB_CNTL readback=0x%08x (IB_ENABLE still set)",
+                        ib_after);
+                ok = false;
+            } else {
+                td_line(l, "teardown: sdma IB_CNTL 0x%08x -> 0x%08x (IB_ENABLE=0)",
+                        ib_before, ib_after);
+            }
+        }
+    } else {
+        td_line(l, "teardown: sdma IB_CNTL not reversible; ib step skipped");
+    }
+
     uint32_t f32_before = 0;
     if (!td_read(l.env, f32, &f32_before)) {
         td_line(l, "teardown: sdma F32_CNTL unreadable");
@@ -375,6 +469,90 @@ bool td_sdma(TdLog &l)
     r3_wg_disarm_substep();
     return ok;
 }
+/* --- GFX ------------------------------------------------------------------------------ */
+bool td_gfx(TdLog &l)
+{
+    const IPBaseTable *ip = td_ip(l.env);
+    if (!ip || !ip->isResolved(IPBlock::GC, 0) || !ip->isResolved(IPBlock::GC, 1)) {
+        td_line(l, "teardown: gfx fail (GC base unresolved)");
+        return false;
+    }
+    const uint32_t gc0 = ip->getBase(IPBlock::GC, 0);
+    const uint32_t gc1 = ip->getBase(IPBlock::GC, 1);
+    const uint32_t me_cntl = gc1 + amdgpu::kGfx11CpMeCntl;
+    const uint32_t me_stat = gc0 + amdgpu::kGfx11CpStat;
+    const uint32_t mec_cntl = gc1 + amdgpu::kGfx11CpMecCntl;
+
+    /* Teardown-only rows registered by the gfx entry (tag "reg:gfx-teardown"). */
+    if (!td_ensure_teardown_reg(me_cntl, WClass::State, WSubstep::Gfx, "reg:gfx-teardown") ||
+        !td_ensure_teardown_reg(mec_cntl, WClass::State, WSubstep::Gfx, "reg:gfx-teardown")) {
+        td_line(l, "teardown: gfx skip (teardown rows not registered)");
+        return true;
+    }
+
+    r3_wg_arm_substep(WSubstep::Gfx);
+    bool ok = true;
+
+    /* T-E.6: halt ME and PFP in one RMW (CE_HALT preserved), then wait for CP_STAT to
+     * drain. The wait is bounded by T_E_POLL_MAX; a timeout is reported, not fatal. */
+    uint32_t me_before = 0;
+    if (!td_read(l.env, me_cntl, &me_before)) {
+        td_line(l, "teardown: gfx CP_ME_CNTL unreadable");
+        ok = false;
+    } else {
+        const uint32_t want =
+            me_before | amdgpu::kGfx11CpMeCntlMeHalt | amdgpu::kGfx11CpMeCntlPfpHalt;
+        uint32_t after = 0;
+        if (!td_write(l, me_cntl, want, "teardown:gfx", "gfx-me-halt", &after)) {
+            ok = false;
+        } else if ((after & (amdgpu::kGfx11CpMeCntlMeHalt | amdgpu::kGfx11CpMeCntlPfpHalt)) !=
+                   (amdgpu::kGfx11CpMeCntlMeHalt | amdgpu::kGfx11CpMeCntlPfpHalt)) {
+            td_line(l, "teardown: gfx CP_ME_CNTL readback=0x%08x (ME/PFP halt missing)", after);
+            ok = false;
+        } else {
+            td_line(l, "teardown: gfx CP_ME_CNTL 0x%08x -> 0x%08x (ME/PFP halted)", me_before,
+                    after);
+        }
+    }
+
+    uint32_t stat = 0;
+    const int p = r3_io_poll(l.env->io, me_stat, 0xFFFFFFFFu, 0u, kHqdPolls, kHqdPollUs, &stat);
+    if (p == 1) {
+        td_line(l, "teardown: gfx CP_STAT idle");
+    } else if (p == 0) {
+        td_line(l, "teardown: gfx CP_STAT timeout=0x%08x (continuing)", stat);
+        ok = false;
+    } else {
+        td_line(l, "teardown: gfx CP_STAT unreadable");
+        ok = false;
+    }
+
+    uint32_t mec_before = 0;
+    if (!td_read(l.env, mec_cntl, &mec_before)) {
+        td_line(l, "teardown: gfx CP_MEC_CNTL unreadable");
+        ok = false;
+    } else {
+        const uint32_t want =
+            mec_before | amdgpu::kGfx11CpMecCntlMe1Halt | amdgpu::kGfx11CpMecCntlMe2Halt;
+        uint32_t after = 0;
+        if (!td_write(l, mec_cntl, want, "teardown:gfx", "gfx-mec-halt", &after)) {
+            ok = false;
+        } else if ((after & (amdgpu::kGfx11CpMecCntlMe1Halt | amdgpu::kGfx11CpMecCntlMe2Halt)) !=
+                   (amdgpu::kGfx11CpMecCntlMe1Halt | amdgpu::kGfx11CpMecCntlMe2Halt)) {
+            td_line(l, "teardown: gfx CP_MEC_CNTL readback=0x%08x (ME1/ME2 halt missing)",
+                    after);
+            ok = false;
+        } else {
+            td_line(l, "teardown: gfx CP_MEC_CNTL 0x%08x -> 0x%08x (ME1/ME2 halted)",
+                    mec_before, after);
+        }
+    }
+    r3_io_udelay(l.env->io, 50u);
+
+    r3_wg_disarm_substep();
+    return ok;
+}
+
 
 } /* namespace */
 
@@ -407,14 +585,17 @@ R3TeardownReport r3_teardown_run(const R3TeardownEnv *env)
         return rep;
     }
 
-    const uint32_t failed_bit =
-        (env->failed) ? R3_IP_BIT(env->failed_ip) : 0u;
+    uint32_t failed_bit = 0u;
+    if (env->failed && env->failed_ip_valid &&
+        static_cast<uint32_t>(env->failed_ip) < static_cast<uint32_t>(R3_IP_COUNT)) {
+        failed_bit = R3_IP_BIT(env->failed_ip);
+    }
     const uint32_t started = rt->ready_bits | failed_bit;
     rep.started = started;
 
     /* T4: a failing PSP stops the ladder with no inverse sequence. Snapshot is the
      * failure dump (already taken); teardown performs nothing and says so. */
-    if (env->failed && env->failed_ip == R3Ip::Psp) {
+    if (env->failed && env->failed_ip_valid && env->failed_ip == R3Ip::Psp) {
         rep.psp_failed = true;
         td_line(l, "teardown: none (psp failed; stop + snapshot; psp left alive)");
         td_publish(l);
@@ -429,7 +610,7 @@ R3TeardownReport r3_teardown_run(const R3TeardownEnv *env)
     }
 
     rep.triggered = true;
-    td_line(l, "teardown: begin order=mes,sdma,gfx,smu psp=alive reset=none");
+    td_line(l, "teardown: begin order=mes,sdma,gfx,smu,ih psp=alive reset=none");
 
     for (uint32_t i = 0; i < 4u; i++) {
         const R3Ip ip = kOrder[i];
@@ -450,8 +631,6 @@ R3TeardownReport r3_teardown_run(const R3TeardownEnv *env)
                 rep.none |= bit;
             if (!ok)
                 rep.write_fail |= bit;
-            /* Reverse-order IH teardown after MES (S10 IH before S11 MES in power-up). */
-            td_ih(l);
             break;
         }
         case R3Ip::Sdma: {
@@ -465,10 +644,17 @@ R3TeardownReport r3_teardown_run(const R3TeardownEnv *env)
                 rep.write_fail |= bit;
             break;
         }
-        case R3Ip::Gfx:
-            rep.none |= bit;
-            td_line(l, "teardown: gfx none");
+        case R3Ip::Gfx: {
+            const uint32_t w0 = l.writes;
+            const bool ok = td_gfx(l);
+            if (l.writes > w0)
+                rep.acted |= bit;
+            else
+                rep.none |= bit;
+            if (!ok)
+                rep.write_fail |= bit;
             break;
+        }
         case R3Ip::Smu:
             rep.none |= bit;
             td_line(l, "teardown: smu none (no inverse in minimal message set)");
@@ -478,10 +664,21 @@ R3TeardownReport r3_teardown_run(const R3TeardownEnv *env)
         }
     }
 
+    /* T-E.7: IH is the last block (after GFX; SMU has no inverse), so no failure line is
+     * lost before the interrupt path goes down. It is enabled early in power-up, hence
+     * not gated on `started`; INV-D13 still requires its three rows to have been written. */
+    {
+        /* R3Ip has no IH member: td_ih logs its own outcome and its writes feed
+         * rep.writes; a failed IH action is counted in ih_fail (never fatal). */
+        const int ih = td_ih(l);
+        if (ih < 0)
+            rep.ih_fail = 1u;
+    }
+
     rep.skipped |= R3_IP_BIT(R3Ip::Psp); /* PSP is deliberately left alive */
     rep.writes = l.writes;
-    td_line(l, "teardown: done writes=%u acted=0x%x none=0x%x failed=0x%x",
-            rep.writes, rep.acted, rep.none, rep.write_fail);
+    td_line(l, "teardown: done writes=%u acted=0x%x none=0x%x failed=0x%x ih_fail=%u",
+            rep.writes, rep.acted, rep.none, rep.write_fail, rep.ih_fail);
     td_publish(l);
     return rep;
 }

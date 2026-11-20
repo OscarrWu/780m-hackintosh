@@ -32,7 +32,8 @@ namespace amdgpu {
 // S7 第 4 行才表满返回 -2（被折叠成 pre:register）。每一常量由 amd/*.cpp 的
 // 反证 static_assert 机械核对（删本地 sizeof 常量处），总和与 R3_WG_GRANT_MAX
 // 在此比较。IH 的输入行（9 行）只参与 expect 集（<= R3_WG_EXPECT_MAX），
-// 不参与 grant 预算，故保留本地（ih_v6_0.cpp），未在此重复。
+// 不参与 grant 预算，故保留本地（ih_v6_0.cpp），未在此重复；IH 的拆除行（3 行）
+// 参与 grant 预算，见 kIhTeardownRowCount。
 
 // ---- 阶段2（prep 生产注册，S2..S11）常量 ----
 constexpr uint32_t kPspLayoutCount   = 5u;   // psp_v13_0.cpp kPspLayouts[]（5 项 layout）
@@ -53,8 +54,11 @@ constexpr uint32_t kVmid8FirstInvalidateRow = 15u;  // S9 只注册前 15 行（
 constexpr uint32_t kVmid8RowCount           = 18u;  // 声明全集（expect 用；15..17 非 S9 注册）
 constexpr uint32_t kMesQueueLayoutCount     = 1u;   // mes S11 test_buf layout 计 1 条
 
-// ---- W1 拆除行（teardown-only，不属于阶段2 生产注册；由 TP-G1 在 gfx_v11_0.cpp 注册） ----
+// ---- W1 拆除行（teardown-only，不属于阶段2 生产注册；GFX 行由 gfx_v11_0.cpp、IH 行由 ih_v6_0.cpp 注册） ----
 constexpr uint32_t kGfxTeardownRowCount = 2u;   // CP_ME_CNTL + CP_MEC_CNTL，gfx_v11_0.cpp "reg:gfx-teardown"
+
+// IH 拆除行由 ih_v6_0.cpp pre() 注册（reg:teardown:ih-*）：关断只写 CNTL/RPTR/WPTR 三个。
+constexpr uint32_t kIhTeardownRowCount  = 3u;   // IH_RB_CNTL + IH_RB_RPTR + IH_RB_WPTR，ih_v6_0.cpp "reg:teardown:ih-*"
 
 // ---- 派生合计（与实施蓝本附录 A 账目一一对应） ----
 constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
@@ -63,18 +67,19 @@ constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
 constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
     kPspRowCount + kSmuRowCount + kSdmaRowCount + kMesRowCount +
     kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
-    kGartRowCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount;  // = 153
+    kGartRowCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount +
+    kIhTeardownRowCount;                                             // = 156
 constexpr uint32_t R3_WG_BUDGET_STAGE2 =
     kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
     kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
     kMesQueueRowCount;                                               // = 121
 constexpr uint32_t R3_WG_BUDGET_TOTAL =
-    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 167
+    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 170
 
 static_assert(R3_WG_BUDGET_STAGE2 == 121u, "阶段2 生产注册预算应为 121 项");
 static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
-static_assert(R3_WG_BUDGET_REG_TOTAL == 153u, "全链 reg 预算应为 153 项");
-static_assert(R3_WG_BUDGET_TOTAL == 167u, "全链写守卫预算应为 167 项");
+static_assert(R3_WG_BUDGET_REG_TOTAL == 156u, "全链 reg 预算应为 156 项");
+static_assert(R3_WG_BUDGET_TOTAL == 170u, "全链写守卫预算应为 170 项");
 static_assert(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
               "写守卫 grant 容量小于全链预算：请同步 R3_WG_GRANT_MAX");
 
@@ -114,6 +119,12 @@ constexpr uint32_t kGfx11GrbmStatus2       = 0x0da2;
 constexpr int      kGfx11GrbmStatus2Base   = 0;
 constexpr uint32_t kGfx11CpStat            = 0x0f40;
 constexpr int      kGfx11CpStatBase        = 0;
+// CP_MEC_CNTL (S11 T-E.6 inverse of the MEC power-up). MEC_ME2_HALT bit28,
+// MEC_ME1_HALT bit30 (gc_11_0_0_sh_mask.h:23976-24001).
+constexpr uint32_t kGfx11CpMecCntl         = 0x0802;
+constexpr int      kGfx11CpMecCntlBase     = 1;
+constexpr uint32_t kGfx11CpMecCntlMe2Halt  = 0x10000000u;
+constexpr uint32_t kGfx11CpMecCntlMe1Halt  = 0x40000000u;
 
 // =========================================================================
 // MES 11.0 — substep entry & step-2 getters
@@ -142,6 +153,20 @@ constexpr uint32_t kMesCntlPipe0Active         = 1u << 26;
 constexpr uint32_t kMesCntlPipe1Active         = 1u << 27;
 constexpr uint32_t kMesCntlPipe0Reset          = 1u << 16;
 constexpr uint32_t kMesCntlPipe1Reset          = 1u << 17;
+
+// Teardown-only MES control fields (tech plan §9 T-E.3/T-E.4; gc_11_0_0_sh_mask.h
+// CP_MES_CNTL). The HQD offsets live in mes_v11_0.h; only the field bits the inverse
+// sequence needs are declared here.
+constexpr uint32_t kCpHqdPqDoorbellHit          = 1u << 31;
+constexpr uint32_t kMesCntlInvalidateIcache     = 1u << 4;
+constexpr uint32_t kMesCntlHalt                 = 1u << 30;
+
+// Teardown-only IH bits (tech plan §9 T-E.7). Linux amdgpu_ih_toggle_ring_interrupts(..., false)
+// clears exactly RB_ENABLE (ih_v6_0.c:137) and ENABLE_INTR (ih_v6_0.c:168, ring0 only) in one
+// RMW of IH_RB_CNTL, then zeroes RPTR/WPTR (ih_v6_0.c:181-182). Bit positions:
+// oss_3_0_sh_mask.h:737 (RB_ENABLE__SHIFT=0) and :67-68 (ENABLE_INTR_MASK=0x20000, SHIFT=17).
+constexpr uint32_t kIhRbCntlRbEnable            = 1u << 0;
+constexpr uint32_t kIhRbCntlEnableIntr          = 1u << 17;
 
 // =========================================================================
 // PSP 13.0 — substep entry & step-2 getters

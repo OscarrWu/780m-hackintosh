@@ -142,7 +142,8 @@ private:
     char                  rdm_buf_[R3_MANIFEST_BYTES] {}; /* B5/T16: read-manifest text (was stack) */
     bool                  fired_ { false };              /* D-01: power-up substeps ran this boot */
     bool                  started_ { false };
-    uint32_t              cmp_wptr_ { 0 };               /* C-09: compute ring wptr, persistent across submits */
+    bool                  teardown_done_ { false };   /* #18: stop reverses a fired power-up */
+    uint32_t              cmp_wptr_ { 0 };             /* C-09: compute ring wptr, persistent across submits */
 };
 
 #endif // KERNEL

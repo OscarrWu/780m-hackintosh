@@ -107,6 +107,59 @@ static void test_install(void)
           "install resets counters");
 }
 
+/* #17: install_checked validates segment shape and reports discovery drift. */
+static char g_ic_log[2048];
+static uint32_t g_ic_used;
+static void ic_log_capture(void *user, const char *line)
+{
+    (void)user;
+    const size_t n = strlen(line);
+    if (g_ic_used + n + 2 >= sizeof g_ic_log)
+        return;
+    memcpy(g_ic_log + g_ic_used, line, n);
+    g_ic_used += (uint32_t)n;
+    g_ic_log[g_ic_used++] = '\n';
+    g_ic_log[g_ic_used] = '\0';
+}
+
+static void test_install_checked(void)
+{
+    uint32_t bad[R3_WG_SEGS] = {0x00000000u, 0x00001000u, 0x00010000u, 0x00020000u,
+                                0x00030000u};
+    CHECK(r3_writeguard_install_checked(nullptr, SEG, false) == -1, "null seg refused");
+    CHECK(r3_writeguard_install_checked(SEG, nullptr, false) == -1, "null disc refused");
+
+    bad[1] = 0x00001001u; /* not dword aligned */
+    CHECK(r3_writeguard_install_checked(bad, bad, false) == -2, "unaligned segment refused");
+    bad[1] = 0x00001000u;
+    bad[4] = 0xFFFF0004u; /* above the BAR5 dword range */
+    CHECK(r3_writeguard_install_checked(bad, bad, false) == -2, "out-of-range segment refused");
+
+    /* A zero base is legal: the MM window sits at BAR5 dword 0. */
+    CHECK(r3_writeguard_install_checked(SEG, SEG, true) == 0, "zero base + no drift accepted");
+
+    g_ic_used = 0;
+    g_ic_log[0] = '\0';
+    r3_wg_set_log(&ic_log_capture, nullptr);
+    uint32_t disc[R3_WG_SEGS];
+    memcpy(disc, SEG, sizeof disc);
+    disc[2] += 0x1000u;
+    CHECK(r3_writeguard_install_checked(SEG, disc, false) == 0, "drift warns but installs");
+    CHECK(strstr(g_ic_log, "INSTALL-DRIFT seg2=") != nullptr, "drift line missing");
+    CHECK(strstr(g_ic_log, "INSTALL-DRIFT-SKIP") != nullptr, "drift skip note missing");
+    CHECK(r3_writeguard_install_checked(SEG, disc, true) == -2, "enforced drift refused");
+
+    /* The log sink is not whitelist state: an install must not silence later DENY lines
+     * (INV-D12). Without the fix g_ic_used stays 0 and this fails. */
+    g_ic_used = 0;
+    g_ic_log[0] = '\0';
+    r3_wg_set_log(&ic_log_capture, nullptr);
+    CHECK(r3_writeguard_install_checked(SEG, SEG, false) == 0, "reinstall with sink ok");
+    CHECK(r3_write_classify(0x7u, 1u, "post-install") == WVerdict::Deny, "off-window denied");
+    CHECK(g_ic_used > 0u, "install must keep the log sink (INV-D12)");
+    r3_wg_set_log(nullptr, nullptr);
+}
+
 static void test_mm_only_arm(void)
 {
     CHECK(r3_writeguard_install_mm() == 0, "MM arm ok");
@@ -1093,6 +1146,7 @@ static void test_expect_strict_gate(void)
 int main(void)
 {
     test_install();
+    test_install_checked();
     test_mm_only_arm();
     test_table();
     test_allow();

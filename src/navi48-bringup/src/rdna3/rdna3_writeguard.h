@@ -151,6 +151,17 @@ struct R3WgGrant {
  * re-arms, clears stage-2 grants and resets the counters and the write manifest. */
 int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS]);
 
+/* #17: install with a discovery-source cross-check. `seg` is the authoritative base table;
+ * `disc_seg` is the same table as independently read back from discovery (when it is not
+ * available at this point, callers pass `seg` itself and the check is a no-op). Every base
+ * must be non-zero, dword aligned and within the 32-bit register space; a structural
+ * violation returns -2 before any state changes. A per-segment difference logs
+ * "INSTALL-DRIFT" + "INSTALL-DRIFT-SKIP" and, with enforce_drift=true, returns -2 instead of
+ * arming on unverified data. Returns 0 on success, -1 on a null argument. */
+int r3_writeguard_install_checked(const uint32_t seg[R3_WG_SEGS],
+                                  const uint32_t disc_seg[R3_WG_SEGS],
+                                  bool enforce_drift);
+
 /* Arm only the absolute MM_INDEX/MM_DATA/MM_INDEX_HI read-transaction windows (BAR5 dwords
  * 0x0/0x1/0x6, base Navi48Bringup.cpp:160-165). T2 needs these BEFORE discovery has supplied
  * the DCN segment bases, so this is a separate arm step; r3_writeguard_install() later re-arms
@@ -194,6 +205,11 @@ int r3_wg_reserve(uint32_t rows);
 
 uint32_t r3_wg_grant_count(void);
 const R3WgGrant *r3_wg_grant(uint32_t index);
+
+/* #20: true when this exact single-dword register row was registered AND at least one
+ * write through it was classified as ALLOW (i.e. power-up really wrote it). Teardown uses
+ * this to honour INV-D13: only reverse objects that were actually written. */
+bool r3_wg_was_written(uint32_t addr);
 
 /* Enter a substep (sets the owner checked against every grant) or leave it (owner None). */
 void r3_wg_arm_substep(WSubstep s);

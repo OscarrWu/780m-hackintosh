@@ -103,6 +103,7 @@ struct State {
     R3WgLogFn log_fn;       /* D-06/B1: optional DENY log sink                  */
     void *log_user;
     R3WgGrant grants[R3_WG_GRANT_MAX];
+    uint8_t grant_hit[R3_WG_GRANT_MAX]; /* 1 = an ALLOW write went through grants[i] (#20) */
     uint32_t grant_count;
     R3WManifest manifest;
     /* Step3: expectation state. */
@@ -205,11 +206,45 @@ void r3_wg_set_log(R3WgLogFn fn, void *user)
     g.log_user = user;
 }
 
-int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS])
+namespace {
+bool seg_ok(uint32_t base)
 {
-    if (!seg)
+    return (base & 3u) == 0u && base <= 0xFFFF0000u;
+}
+} // namespace
+
+int r3_writeguard_install_checked(const uint32_t seg[R3_WG_SEGS],
+                                  const uint32_t disc_seg[R3_WG_SEGS], bool enforce_drift)
+{
+    if (!seg || !disc_seg)
         return -1;
+    for (uint32_t i = 0; i < R3_WG_SEGS; i++) {
+        if (!seg_ok(seg[i]))
+            return -2;
+    }
+    bool drift = false;
+    for (uint32_t i = 0; i < R3_WG_SEGS; i++) {
+        if (seg[i] == disc_seg[i])
+            continue;
+        drift = true;
+        if (g.log_fn) {
+            char line[128];
+            snprintf(line, sizeof line,
+                     "N48R3LOG writeguard: INSTALL-DRIFT seg%u=%08x disc=%08x", i, seg[i],
+                     disc_seg[i]);
+            g.log_fn(g.log_user, line);
+            g.log_fn(g.log_user, "N48R3LOG writeguard: INSTALL-DRIFT-SKIP (armed on seg)");
+        }
+    }
+    if (drift && enforce_drift)
+        return -2;
+    /* The log sink is not whitelist state: keep it so post-install DENY/drift lines
+     * still reach N48R3LOG (INV-D12). */
+    const R3WgLogFn log_fn = g.log_fn;
+    void *const log_user = g.log_user;
     zero_state();
+    g.log_fn = log_fn;
+    g.log_user = log_user;
     r3_wm_init(&g.manifest);
     for (uint32_t i = 0; i < R3_WG_WINDOW_COUNT; i++) {
         const uint32_t base = kWindows[i].absolute ? kWindows[i].offset
@@ -220,9 +255,18 @@ int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS])
     return 0;
 }
 
+int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS])
+{
+    return r3_writeguard_install_checked(seg, seg, false);
+}
+
 int r3_writeguard_install_mm(void)
 {
+    const R3WgLogFn log_fn = g.log_fn;
+    void *const log_user = g.log_user;
     zero_state();
+    g.log_fn = log_fn;
+    g.log_user = log_user;
     r3_wm_init(&g.manifest);
     for (uint32_t i = 0; i < R3_WG_MM_WINDOW_COUNT; i++)
         arm_window(i, kWindows[i].offset);
@@ -241,6 +285,11 @@ WVerdict note_allow(const R3WgGrant *matched, const char *ctx, uint32_t addr,
                     uint32_t dwords, WClass cls, const char *wm_tag)
 {
     g.txns++;
+    if (matched && !matched->range) {
+        const uintptr_t idx = static_cast<uintptr_t>(matched - g.grants);
+        if (idx < R3_WG_GRANT_MAX)
+            g.grant_hit[idx] = 1u;
+    }
     g.last_tag = wm_tag;
     g.last_context = ctx;
     r3_wm_record(&g.manifest, addr, dwords, g.owner, cls, WMStatus::Allow, wm_tag, ctx);
@@ -379,6 +428,16 @@ uint32_t r3_wg_grant_count(void)
 const R3WgGrant *r3_wg_grant(uint32_t index)
 {
     return index < g.grant_count ? &g.grants[index] : nullptr;
+}
+
+bool r3_wg_was_written(uint32_t addr)
+{
+    for (uint32_t i = 0; i < g.grant_count; i++) {
+        const R3WgGrant &gr = g.grants[i];
+        if (!gr.range && gr.start == addr && gr.dwords == 1u && g.grant_hit[i])
+            return true;
+    }
+    return false;
 }
 
 void r3_wg_arm_substep(WSubstep s)

@@ -295,16 +295,20 @@ void NaviR3Bringup::onStageStop(StageCtx &ctx, uint32_t index, StageResult resul
     if (!self || !ic) return;
     // K9 order: dump already ran in the dump hook; latch is owned by StageRunner; here the
     // reverse teardown of the IPs that actually started.
-    R3TeardownEnv te;
+    R3TeardownEnv te {};
     te.io = &ic->io;
     te.sub = &ic->env;
     te.failed = ic->failed;
+    te.failed_ip_valid = ic->failed_ip_valid;
     te.failed_ip = ic->failed_ip;
     const R3TeardownReport rep = r3_teardown_run(&te);
+    self->teardown_done_ = true;
     char line[192];
     snprintf(line, sizeof line,
-             "N48R3LOG teardown: triggered=%d acted=0x%x none=0x%x writes=%u failed=0x%x",
-             rep.triggered ? 1 : 0, rep.acted, rep.none, rep.writes, rep.write_fail);
+             "N48R3LOG teardown: triggered=%d acted=0x%x none=0x%x writes=%u failed=0x%x "
+             "ih_fail=%u",
+             rep.triggered ? 1 : 0, rep.acted, rep.none, rep.writes, rep.write_fail,
+             rep.ih_fail);
     IOLog("%s\n", line);
 }
 
@@ -405,6 +409,7 @@ bool NaviR3Bringup::start(IOService *provider) {
 
     // The integration context behind StageCtx::substep. Stage 0 still sees state_ via
     // StageCtx::user; the substeps see integ_.env (rt/ev/sink/ip/fb_mc_base).
+    integ_.failed_ip_valid = false;
     integ_.owner = this;
     integ_.stage = stage;
     integ_.sink.set_property = &NaviR3Bringup::setPropertyThunk;
@@ -1043,10 +1048,22 @@ void NaviR3Bringup::exportStage2Evidence() {
 }
 
 void NaviR3Bringup::stop(IOService *provider) {
-    // D-01/8e: teardown is handled by onStageStop when a substep fails during trigger.
-    // An armed-but-not-fired stop leaves the GPU in its read-only survey state (no
-    // writes to reverse); a fired stop disarms the writeguard (same as the original
-    // semantics — teardown already ran in onStageStop if a substep failed).
+    // D-01/8e: a failed substep already ran the reverse chain in onStageStop. #18: a
+    // power-up that completed successfully must also be reversed exactly once here;
+    // teardown_done_ keeps the two paths single-shot. An armed-but-not-fired stop never
+    // wrote the IPs, so the chain records "no reversible object" and writes nothing.
+    if (started_ && !teardown_done_) {
+        R3TeardownEnv te {};
+        te.io = &integ_.io;
+        te.sub = &integ_.env;
+        te.failed = integ_.failed;
+        te.failed_ip_valid = integ_.failed_ip_valid;
+        te.failed_ip = integ_.failed_ip;
+        const R3TeardownReport rep = r3_teardown_run(&te);
+        IOLog("N48R3LOG teardown: stop triggered=%d acted=0x%x none=0x%x writes=%u failed=0x%x\n",
+              rep.triggered ? 1 : 0, rep.acted, rep.none, rep.writes, rep.write_fail);
+        teardown_done_ = true;
+    }
     if (started_) {
         r3_writeguard_disarm();
         started_ = false;

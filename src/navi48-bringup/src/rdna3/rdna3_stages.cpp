@@ -217,11 +217,17 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
     if (dmu && dmu->numBases >= R3_WG_SEGS) {
         uint32_t seg[R3_WG_SEGS];
         for (uint32_t b = 0; b < R3_WG_SEGS; b++) seg[b] = dmu->bases[b];
-        arm_rc = r3_writeguard_install(seg);
+        /* #17: discovery is the only truthful source here; with a single snapshot the
+         * drift check has nothing to compare against, so it is reported as skipped and
+         * left non-enforcing (no fabricated second source). */
+        arm_rc = r3_writeguard_install_checked(seg, seg, false);
+        emitf(ctx, "stage2 prep: writeguard INSTALL-DRIFT-SKIP (single discovery source)");
     } else {
         arm_rc = r3_writeguard_install_mm();
     }
     if (arm_rc != 0) {
+        emitf(ctx, "stage2 prep: whitelist-arm rc=%d (segments=%s)", arm_rc,
+              (dmu && dmu->numBases >= R3_WG_SEGS) ? "dmu" : "mm");
         r3_integration_note_prep_failure(ic, "prep:whitelist-arm");
         return false;
     }
@@ -281,6 +287,11 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
     ic->env.hdp_flush_dword = hdp_dw;
     ic->env.hdp_flush_valid = true;
     ic->env.strict_expect = false;
+    /* #13: hand the runtime MES doorbell indices to the substeps. The mes substep fails
+     * closed (SET_HW) when mes_aggregated_valid is false, so a missing sync is loud. */
+    for (uint32_t i = 0; i < 5u; i++)
+        ic->env.mes_aggregated[i] = d.doorbell.index.mes_aggregated[i];
+    ic->env.mes_aggregated_valid = true;
 
     /* T-E: bind the sysmem allocator so GMC substeps (S6-S9) can allocate
      * D1-D3 system memory. The allocator was set up by the driver via
@@ -369,6 +380,7 @@ static StageResult run_substep(StageCtx &ctx, R3Ip ip,
     ic->rt.latch_bits |= R3_IP_BIT(ip);
     ic->failed = true;
     ic->failed_ip = ip;
+    ic->failed_ip_valid = true;
     return kStageFail;
 }
 
@@ -455,6 +467,7 @@ static StageResult run_generic(StageCtx &ctx, R3SubstepFn fn, const char *name)
           r.name ? r.name : "?", r.step, r.reading_count);
     emit_readings(ctx, ic, name, r);
     ic->failed = true;
+    ic->failed_ip_valid = false;
     return kStageFail;
 }
 
@@ -858,7 +871,7 @@ void r3_dump_failure_state(StageCtx &ctx) {
         R3DumpEnv de;
         de.io = &ic->io;
         de.sub = &ic->env;
-        de.has_failed_ip = true;
+        de.has_failed_ip = ic->failed_ip_valid;
         de.failed_ip = ic->failed_ip;
         r3_dump_failure_state(&de);
         return;

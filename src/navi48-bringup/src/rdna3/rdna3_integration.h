@@ -205,6 +205,7 @@ struct R3IntegrationCtx {
     R3IpOutcome       outcomes[R3_INTEG_MAX_OUTCOMES];
     uint32_t          outcome_count;
     R3Ip              failed_ip;       /* substep that stopped the ladder             */
+    bool              failed_ip_valid; /* failed_ip names a real IP (INV-D12)         */
     bool              failed;
 };
 

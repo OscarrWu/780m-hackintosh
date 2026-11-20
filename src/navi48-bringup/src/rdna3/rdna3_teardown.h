@@ -35,17 +35,19 @@ struct R3TeardownEnv {
     const R3Io *io;            /* register access; null => quiet skip                    */
     const R3SubstepEnv *sub;   /* rt (ready bits), ev, sink, ip table                    */
     bool failed;               /* true: failed_ip stopped the ladder                     */
-    R3Ip failed_ip;            /* only read when failed                                  */
+    bool failed_ip_valid;      /* failed_ip carries a real IP (T-E.5 / INV-D12)          */
+    R3Ip failed_ip;            /* only read when failed && failed_ip_valid               */
 };
 
 struct R3TeardownReport {
     bool triggered;      /* teardown was entered (a non-PSP IP had started)             */
     bool psp_failed;     /* PSP failure: stop + snapshot, no inverse                        */
     uint32_t started;    /* mese bits: ready | failed                                   */
-    uint32_t acted;      /* IPs whose teardown action ran (Mes/Sdma)                    */
-    uint32_t none;       /* IPs recorded as no-action (Gfx/Smu)                         */
+    uint32_t acted;      /* IPs whose teardown action ran (Mes/Sdma/Gfx; IH has no bit) */
+    uint32_t none;       /* IPs recorded as no-action (Smu, or rows absent)             */
     uint32_t skipped;    /* IPs never started (including PSP)                           */
     uint32_t write_fail; /* IPs whose action reported a quiet failure                   */
+    uint32_t ih_fail;    /* 1 when the IH action failed (no R3Ip bit; INV-D12)          */
     uint32_t writes;     /* allowed register writes performed                          */
 };
 

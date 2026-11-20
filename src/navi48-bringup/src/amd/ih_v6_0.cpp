@@ -385,6 +385,22 @@ R3SubstepResult pre(Ih &s)
         static_cast<unsigned long long>(s.wb_start + kIhRptrWbBytes),
         static_cast<unsigned long long>(s.ring_gpa),
         static_cast<unsigned long long>(s.wb_gpa));
+
+    /* Teardown grants (W1b): the inverse sequence writes IH_RB_CNTL/RPTR/WPTR, and the
+     * S10.0 disable already writes the same three addresses. A grant is an
+     * address+width+owner+class key, so registering it here also lets those power-up
+     * writes through (they were rejected while the IH had no grant at all). */
+    struct { uint32_t addr; const char *tag; } td[3] = {
+        {s.rb_cntl, "reg:teardown:ih-rb-cntl"},
+        {s.rb_rptr, "reg:teardown:ih-rb-rptr"},
+        {s.rb_wptr, "reg:teardown:ih-rb-wptr"},
+    };
+    for (uint32_t i = 0; i < 3u; i++) {
+        if (r3_wg_register_reg(td[i].addr, 1u, WClass::State, WSubstep::Ih, td[i].tag) != 0) {
+            evf(s.env, "ih-pre", "P3 teardown grant %s rejected", td[i].tag);
+            return r3_substep_fail(kR3SecPre, 8, "pre:ih-teardown-register");
+        }
+    }
     (void)r;
     return r;
 }
