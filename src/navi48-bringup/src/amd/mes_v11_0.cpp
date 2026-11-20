@@ -185,6 +185,8 @@ struct Mes {
     uint32_t             cmp_active, cmp_rptr;
     uint32_t             gfx_active, gfx_rptr;
     uint32_t             cntl_readback;
+    /* B#22: compute queues successfully added by S7 (CID2 = the second one). */
+    uint32_t             cmp_queues_added;
     uint32_t             gp3_sched;
     uint32_t             gp3_kiq;
     uint64_t             last_fence;
@@ -1462,6 +1464,13 @@ R3SubstepResult seq_set_hw(Mes &s)
     evf(s.env, "mes-set-hw", "S5 fence=0x%llx status=0x%llx wptr=%u",
         static_cast<unsigned long long>(s.last_fence),
         static_cast<unsigned long long>(s.last_status), s.sch_wptr);
+    /* B#22: record the resources actually handed to MES; readiness is confirmed
+     * only by MMIO polling (completion fences), no interrupt is routed to the OS. */
+    evf(s.env, "mes-chk",
+        "set_hw gds=0x%x gfx_mask=0x%x cmp_mask=0x%x sdma_mask=0x%x agg=%x,%x,%x,%x,%x",
+        p.gds_size, p.gfx_hqd_mask[0], p.compute_hqd_mask[0], p.sdma_hqd_mask[0],
+        p.aggregated_doorbells[0], p.aggregated_doorbells[1], p.aggregated_doorbells[2],
+        p.aggregated_doorbells[3], p.aggregated_doorbells[4]);
     return r3_substep_pass();
 }
 
@@ -1579,6 +1588,8 @@ R3SubstepResult seq_addq_compute(Mes &s)
         case SubmitResult::StatusTimeout: result = "fail:status";     break;
         case SubmitResult::IoFail:        result = "fail:io";         break;
         }
+        if (sr == SubmitResult::Ok)
+            s.cmp_queues_added++;
         if (sr != SubmitResult::IoFail) {
             s.cmp_fence = s.last_fence;
             s.cmp_status = s.last_status;
@@ -1631,6 +1642,10 @@ R3SubstepResult seq_addq_gfx(Mes &s)
         p.queue_type = kMesQueueTypeGfx;
         p.pipe_id = 0u;
         p.queue_id = 0u;
+        /* G19: map_legacy_kq is the MES ADD_QUEUE form of Linux's legacy-KQ
+         * mapping (mes_v11_0.c:493-516 sets map_legacy_kq=1); the KIQ-side
+         * equivalent is mes_v11_0_kiq_enable_queue -> kiq_map_queues
+         * (:1284-1300). Intentional, not an omission. */
         p.flags = kMesAddQueueFlagMapLegacyKq;
         memset(s.frame, 0, sizeof(s.frame));
         memcpy(s.frame, &p, sizeof(p));
@@ -1682,9 +1697,24 @@ R3SubstepResult seq_addq_gfx(Mes &s)
     return ret;
 }
 
-bool mc_prefix_ok(uint64_t addr)
+/* MC-form self-check (audit B#19/d-3): every ring/wb/mqd/eop address must lie
+ * inside the FB aperture discovered at runtime (MMMC_VM_FB_LOCATION_BASE/TOP,
+ * S-1). The old check compared the high dword against the constant 0x80, which
+ * is this board's nullarc observation (implementation plan v3 "MC form"), not
+ * an architectural value: a different FB placement would false-fail. Derive
+ * the window from mc_base/fb_top_raw instead (AMD IP discovery runtime base). */
+uint64_t fb_top_mc(const Mes &s)
 {
-    return (addr >> 32) == kMesMcPrefix;
+    return ((static_cast<uint64_t>(s.fb_top_raw & MMHUBRegs::kFBBaseMask))
+            << MMHUBRegs::kFBBaseShift) | 0xffffffull;
+}
+
+bool mc_in_fb_aperture(const Mes &s, uint64_t addr)
+{
+    if (s.mc_base == 0ull)
+        return false;
+    const uint64_t fb_top = fb_top_mc(s);
+    return fb_top >= s.mc_base && addr >= s.mc_base && addr <= fb_top;
 }
 
 R3SubstepResult chk_queues(Mes &s)
@@ -1707,26 +1737,35 @@ R3SubstepResult chk_queues(Mes &s)
         s.gfx_ring_mc, s.gfx_wb_mc, s.gfx_mqd_mc, s.gfx_eop_mc,
         s.cmp_ring_mc, s.cmp_wb_mc, s.cmp_mqd_mc, s.cmp_eop_mc,
     };
-    bool all_prefix = true;
+    bool all_form = true;
     for (uint32_t i = 0; i < sizeof(addrs) / sizeof(addrs[0]); i++) {
-        if (!mc_prefix_ok(addrs[i])) {
-            all_prefix = false;
-            evf(s.env, "mes-addr", "S9 address form bad @%u: 0x%llx", i,
+        if (!mc_in_fb_aperture(s, addrs[i])) {
+            all_form = false;
+            evf(s.env, "mes-addr", "S9 address outside FB aperture @%u: 0x%llx", i,
                 static_cast<unsigned long long>(addrs[i]));
         }
     }
+    /* B#22: readiness was obtained through MMIO only (CP_MES_CNTL readback in S1
+     * and completion fences in S5/S6); no IRQ is routed to the OS. CID2 is the
+     * second compute queue: stage 3's init_compute_vmid creates it, this
+     * bring-up adds one compute queue (S7), so the record derives to 0. */
+    evf(s.env, "mes-chk", "ready via MMIO (no IRQ); CID2=%u",
+        s.cmp_queues_added > 1u ? 1u : 0u);
     evf(s.env, "mes-queues",
         "S9 compute active=%u buf=%u rptr=%u gfx active=%u buf=%u rptr=%u",
         s.cmp_active, ca ? 1u : 0u, cr ? s.cmp_rptr : 0u,
         s.gfx_active, ga ? 1u : 0u, gr ? s.gfx_rptr : 0u);
+    const uint64_t fb_top = fb_top_mc(s);
     evf(s.env, "mes-addr",
-        "S9 kiq_ring=0x%llx sch_ring=0x%llx gfx_ring=0x%llx cmp_ring=0x%llx prefix=%s",
+        "S9 kiq_ring=0x%llx sch_ring=0x%llx gfx_ring=0x%llx cmp_ring=0x%llx "
+        "fb=0x%llx..0x%llx form=%s",
         static_cast<unsigned long long>(s.kiq_ring_mc),
         static_cast<unsigned long long>(s.sch_ring_mc),
         static_cast<unsigned long long>(s.gfx_ring_mc),
         static_cast<unsigned long long>(s.cmp_ring_mc),
-        all_prefix ? "0x80" : "bad");
-    if (!all_prefix) {
+        static_cast<unsigned long long>(s.mc_base),
+        static_cast<unsigned long long>(fb_top), all_form ? "ok" : "bad");
+    if (!all_form) {
         char q[128];
         snprintf(q, sizeof(q), "prefix=bad sch=0x%llx cmp=0x%llx gfx=0x%llx",
                  static_cast<unsigned long long>(s.sch_ring_mc),

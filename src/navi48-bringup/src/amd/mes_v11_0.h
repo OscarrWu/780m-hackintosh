@@ -183,7 +183,6 @@ constexpr uint32_t kMesAddQueueFlagMapLegacyKq = 1u << 13;
 
 constexpr uint32_t kMesTimeoutUs                = 2100000u; /* 2100 ms, Linux */
 constexpr uint32_t kMesPollUs                   = 100u;
-constexpr uint32_t kMesMcPrefix                 = 0x80u; /* high dword of the MC form */
 
 /* Wire header: type bits 0-3, opcode 4-11, dwsize 12-19 (little endian). */
 inline uint32_t mes_api_header(uint32_t type, uint32_t opcode, uint32_t dwsize)

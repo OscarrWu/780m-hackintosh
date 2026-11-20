@@ -1528,6 +1528,25 @@ static void test_pre_failures()
     }
 }
 
+static void test_mes_ready_record()
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d, true, true), "fixture");
+    RunResult rr = run(f);
+    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+    const char *text = n48log_host_text();
+    /* B#22: SET_HW resources handed to MES must be auditable: five aggregated
+     * doorbells and the per-engine HQD masks. */
+    CHECK(text && strstr(text,
+              "set_hw gds=0x1000 gfx_mask=0x2 cmp_mask=0xc sdma_mask=0xfc "
+              "agg=1a0,1a2,1a4,1a6,1a8") != nullptr,
+          "missing SET_HW resource record");
+    /* B#22: readiness is MMIO-only (no IRQ); CID2 is absent with a single
+     * compute queue, which must be recorded without failing the substep. */
+    CHECK(text && strstr(text, "ready via MMIO (no IRQ); CID2=0") != nullptr,
+          "missing MMIO readiness record");
+}
 } /* namespace */
 
 int main(void)
@@ -1540,6 +1559,7 @@ int main(void)
     test_set_hw_status_failure();
     test_set_hw_resources();
     test_hqd_write_order();
+    test_mes_ready_record();
     test_aggregated_doorbells_required();
     test_query_gate_unchanged();
     test_compute_addq_status_failure();
