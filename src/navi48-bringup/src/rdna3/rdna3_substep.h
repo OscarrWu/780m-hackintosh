@@ -332,6 +332,11 @@ struct R3SubstepEnv {
     // a missing window fails the substep before any submit.
     uint32_t           hdp_flush_dword;  // BAR5 dword; meaningful only when valid is true
     bool               hdp_flush_valid;
+    // A#13: aggregated doorbell DWORD offsets (Linux amdgpu_mes.c:56). The integration
+    // syncs these from DeviceContext.doorbell.index.mes_aggregated after bind_env; valid is
+    // false until then, and SET_HW fails closed rather than sending zero doorbells.
+    uint32_t           mes_aggregated[5];
+    bool               mes_aggregated_valid;
     bool               strict_expect;  // Step2: true=host test (expectation failure→substep fail)
                                       //        false=true hardware (record only, no gate)
 

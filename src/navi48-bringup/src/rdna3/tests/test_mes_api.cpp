@@ -85,6 +85,11 @@ struct ApiOp {
     uint32_t hw_flags;
     uint32_t os_tdr;
     uint32_t gc_base1;
+    uint32_t gds_size;
+    uint32_t gfx_hqd_mask0;
+    uint32_t compute_hqd_mask0;
+    uint32_t sdma_hqd_mask0;
+    uint32_t aggregated[5];
 };
 
 struct FenceOp {
@@ -250,6 +255,11 @@ static void mes_run(Dev &d, uint32_t wptr)
             a.hw_flags = p.flags;
             a.os_tdr = p.os_tdr_timeout_in_sec;
             a.gc_base1 = p.gc_base[1];
+            a.gds_size = p.gds_size;
+            a.gfx_hqd_mask0 = p.gfx_hqd_mask[0];
+            a.compute_hqd_mask0 = p.compute_hqd_mask[0];
+            a.sdma_hqd_mask0 = p.sdma_hqd_mask[0];
+            memcpy(a.aggregated, p.aggregated_doorbells, sizeof(a.aggregated));
         } else if (op == kMesApiAddQueue) {
             MesApiAddQueue p;
             memcpy(&p, &d.bar0[static_cast<size_t>(base)], sizeof(p));
@@ -607,6 +617,9 @@ static bool build_fixture(Fixture &f, Dev &d, bool psp_ready, bool gfx_ready)
     f.env.hdp_flush_dword = 0x80000u;
     f.env.hdp_flush_valid = true;
     f.env.strict_expect = true;
+    for (uint32_t i = 0; i < 5u; i++)
+        f.env.mes_aggregated[i] = 0x1A0u + 2u * i;
+    f.env.mes_aggregated_valid = true;
 
     memset(&f.io, 0, sizeof(f.io));
     f.io.ctx = &d;
@@ -1306,8 +1319,14 @@ static void test_set_hw_1_op19()
     RunResult rr = run(f);
     CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
     CHECK(rr.ready, "ready bit not set");
-    // Short path = 5 API submissions; S11 gp3=0x52 >= 0x47 adds 2 (compute+gfx ADD_QUEUE) = 7
-    CHECK(d.apis.size() == 7u, "api count=%zu", d.apis.size());
+    /* Short path = 5 API submissions (SET_HW, SET_HW_1, QUERY, S7 compute
+     * ADD_QUEUE, S8 gfx ADD_QUEUE). S11 must not re-submit ADD_QUEUE. */
+    CHECK(d.apis.size() == 5u, "api count=%zu", d.apis.size());
+    uint32_t addq = 0u;
+    for (size_t i = 0; i < d.apis.size(); i++)
+        if (d.apis[i].opcode == kMesApiAddQueue)
+            addq++;
+    CHECK(addq == 2u, "ADD_QUEUE count=%u", addq);
     if (d.apis.size() >= 2u)
         CHECK(d.apis[1].opcode == kMesApiSetHwRsrc1, "op1=%u", d.apis[1].opcode);
     char want[64];
@@ -1398,6 +1417,83 @@ static void test_s11_vmid8_ib_fence_timeout()
     CHECK(!rr.ready, "ready bit set on vmid8 ib failure");
 }
 
+static void test_hqd_write_order()
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d, true, true), "fixture");
+    RunResult rr = run(f);
+    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+
+    uint32_t ctl_seen = 0u;
+    uint32_t last_hqd = 0u;
+    uint32_t last_active = 0u;
+    bool rptr_written = false;
+    for (size_t i = 0; i < d.writes.size(); i++) {
+        const uint32_t off = d.writes[i] - kGc0;
+        if (off == kRegCpHqdPqRptr)
+            rptr_written = true;
+        if (off == kRegCpHqdPqControl) {
+            ctl_seen++;
+            CHECK(i >= 2u && d.writes[i - 2u] == kGc0 + kRegCpHqdPqRptrReportAddr &&
+                      d.writes[i - 1u] == kGc0 + kRegCpHqdPqRptrReportAddrHi,
+                  "PQ_CONTROL#%u not preceded by RPTR_REPORT lo/hi", ctl_seen);
+        }
+        if (off == kRegCpHqdPqRptr || off == kRegCpHqdPqControl ||
+            off == kRegCpHqdPqRptrReportAddr || off == kRegCpHqdPqRptrReportAddrHi ||
+            off == kRegCpHqdActive) {
+            last_hqd = static_cast<uint32_t>(i);
+            if (off == kRegCpHqdActive)
+                last_active = static_cast<uint32_t>(i);
+        }
+    }
+    CHECK(!rptr_written, "CP_HQD_PQ_RPTR written during queue init");
+    CHECK(ctl_seen == 2u, "PQ_CONTROL writes=%u", ctl_seen);
+    CHECK(last_hqd == last_active, "last HQD write is not ACTIVE=on (%u vs %u)",
+          last_hqd, last_active);
+}
+
+static void test_set_hw_resources()
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d, true, true), "fixture");
+    RunResult rr = run(f);
+    CHECK(rr.r.status == kR3SsecOk, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(!d.apis.empty() && d.apis[0].opcode == kMesApiSetHwRsrc,
+          "op0=%u", d.apis.empty() ? 0xffffffffu : d.apis[0].opcode);
+    if (d.apis.empty())
+        return;
+    CHECK(d.apis[0].gds_size == 0x1000u, "gds_size=0x%x", d.apis[0].gds_size);
+    CHECK(d.apis[0].gfx_hqd_mask0 == 0x2u, "gfx_hqd_mask=0x%x",
+          d.apis[0].gfx_hqd_mask0);
+    CHECK(d.apis[0].compute_hqd_mask0 == 0x0cu, "compute_hqd_mask=0x%x",
+          d.apis[0].compute_hqd_mask0);
+    CHECK(d.apis[0].sdma_hqd_mask0 == 0xfcu, "sdma_hqd_mask=0x%x",
+          d.apis[0].sdma_hqd_mask0);
+    CHECK(d.apis[0].aggregated[0] == 0x1A0u &&
+              d.apis[0].aggregated[1] == 0x1A2u &&
+              d.apis[0].aggregated[2] == 0x1A4u &&
+              d.apis[0].aggregated[3] == 0x1A6u &&
+              d.apis[0].aggregated[4] == 0x1A8u,
+          "aggregated doorbells not copied verbatim");
+}
+
+static void test_aggregated_doorbells_required()
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d, true, true), "fixture");
+    f.env.mes_aggregated_valid = false;
+    RunResult rr = run(f);
+    CHECK(rr.r.status == kR3SsecFail, "status=%u name=%s", rr.r.status, rr.r.name);
+    CHECK(strcmp(rr.r.name, "seq:set-hw") == 0, "name=%s", rr.r.name);
+    CHECK(rr.r.section == kR3SecSeq && rr.r.step == 5u, "section/step %u/%u",
+          rr.r.section, rr.r.step);
+    CHECK(d.apis.empty(), "SET_HW submitted without aggregated doorbells");
+    CHECK(!rr.ready, "ready bit set on fail-closed SET_HW");
+}
+
 static void test_pre_failures()
 {
     {
@@ -1442,6 +1538,9 @@ int main(void)
     test_gp3_zero_passes();
     test_gp3_read_fault();
     test_set_hw_status_failure();
+    test_set_hw_resources();
+    test_hqd_write_order();
+    test_aggregated_doorbells_required();
     test_query_gate_unchanged();
     test_compute_addq_status_failure();
     test_both_addq_rejected();

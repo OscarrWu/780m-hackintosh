@@ -66,6 +66,12 @@ constexpr uint32_t kRegCpHqdEopBaseAddr        = 0x1fce;
 constexpr uint32_t kRegCpHqdEopBaseAddrHi      = 0x1fcf;
 constexpr uint32_t kRegCpHqdEopControl         = 0x1fd0;
 
+/* Teardown-only HQD registers: declared for the S11 inverse objects, never written at
+ * power-up. Linux gc_11_0_0_offset.h:4646/4712/4714, BASE_IDX 0. */
+constexpr uint32_t kCpHqdDequeue               = 0x1fc1;
+constexpr uint32_t kCpHqdPqWptrLo              = 0x1fdf;
+constexpr uint32_t kCpHqdPqWptrHi              = 0x1fe0;
+
 /* CP GFX HQD registers, base 0 (S9 state export only). */
 
 constexpr uint32_t kRegCpGfxHqdRptr            = 0x1e88;

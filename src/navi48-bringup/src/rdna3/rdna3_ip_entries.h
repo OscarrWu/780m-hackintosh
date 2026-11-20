@@ -43,7 +43,7 @@ constexpr uint32_t kSdmaRowCount     = 17u;  // sdma_v6_0.cpp kSdmaRows[]（17 �
 constexpr uint32_t kMesLayoutCount   = 1u;   // mes_v11_0.cpp layout:mes 计 1 条
 constexpr uint32_t kMesRowCount      = 74u;  // mes_v11_0.cpp kMesRows[]（52 hub + 10 S0-S5 + 12 HQD）
 constexpr uint32_t kMesDoorbellCount = 4u;   // mes_v11_0.cpp kMesDoorbells[]（kiq+sch+cmp+gfx）
-constexpr uint32_t kMesQueueRowCount = 8u;   // mes_v11_0.cpp kMesQueueRows[]（2 dbrange+GRBM+5 S11）
+constexpr uint32_t kMesQueueRowCount = 11u;  // mes_v11_0.cpp kMesQueueRows[]（2 dbrange+GRBM+5 S11+3 拆除行）
 
 // ---- 阶段2之后（S6..S11 增量）常量 ----
 constexpr uint32_t kHdpGrantCount           = 1u;   // stages.cpp reg:hdp-flush 共享窗口 1 条
@@ -53,6 +53,9 @@ constexpr uint32_t kVmid8FirstInvalidateRow = 15u;  // S9 只注册前 15 行（
 constexpr uint32_t kVmid8RowCount           = 18u;  // 声明全集（expect 用；15..17 非 S9 注册）
 constexpr uint32_t kMesQueueLayoutCount     = 1u;   // mes S11 test_buf layout 计 1 条
 
+// ---- W1 拆除行（teardown-only，不属于阶段2 生产注册；由 TP-G1 在 gfx_v11_0.cpp 注册） ----
+constexpr uint32_t kGfxTeardownRowCount = 2u;   // CP_ME_CNTL + CP_MEC_CNTL，gfx_v11_0.cpp "reg:gfx-teardown"
+
 // ---- 派生合计（与实施蓝本附录 A 账目一一对应） ----
 constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
     kPspLayoutCount + kSdmaLayoutCount + kMesLayoutCount +
@@ -60,18 +63,18 @@ constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
 constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
     kPspRowCount + kSmuRowCount + kSdmaRowCount + kMesRowCount +
     kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
-    kGartRowCount + kVmid8FirstInvalidateRow;                        // = 148
+    kGartRowCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount;  // = 153
 constexpr uint32_t R3_WG_BUDGET_STAGE2 =
     kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
     kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
-    kMesQueueRowCount;                                               // = 118
+    kMesQueueRowCount;                                               // = 121
 constexpr uint32_t R3_WG_BUDGET_TOTAL =
-    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 162
+    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 167
 
-static_assert(R3_WG_BUDGET_STAGE2 == 118u, "阶段2 生产注册预算应为 118 项");
+static_assert(R3_WG_BUDGET_STAGE2 == 121u, "阶段2 生产注册预算应为 121 项");
 static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
-static_assert(R3_WG_BUDGET_REG_TOTAL == 148u, "全链 reg 预算应为 148 项");
-static_assert(R3_WG_BUDGET_TOTAL == 162u, "全链写守卫预算应为 162 项");
+static_assert(R3_WG_BUDGET_REG_TOTAL == 153u, "全链 reg 预算应为 153 项");
+static_assert(R3_WG_BUDGET_TOTAL == 167u, "全链写守卫预算应为 167 项");
 static_assert(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
               "写守卫 grant 容量小于全链预算：请同步 R3_WG_GRANT_MAX");
 

@@ -80,7 +80,6 @@ constexpr const char *kFailApiStatus     = "chk:api-status";
 constexpr const char *kFailAddrPrefix    = "chk:addr-prefix";
 constexpr const char *kFailS11Csib       = "seq:s11-csib";
 constexpr const char *kFailS11Dbrange    = "seq:s11-dbrange";
-constexpr const char *kFailS11Addq       = "seq:s11-addq";
 constexpr const char *kFailS11Wptr       = "seq:s11-wptr";
 constexpr const char *kFailS11Vmid8Ib    = "seq:s11-vmid8-ib";
 constexpr const char *kFailS11TestGrant  = "pre:test-buf-grant";
@@ -468,11 +467,13 @@ bool program_hqd(Mes &s, uint32_t me, uint32_t pipe, uint64_t mqd, uint64_t ring
                    static_cast<uint32_t>(ring >> 8), kR3WState, "mes-hqd")) return false;
     if (!reg_write(s, s.gc0 + kRegCpHqdPqBaseHi,
                    static_cast<uint32_t>(ring >> 40), kR3WState, "mes-hqd")) return false;
-    if (!reg_write(s, s.gc0 + kRegCpHqdPqControl, pq, kR3WState, "mes-hqd")) return false;
+    /* Linux mes_v11_0.c:1255-1262 writes the RPTR report address before
+     * PQ_CONTROL: the queue latches it when PQ_CONTROL enables it. */
     if (!reg_write(s, s.gc0 + kRegCpHqdPqRptrReportAddr, report_lo, kR3WState, "mes-hqd"))
         return false;
     if (!reg_write(s, s.gc0 + kRegCpHqdPqRptrReportAddrHi, report_hi, kR3WState, "mes-hqd"))
         return false;
+    if (!reg_write(s, s.gc0 + kRegCpHqdPqControl, pq, kR3WState, "mes-hqd")) return false;
     if (!reg_write(s, s.gc0 + kRegCpHqdPqWptrPollAddr, poll_lo, kR3WState, "mes-hqd"))
         return false;
     if (!reg_write(s, s.gc0 + kRegCpHqdPqWptrPollAddrHi, poll_hi, kR3WState, "mes-hqd"))
@@ -481,7 +482,6 @@ bool program_hqd(Mes &s, uint32_t me, uint32_t pipe, uint64_t mqd, uint64_t ring
         return false;
     if (!reg_write(s, s.gc0 + kRegCpHqdPersistentState, kCpHqdPersistentDefault,
                    kR3WState, "mes-hqd")) return false;
-    if (!reg_write(s, s.gc0 + kRegCpHqdPqRptr, 0u, kR3WState, "mes-hqd")) return false;
     if (!reg_write(s, s.hqd_active, kCpHqdActiveOn, kR3WState, "mes-hqd"))
         return false;
     return grbm_select(s, 0u, 0u, 0u, 0u);
@@ -1424,18 +1424,27 @@ R3SubstepResult seq_set_hw(Mes &s)
     p.header = mes_api_header(kMesApiTypeScheduler, kMesApiSetHwRsrc, kMesApiFrameDwords);
     p.vmid_mask_mmhub = 0xffffff00u;
     p.vmid_mask_gfxhub = 0xffffff00u;
-    p.gds_size = 0u;
+    p.gds_size = 0x1000u;
     p.paging_vmid = 0u;
     for (uint32_t i = 0; i < 4u; i++)
         p.compute_hqd_mask[i] = 0xcu;
-    p.gfx_hqd_mask[0] = 0xfffffffeu;
+    p.gfx_hqd_mask[0] = 0x2u;
     p.sdma_hqd_mask[0] = 0xfcu;
+    if (!s.env->mes_aggregated_valid) {
+        evf(s.env, "mes-set-hw", "S5 aggregated doorbells not synced");
+        return r3_substep_fail(kR3SecSeq, 5, kFailSetHw);
+    }
     p.g_sch_ctx_gpu_mc_ptr = s.sch_wb_mc + kMesWbSchCtxOff;
     p.query_status_fence_gpu_mc_ptr = s.sch_wb_mc + kMesWbQueryFenceOff;
     for (uint32_t i = 0; i < 5u; i++) {
         p.gc_base[i] = ip_get(s, IPBlock::GC, i);
         p.mmhub_base[i] = ip_get(s, IPBlock::MMHUB, i);
         p.osssys_base[i] = ip_get(s, IPBlock::OSSSYS, i);
+        p.aggregated_doorbells[i] = s.env->mes_aggregated[i];
+        if (i != 0u && p.aggregated_doorbells[i] != p.aggregated_doorbells[0] + 2u * i) {
+            evf(s.env, "mes-set-hw", "S5 aggregated doorbell stride != 2 at %u", i);
+            return r3_substep_fail(kR3SecSeq, 5, kFailSetHw);
+        }
     }
     p.flags = kMesFlagsDisableReset | kMesFlagsUseDiffVmidCompute |
               kMesFlagsDisableMesLog | kMesFlagsLevelProcessQuantum |
@@ -1931,99 +1940,12 @@ R3SubstepResult seq_s11(Mes &s)
             s.mec_db_range_lower, s.mec_db_range_upper);
     }
 
-    /* --- 4. ADD_QUEUE full payload (R10 §4.5): page_table_base_addr,
-     * process_va_start/end, etc. --- */
-    {
-        /* Rebuild compute MQD with full context (MQD already zeroed in S7). */
-        if (!build_compute_mqd(s, s.cmp_mqd_bar0, s.cmp_ring_bar0, s.cmp_wb_bar0,
-                               s.cmp_eop_bar0, kMesDoorbellCompute,
-                               kMesCmpRingDwords)) {
-            evf(s.env, "mes-s11", "S11 compute MQD rebuild failed");
-            return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
-        }
-
-        /* Rebuild GFX MQD similarly. */
-        if (!build_gfx_mqd(s, s.gfx_mqd_bar0, s.gfx_ring_bar0, s.gfx_wb_bar0,
-                           s.gfx_eop_bar0, kMesDoorbellGfx)) {
-            evf(s.env, "mes-s11", "S11 gfx MQD rebuild failed");
-            return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
-        }
-
-        /* Compute ADD_QUEUE with full payload (R10 §4.5). */
-        {
-            MesApiAddQueue p;
-            memset(&p, 0, sizeof(p));
-            p.header = mes_api_header(kMesApiTypeScheduler, kMesApiAddQueue,
-                                      kMesApiFrameDwords);
-            p.process_id = 0u;
-            p.page_table_base_addr = s.page_table_base_addr; /* resolved from sysmem_grants D2 root or 0 */
-            p.process_va_start = 0ull;
-            p.process_va_end = 0xFFFFFFFFFFFFFFFFull;
-            p.process_quantum = 100000ull;
-            p.gang_quantum = 10000ull;
-            p.doorbell_offset = kMesDoorbellCompute;
-            p.mqd_addr = s.cmp_mqd_mc;
-            p.wptr_addr = s.cmp_wb_mc + kMesWbWptrOff;
-            p.queue_type = kMesQueueTypeCompute;
-            p.pipe_id = 0u;
-            p.queue_id = 0u;
-            p.flags = kMesAddQueueFlagMapLegacyKq;
-            /* vm_context_cntl from D2 root; placeholder 0 for now. */
-            p.vm_context_cntl = 0u;
-
-            memset(s.frame, 0, sizeof(s.frame));
-            memcpy(s.frame, &p, sizeof(p));
-            const SubmitResult sr = submit_api(s, kMesApiAddQueue,
-                static_cast<uint32_t>(offsetof(MesApiAddQueue, api_status)));
-            if (sr != SubmitResult::Ok) {
-                const char *why = (sr == SubmitResult::FenceTimeout) ? "fence-timeout" :
-                                  (sr == SubmitResult::StatusTimeout) ? "status-timeout" : "io-fail";
-                evf(s.env, "mes-s11", "S11 compute ADD_QUEUE full-payload %s", why);
-                return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
-            }
-            evf(s.env, "mes-s11",
-                "S11 compute ADD_QUEUE (full) ok fence=0x%llx status=0x%llx wptr=%u",
-                static_cast<unsigned long long>(s.last_fence),
-                static_cast<unsigned long long>(s.last_status), s.sch_wptr);
-        }
-
-        /* GFX ADD_QUEUE with full payload. */
-        {
-            MesApiAddQueue p;
-            memset(&p, 0, sizeof(p));
-            p.header = mes_api_header(kMesApiTypeScheduler, kMesApiAddQueue,
-                                      kMesApiFrameDwords);
-            p.process_id = 0u;
-            p.page_table_base_addr = s.page_table_base_addr;
-            p.process_va_start = 0ull;
-            p.process_va_end = 0xFFFFFFFFFFFFFFFFull;
-            p.process_quantum = 100000ull;
-            p.gang_quantum = 10000ull;
-            p.doorbell_offset = kMesDoorbellGfx;
-            p.mqd_addr = s.gfx_mqd_mc;
-            p.wptr_addr = s.gfx_wb_mc + kMesWbWptrOff;
-            p.queue_type = kMesQueueTypeGfx;
-            p.pipe_id = 0u;
-            p.queue_id = 0u;
-            p.flags = kMesAddQueueFlagMapLegacyKq;
-            p.vm_context_cntl = 0u;
-
-            memset(s.frame, 0, sizeof(s.frame));
-            memcpy(s.frame, &p, sizeof(p));
-            const SubmitResult sr = submit_api(s, kMesApiAddQueue,
-                static_cast<uint32_t>(offsetof(MesApiAddQueue, api_status)));
-            if (sr != SubmitResult::Ok) {
-                const char *why = (sr == SubmitResult::FenceTimeout) ? "fence-timeout" :
-                                  (sr == SubmitResult::StatusTimeout) ? "status-timeout" : "io-fail";
-                evf(s.env, "mes-s11", "S11 gfx ADD_QUEUE full-payload %s", why);
-                return r3_substep_fail(kR3SecSeq, 11, kFailS11Addq);
-            }
-            evf(s.env, "mes-s11",
-                "S11 gfx ADD_QUEUE (full) ok fence=0x%llx status=0x%llx",
-                static_cast<unsigned long long>(s.last_fence),
-                static_cast<unsigned long long>(s.last_status));
-        }
-    }
+    /* S11 used to rebuild the compute/gfx MQDs and re-submit ADD_QUEUE with a
+     * full payload. S7 (compute) and S8 (gfx) already issued the single
+     * ADD_QUEUE that Linux mes_v11_0_hw_init issues (AMDKFD ADD_QUEUE is
+     * per-process). A second ADD_QUEUE for the same queue is not a legal
+     * upstream sequence (mes_v11_0.c only calls it once per queue init), so
+     * the duplicate block is removed. */
 
     /* --- 5. wptr discipline check: WB+16 must precede doorbell --- */
     {
@@ -2223,7 +2145,8 @@ R3SubstepResult mes_queue_v11_0_substep(const R3Io *io, const R3SubstepEnv *env)
  *
  * After T-E split (mes_queue_v11_0_substep introduction), this is split into two tables:
  *   kMesRows[74] for mes_v11_0_substep (S-1..S6): 52 hub-pre + 10 S0-S5 rows.
- *   kMesQueueRows[19] for mes_queue_v11_0_substep (S7..S11): 14 ADD_QUEUE rows + 5 S11 rows.
+ *   kMesQueueRows[11] for mes_queue_v11_0_substep (S7..S11): 2 GFX dbrange + 1 GRBM
+ *   select + 5 S11 rows + 3 teardown-only rows.
  * Doorbell rows (kMesDoorbells) are shared and registered by both entries.
  */
 namespace {
@@ -2299,7 +2222,7 @@ constexpr R3WriteRowReg kMesRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPersistentState, 1, WClass::State, WNeed::Required,   "mes-hqd-persistent"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqBase, 1, WClass::State,       WNeed::Required,      "mes-hqd-pq-base"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqBaseHi, 1, WClass::State,     WNeed::Required,      "mes-hqd-pq-base-hi"},
-    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqRptr, 1, WClass::State,       WNeed::Required,      "mes-hqd-pq-rptr"},
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqRptr, 1, WClass::State,       WNeed::OnFailure,     "mes-hqd-pq-rptr"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqRptrReportAddr, 1, WClass::State, WNeed::Required,  "mes-hqd-rptr-report"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqRptrReportAddrHi, 1, WClass::State, WNeed::Required, "mes-hqd-rptr-report-hi"},
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kRegCpHqdPqWptrPollAddr, 1, WClass::State, WNeed::Required,    "mes-hqd-wptr-poll"},
@@ -2311,7 +2234,8 @@ constexpr R3WriteRowReg kMesRows[] = {
 static_assert(sizeof(kMesRows) / sizeof(kMesRows[0]) == kMesRowCount,
               "mes declaration table must have 74 rows (52 hub + 10 S0-S5 + 12 HQD)");
 
-/* Queue substep rows (S7..S11): 2 GFX dbrange + 1 GRBM select + 5 S11 rows = 8.
+/* Queue substep rows (S7..S11): 2 GFX dbrange + 1 GRBM select + 5 S11 rows + 3
+ * teardown-only rows = 11.
  * GRBM_GFX_CNTL row: chk_queues (S9) calls grbm_select() twice (mes_v11_0.cpp:1605/1610)
  * which writes gc1+kRegGrbmGfxCntl — the row is declared at i=29 in kMesRows for the
  * MES entry, but the queue entry arms a separate expectation set, so S9's GRBM writes
@@ -2332,9 +2256,15 @@ constexpr R3WriteRowReg kMesQueueRows[] = {
     {&r3gold::kRlcCsibLength, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State,      WNeed::OnSuccessPath, "mes-s11-csib"},
     {&r3gold::kCpMecDoorbellRangeLower, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State, WNeed::OnSuccessPath, "mes-s11-dbrange"},
     {&r3gold::kCpMecDoorbellRangeUpper, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1, WClass::State, WNeed::OnSuccessPath, "mes-s11-dbrange"},
+    /* Rows 8-10: S11 inverse objects. Never written at power-up (the hardware clears
+     * DEQUEUE; WPTR/RPTR are polled, not driven), declared for teardown. */
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kCpHqdDequeue,  1, WClass::State, WNeed::Optional, "reg:teardown:mes-hqd-dequeue"},
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kCpHqdPqWptrLo, 1, WClass::State, WNeed::Optional, "reg:teardown:mes-hqd-wptr-lo"},
+    {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kCpHqdPqWptrHi, 1, WClass::State, WNeed::Optional, "reg:teardown:mes-hqd-wptr-hi"},
 };
 static_assert(sizeof(kMesQueueRows) / sizeof(kMesQueueRows[0]) == kMesQueueRowCount,
-              "mes queue declaration table must have 8 rows (2 GFX dbrange + 1 GRBM + 5 S11)");
+              "mes queue declaration table must have 11 rows (2 GFX dbrange + 1 GRBM + 5 S11 "
+              "+ 3 teardown-only)");
 
 constexpr const char *kMesLayoutTag = "mes";
 
