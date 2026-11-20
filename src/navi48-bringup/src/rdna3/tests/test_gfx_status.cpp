@@ -1,9 +1,9 @@
 /*
- * test_gfx_status.cpp - host tests for the GFX 11.0.1 read-only readiness substep
+ * test_gfx_status.cpp - host tests for the GFX 11.0.1 readiness + constants-init substep
  * (K6 / requirement C3.1-C3.3, tech plan §3.3 + §8.1 + §10).
  *
- * Everything runs on a RAM-backed fake of BAR5: the substep issues no write, so the fake
- * only has to answer dword reads and prove that no write ever reaches it. Golden values
+ * Everything runs on a RAM-backed fake of BAR5: the substep's only writes are the declared
+ * W1.5 rows, so the fake records every write and proves nothing else reaches it. Golden values
  * come from independent sources, never from the code under test (H4):
  *
  *   Offsets  re-transcribed here from gc_11_0_0_offset.h / gc_11_0_0_sh_mask.h (the
@@ -48,18 +48,33 @@ struct RegSeq {
 struct Dev {
     std::vector<uint32_t> bar5;
     std::vector<uint32_t> reads;        // BAR5 dwords read, in order
-    std::vector<uint32_t> writes;       // BAR5 dwords written, in order (must stay empty)
+    std::vector<uint32_t> writes;       // BAR5 dwords written, in order (declared rows only)
     std::vector<RegSeq>   seqs;         // per-address read sequences
     std::vector<uint32_t> fail_reads;   // addresses whose read returns false
     uint64_t now;
+    uint32_t vmid;                      // GRBM_GFX_CNTL.VMID selector (value >> 4)
+    uint32_t shm_config[16];            // SH_MEM_CONFIG per VMID
+    uint32_t shm_bases[16];             // SH_MEM_BASES per VMID
 
     Dev()
     {
         bar5.assign(kBar5Dwords, 0);
         now = 1000;
+        vmid = 0;
+        memset(shm_config, 0, sizeof shm_config);
+        memset(shm_bases, 0, sizeof shm_bases);
     }
 
     void set(uint32_t base, uint32_t off, uint32_t v) { bar5[base + off] = v; }
+
+    // SH_MEM_CONFIG/BASES are selected by GRBM_GFX_CNTL.VMID; preset all 16 slots.
+    void set_shmem_all(uint32_t config, uint32_t bases)
+    {
+        for (int v = 0; v < 16; v++) {
+            shm_config[v] = config;
+            shm_bases[v] = bases;
+        }
+    }
 
     // Two-sample sequence for a stability register: first read -> a, second -> b.
     void seq2(uint32_t base, uint32_t off, uint32_t a, uint32_t b)
@@ -80,8 +95,18 @@ static bool io_mmio(void *, uint32_t dword, uint32_t *value, bool write)
 {
     if (dword >= kBar5Dwords)
         return false;
+    const uint32_t gfx_cntl  = kGcBase1 + 0x0900u;   // GRBM_GFX_CNTL (VMID selector)
+    const uint32_t shm_cfg   = kGcBase1 + 0x09E4u;   // SH_MEM_CONFIG
+    const uint32_t shm_bases = kGcBase1 + 0x09E3u;   // SH_MEM_BASES
     if (write) {
         g_dev->writes.push_back(dword);
+        if (dword == gfx_cntl) {
+            g_dev->vmid = (*value >> 4) & 0xFu;
+        } else if (dword == shm_cfg) {
+            g_dev->shm_config[g_dev->vmid] = *value;
+        } else if (dword == shm_bases) {
+            g_dev->shm_bases[g_dev->vmid] = *value;
+        }
         g_dev->bar5[dword] = *value;
         return true;
     }
@@ -97,6 +122,18 @@ static bool io_mmio(void *, uint32_t dword, uint32_t *value, bool write)
     for (uint32_t a : g_dev->fail_reads)
         if (a == dword)
             return false;
+    if (dword == gfx_cntl) {
+        *value = g_dev->vmid << 4;
+        return true;
+    }
+    if (dword == shm_cfg) {
+        *value = g_dev->shm_config[g_dev->vmid];
+        return true;
+    }
+    if (dword == shm_bases) {
+        *value = g_dev->shm_bases[g_dev->vmid];
+        return true;
+    }
     *value = g_dev->bar5[dword];
     return true;
 }
@@ -204,6 +241,7 @@ static RunResult run(Fixture &f, Dev &d)
     n48log_host_reset();
     r3_ev_init(&f.ev);
     f.prop_count = 0;
+    r3_writeguard_install_mm();   // arms the MM windows; the substep declares its own rows
     RunResult out;
     out.t0 = d.now;
     out.deny_before = r3_writeguard_deny_count();
@@ -212,6 +250,17 @@ static RunResult run(Fixture &f, Dev &d)
     out.t1 = d.now;
     out.ready_bit = (f.rt.ready_bits & R3_IP_BIT(R3Ip::Gfx)) != 0u;
     return out;
+}
+
+// The only writes the substep may issue are the four W1.5 declaration rows.
+static bool only_w15_writes(const Dev &d)
+{
+    for (uint32_t a : d.writes) {
+        if (a != kGcBase0 + 0x0DA0u && a != kGcBase1 + 0x0900u &&
+            a != kGcBase1 + 0x09E4u && a != kGcBase1 + 0x09E3u)
+            return false;
+    }
+    return true;
 }
 
 static bool ev_has(const Fixture &f, const char *needle)
@@ -286,7 +335,15 @@ static void test_happy_path()
 
     CHECK(rr.r.status == kR3SsecOk, "happy path succeeded: %s", rr.r.name);
     CHECK(rr.ready_bit, "GFX ready bit set on success");
-    CHECK(d.writes.empty(), "GFX substep issued %zu writes (must be 0)", d.writes.size());
+    CHECK(d.bar5[kGcBase0 + 0x0DA0u] == 0xFFu, "GRBM_CNTL.READ_TIMEOUT=0xff");
+    CHECK(d.bar5[kGcBase1 + 0x09E4u] == 0x0000C00Cu, "SH_MEM_CONFIG=0xC00C");
+    CHECK(d.bar5[kGcBase1 + 0x09E3u] == 0x20001000u, "SH_MEM_BASES=0x20001000");
+    CHECK(only_w15_writes(d), "only declared W1.5 registers written (%zu)", d.writes.size());
+    for (int v = 8; v < 16; v++) {
+        CHECK(d.shm_config[v] == 0u && d.shm_bases[v] == 0u,
+              "VMID%d left to init_compute_vmid (config=0x%08x bases=0x%08x)", v,
+              d.shm_config[v], d.shm_bases[v]);
+    }
     CHECK(rr.deny_after == rr.deny_before, "no whitelist DENY (%llu)",
           (unsigned long long)(rr.deny_after - rr.deny_before));
 
@@ -327,7 +384,7 @@ static void test_all_zero()
     CHECK(strcmp(rr.r.name, "chk:imu-not-running") == 0, "all-zero reason: %s", rr.r.name);
     CHECK(rr.r.section == kR3SecChk && rr.r.step == 1u, "all-zero section/step");
     CHECK(!rr.ready_bit, "no ready bit on failure");
-    CHECK(d.writes.empty(), "no writes on failure");
+    CHECK(only_w15_writes(d), "no undeclared writes on failure");
     CHECK(prop_is(f, "N48R3EVID-gfx-done", "No"), "gfx-done property No");
 }
 
@@ -341,7 +398,7 @@ static void test_imu_read_failure()
     RunResult rr = run(f, d);
     CHECK(rr.r.status == kR3SsecFail && strcmp(rr.r.name, "chk:imu-unreadable") == 0,
           "IMU read failure: %s", rr.r.name);
-    CHECK(d.writes.empty(), "no writes");
+    CHECK(only_w15_writes(d), "no undeclared writes");
 }
 
 static void test_records_not_gated()
@@ -376,7 +433,7 @@ static void test_bootload_absent()
     CHECK(rr.t1 - rr.t0 >= amdgpu::kGfx11AutoloadTimeoutUs,
           "waited the full budget (%llu us)", (unsigned long long)(rr.t1 - rr.t0));
     CHECK(!rr.ready_bit, "no ready bit");
-    CHECK(d.writes.empty(), "no writes");
+    CHECK(only_w15_writes(d), "no undeclared writes");
 }
 
 static void test_bootload_unreadable()
@@ -500,6 +557,74 @@ static void test_preconditions()
     }
 }
 
+// =========================================================================================
+// W1.5: read-back gate (补遗-2), snapshot (补遗-3) and the declared grants
+// =========================================================================================
+static void test_shmem_idempotent()
+{
+    {
+        Fixture f;
+        Dev d;
+        CHECK(build_fixture(f, d), "fixture");
+        healthy(d);
+        d.set_shmem_all(0x0000C00Cu, 0x20001000u);
+        RunResult rr = run(f, d);
+        CHECK(rr.r.status == kR3SsecOk, "idempotent SH_MEM run: %s", rr.r.name);
+        uint32_t cfg_w = 0, bases_w = 0;
+        for (uint32_t a : d.writes) {
+            if (a == kGcBase1 + 0x09E4u) cfg_w++;
+            if (a == kGcBase1 + 0x09E3u) bases_w++;
+        }
+        CHECK(cfg_w == 0u, "equal SH_MEM_CONFIG not rewritten (got %u)", cfg_w);
+        CHECK(bases_w == 0u, "equal SH_MEM_BASES not rewritten (got %u)", bases_w);
+        CHECK(ev_has(f, "S0c shmem vmid15"), "补遗-3 readback snapshot logged");
+        CHECK(ev_has(f, "readback, observe only"), "snapshot marked observation-only");
+    }
+    {
+        Fixture f;
+        Dev d;
+        CHECK(build_fixture(f, d), "fixture");
+        healthy(d);
+        d.set_shmem_all(0x0000C00Cu, 0x0000C00Cu);
+        RunResult rr = run(f, d);
+        CHECK(rr.r.status == kR3SsecOk, "mismatched bases run: %s", rr.r.name);
+        uint32_t bases_w = 0;
+        for (uint32_t a : d.writes)
+            if (a == kGcBase1 + 0x09E3u) bases_w++;
+        CHECK(bases_w == 7u, "VMID1..7 bases rewritten, got %u", bases_w);
+        CHECK(d.bar5[kGcBase1 + 0x09E3u] == 0x20001000u, "bases corrected to 0x20001000");
+        for (int v = 8; v < 16; v++)
+            CHECK(d.shm_bases[v] == 0x0000C00Cu, "VMID%d untouched (0x%08x)", v,
+                  d.shm_bases[v]);
+    }
+}
+
+static void test_grants()
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d), "fixture");
+    healthy(d);
+    CHECK(run(f, d).r.status == kR3SsecOk, "grant run succeeded");
+    uint32_t td = 0, w15 = 0, bad = 0;
+    for (uint32_t i = 0; i < r3_wg_grant_count(); i++) {
+        const R3WgGrant *gr = r3_wg_grant(i);
+        if (!gr)
+            continue;
+        if (gr->owner != WSubstep::Gfx || gr->cls != WClass::State) {
+            bad++;
+            continue;
+        }
+        if (strcmp(gr->tag, "reg:gfx-teardown") == 0)
+            td++;
+        else if (strncmp(gr->tag, "reg:gfx-w1.5-", 13) == 0)
+            w15++;
+    }
+    CHECK(td == 2u, "two teardown halt grants, got %u", td);
+    CHECK(w15 == 4u, "four W1.5 grants, got %u", w15);
+    CHECK(bad == 0u, "no foreign grants in the Gfx run (%u)", bad);
+}
+
 int main()
 {
     printf("test_gfx_status: offsets + S1-S3 state machine\n");
@@ -515,6 +640,8 @@ int main()
     test_cp_busy_transient();
     test_imu_reset_witness();
     test_preconditions();
+    test_shmem_idempotent();
+    test_grants();
     printf("\n%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }
