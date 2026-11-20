@@ -51,6 +51,7 @@ R3SubstepResult abi_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
 #include "rdna3/rdna3_layout.h"
 #include "rdna3/rdna3_runtime.h"
 #include "rdna3/rdna3_substep.h"
+#include "amdgpu_ip.h"
 
 using namespace amdgpu;
 
@@ -59,8 +60,11 @@ namespace {
 constexpr uint64_t kFbMcBase = 0x8000000000ull;
 constexpr uint64_t kBar0Bytes = 0x10000000ull;
 constexpr uint32_t kBar5Dwords = 0x200000u;
-/* SCRATCH_REG0 BAR5 dword (compute_v11.cpp (E) reads it back here). */
-constexpr uint32_t kScratchDword = 0x2040u;
+/* GC base[1] planted in the fixture IP table (mimics discovery on this
+ * machine).  SCRATCH_REG0 declares BASE_IDX 1, so its BAR5 dword is
+ * GC base[1] + 0x2040 = 0x32040 here. */
+constexpr uint32_t kGc1Base = 0x30000u;
+constexpr uint32_t kScratchDword = kGc1Base + 0x2040u;
 /* SET_UCONFIG_REG window-relative offset naming SCRATCH_REG0 (0xC000+0x40). */
 constexpr uint32_t kUconfigWinOff = 0x40u;
 constexpr uint32_t kMagic = 0xCAFEDEADu;
@@ -94,6 +98,7 @@ struct BusOp {
     uint64_t off;
     bool write;
     uint32_t dwords;
+    uint64_t value;   /* write payload; 0 for reads */
 };
 
 struct DbOp {
@@ -278,6 +283,7 @@ static bool io_bus(void *ctx, uint32_t bar, uint64_t off, uint64_t *value, bool 
     bo.off = off;
     bo.write = write;
     bo.dwords = dwords;
+    bo.value = write ? *value : 0ull;
     d.vram_ops.push_back(bo);
     if (write)
         memcpy(&d.bar0[static_cast<size_t>(off)], value, static_cast<size_t>(dwords) * 4u);
@@ -320,6 +326,7 @@ struct Fixture {
     R3EvidenceLines ev;
     R3SubstepEnv env;
     R3Io io;
+    amdgpu::IPBaseTable ip;
 };
 
 static bool build_fixture(Fixture &f, Dev &d)
@@ -345,7 +352,10 @@ static bool build_fixture(Fixture &f, Dev &d)
     r3_ev_init(&f.ev);
 
     memset(&f.env, 0, sizeof(f.env));
+    f.ip = amdgpu::IPBaseTable();
+    f.ip.setBase(amdgpu::IPBlock::GC, 1, kGc1Base);
     f.env.rt = &f.rt;
+    f.env.ip = &f.ip;
     f.env.ev = &f.ev;
     f.env.fb_mc_base = kFbMcBase;
     f.env.strict_expect = true;
@@ -411,6 +421,9 @@ static void test_s13_happy_path(void)
     const uint64_t test_off = grant_start(plan, "test_buf");
     CHECK(mes_off != 0ull && csib_off != 0ull && test_off != 0ull, "s13 grants present");
     d.ring_off = cmp_ring_off;
+    /* Plant a stale released fence (the S11 seq) so only the pre-clear can
+     * make the first poll start from zero. */
+    b0_put64(d, cmp_fence_off, 1ull);
 
     R3SubstepResult r = compute_v11_0_substep(&f.io, &f.env);
     CHECK(r3_substep_ok(&r), "s13 happy path must pass (got %s)", r.name);
@@ -510,6 +523,23 @@ static void test_s13_happy_path(void)
     CHECK(saw_ring_r, "no bus drain read of the ring");
     CHECK(saw_fence_r, "no 2-dword bus fence poll");
     CHECK(saw_buf_r, "no bus read of the test buffer");
+
+    /* The fence slot is pre-cleared with a 2-dword zero write before the
+     * submit tail runs (L1; mes_v11_0.cpp:1773 order). */
+    bool saw_fence_w0 = false;
+    size_t fence_w_idx = static_cast<size_t>(-1);
+    size_t wb_w_idx = static_cast<size_t>(-1);
+    for (size_t i = 0; i < d.vram_ops.size(); i++) {
+        const BusOp &bo = d.vram_ops[i];
+        if (bo.write && bo.off == cmp_fence_off && bo.dwords == 2u && bo.value == 0ull) {
+            saw_fence_w0 = true;
+            fence_w_idx = i;
+        }
+        if (bo.write && bo.off == cmp_wb_off + kMesWbWptrOff && bo.dwords == 2u)
+            wb_w_idx = i;
+    }
+    CHECK(saw_fence_w0, "no 2-dword zero pre-clear of the fence slot");
+    CHECK(fence_w_idx < wb_w_idx, "fence pre-clear must precede the submit tail");
 }
 
 static void test_s13_missing_grant(void)
@@ -550,6 +580,47 @@ static void test_s13_fence_timeout(void)
     CHECK(strcmp(r.name, "fence-timeout") == 0, "name (got %s)", r.name);
     CHECK(r.section == kR3SecChk, "section (got %d)", r.section);
     CHECK(r.step == 6u, "step (got %u)", r.step);
+}
+
+static void test_s13_stale_fence_precleared(void)
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d), "stale-fence fixture");
+    const uint64_t mes_off = grant_start(f.rt.layout, "mes");
+    const uint64_t cmp_fence_off = mes_off + kMesCmpWbOff + kMesWbFenceOff;
+    d.ring_off = mes_off + kMesCmpRingOff;
+    /* S11 already released seq 1 into this slot; the CP never fires here. */
+    b0_put64(d, cmp_fence_off, 1ull);
+    d.stall_fence = true;
+
+    R3SubstepResult r = compute_v11_0_substep(&f.io, &f.env);
+    CHECK(!r3_substep_ok(&r), "stale fence must not fake completion");
+    CHECK(strcmp(r.name, "fence-timeout") == 0, "name (got %s)", r.name);
+    CHECK(b0_64(d, cmp_fence_off) == 0ull, "fence slot must be cleared before the poll");
+}
+
+static void test_s13_gc1_unresolved(void)
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d), "gc1-unresolved fixture");
+    d.ring_off = grant_start(f.rt.layout, "mes") + kMesCmpRingOff;
+    f.ip.setBase(amdgpu::IPBlock::GC, 1, 0xFFFFFFFFu);
+
+    R3SubstepResult r = compute_v11_0_substep(&f.io, &f.env);
+    CHECK(!r3_substep_ok(&r), "unresolved GC base[1] must fail");
+    CHECK(strcmp(r.name, "scratch-gc1-unresolved") == 0, "name (got %s)", r.name);
+    CHECK(r.section == kR3SecChk, "section (got %d)", r.section);
+    CHECK(r.step == 7u, "step (got %u)", r.step);
+    CHECK(strstr(n48log_host_text(), "GC base[1] unresolved") != nullptr,
+          "failure must be recorded in the log");
+
+    /* A null IP table is the same fail-closed case. */
+    f.env.ip = nullptr;
+    r = compute_v11_0_substep(&f.io, &f.env);
+    CHECK(!r3_substep_ok(&r), "null IP table must fail");
+    CHECK(strcmp(r.name, "scratch-gc1-unresolved") == 0, "null-ip name (got %s)", r.name);
 }
 
 static void test_s13_scratch_mismatch(void)
@@ -621,8 +692,10 @@ int main(void)
     test_s12();
     test_s13_happy_path();
     test_s13_missing_grant();
+    test_s13_stale_fence_precleared();
     test_s13_fence_timeout();
     test_s13_scratch_mismatch();
+    test_s13_gc1_unresolved();
     test_s13_buf_mismatch();
     test_s13_submit_abort();
     test_s13_null_io();

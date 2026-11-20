@@ -41,6 +41,7 @@
 #include "../rdna3/rdna3_substep.h"
 #include "../rdna3/rdna3_writeguard.h"
 #include "../rdna3/rdna3_ip_entries.h"
+#include "amdgpu_ip.h"
 #include "mes_v11_0.h"
 #include "pm4_v11.h"
 
@@ -257,7 +258,18 @@ R3SubstepResult amdgpu::compute_v11_0_substep(const R3Io *io, const R3SubstepEnv
         wptr += n;
     }
 
-    /* -- (C) Submit (doorbell) ------------------------------------------ */
+    /* -- (C) Pre-clear the fence, then submit (doorbell) ----------------- */
+    {
+        /* Clear the fence first: a stale value from S11 would make the first
+         * poll below pass immediately (same accessor as poll_fence64; the
+         * fence lives in the VRAM writeback page, mes_v11_0.cpp:1773). */
+        uint64_t zero = 0;
+        if (!io->bus(io->ctx, R3_IO_BAR_VRAM, cmp_fence_off, &zero, true, 2)) {
+            evf(env, "compute", "fence pre-clear failed at off 0x%llx",
+                static_cast<unsigned long long>(cmp_fence_off));
+            return r3_substep_fail(kR3SecSeq, 13, "fence-preclear-fail");
+        }
+    }
     {
         bool submitted = amdgpu::pm4_submit_tail(io, cmp_ring_off, cmp_wb_off,
                                          amdgpu::kMesDoorbellCompute,
@@ -285,7 +297,18 @@ R3SubstepResult amdgpu::compute_v11_0_substep(const R3Io *io, const R3SubstepEnv
 
     /* -- (E) Verify SET_UCONFIG_REG: read SCRATCH_REG0 via MMIO --------- */
     {
-        const uint32_t scratch_addr = 0x2040u;   /* GC base[0] */
+        /* Full address = GC base[1] + 0x2040 (0xC040 on this machine).
+         * SCRATCH_REG0 declares BASE_IDX 1, gc_11_0_0_offset.h:6917. */
+        const amdgpu::IPBaseTable *ip =
+            static_cast<const amdgpu::IPBaseTable *>(env->ip);
+        const uint32_t gc1_base =
+            ip ? ip->getBase(amdgpu::IPBlock::GC, 1) : 0xFFFFFFFFu;
+        if (gc1_base == 0xFFFFFFFFu) {
+            evf(env, "compute", "GC base[1] unresolved (ip=%p)",
+                static_cast<const void *>(ip));
+            return r3_substep_fail(kR3SecChk, 7, "scratch-gc1-unresolved");
+        }
+        const uint32_t scratch_addr = gc1_base + 0x2040u;
         bool ok = false;
         const uint32_t val = r3_io_read32(io, scratch_addr, &ok);
         if (!ok) {
