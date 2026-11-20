@@ -27,8 +27,9 @@
  *   - gmc_v11_0_bind_sysmem (called in stage0 prep) back-fills the
  *     sysmem_grants so BAR0 CPU maps work.
  *   - Layout grant "mes" contains ring/WB/MQD/EOP (C5 layout).
-- *   - Layout grant "test_buf" (D7) provides a 4096-byte page.
- *   - Layout grant "csib" (D4) holds the pre-loaded IB preamble.
+ *   - Layout grant "test_buf" (D7) provides the 1 MiB test buffer.
+ *   - Its page 0 (+0x800) holds the pre-loaded IB preamble; the CSIB
+ *     grant stays untouched for Gfx/RLC.
  *
  * Register source: gc_11_0_0_offset.h, pm4_v11.h.
  * PM4 packet format: pm4_v11.h.
@@ -55,12 +56,32 @@ constexpr uint32_t kComputeMagic    = 0xCAFEDEADu;
  * SET_UCONFIG_REG_START = 0xC000 → window offset = 0x40. */
 constexpr uint32_t kComputeScratchRegOff = 0x40u;
 
-/* Test buffer sub-offset inside the "test_buf" grant (D7, 4096 bytes). */
+/* Test buffer sub-offset inside the "test_buf" grant (D7, 1 MiB) for the
+ * WRITE_DATA target. */
 constexpr uint32_t kComputeBufOff = 0u;
 
-/* IB preamble (csib grant) holds exactly one RELEASE_MEM (8 dwords;
- * TYPE3 count=body-1 → packet3(op,6) carries 8 dwords, Linux emit_fence :6094). */
+/* IB preamble sub-offset inside the same grant: 2 KiB into the reserved
+ * page 0 (pages 0..2 belong to the S7/S8/S9/S13 verification pages,
+ * NaviR3Bringup.cpp:616-619; UMA BOs start at page 3). Kept clear of the
+ * WRITE_DATA target at kComputeBufOff. */
+constexpr uint32_t kComputeIbPreambleOff = 0x800u;
+
+/* IB preamble holds exactly one RELEASE_MEM (8 dwords; TYPE3 count=body-1 →
+ * packet3(op,6) carries 8 dwords, Linux gfx_v11_0.c emit_fence :6094). */
 constexpr uint32_t kComputeIbDw = 8u;
+
+/* Layout guard (L2): the preamble must stay inside D7 and must not overlap
+ * the WRITE_DATA target. The S11 RLC table (960 dw, mes_v11_0.cpp:1884)
+ * lives in the "mes"/CSIB area, so D7 keeps the two writers apart. */
+static_assert(kComputeIbPreambleOff >= 0x100u,
+              "IB preamble must not overlap the WRITE_DATA target");
+static_assert(kComputeIbPreambleOff + kComputeIbDw * 4u <= R3_D7_TEST_BUF_SIZE,
+              "IB preamble must fit inside the D7 test_buf grant");
+
+/* Stay inside D7 page 0: pages 1..2 are the S8/S9 (and S11 vmid8 IB) test
+ * pages (NaviR3Bringup.cpp:616-619, mes_v11_0.cpp:1760). */
+static_assert(kComputeIbPreambleOff + kComputeIbDw * 4u <= 0x1000u,
+              "IB preamble must stay inside test_buf page 0");
 
 /* Fence polling: 100 µs step, 2 s total. */
 constexpr uint32_t kComputeFenceStepUs = 100u;
@@ -159,11 +180,9 @@ R3SubstepResult amdgpu::compute_v11_0_substep(const R3Io *io, const R3SubstepEnv
     /* --- Locate grants --- */
     const R3Grant *mes_grant   = find_grant(plan, "mes");
     const R3Grant *test_grant  = find_grant(plan, "test_buf");
-    const R3Grant *csib_grant  = find_grant(plan, "csib");
 
-    if (!mes_grant || !test_grant || !csib_grant) {
-        const char *missing = !mes_grant ? "mes" :
-                              !test_grant ? "test_buf" : "csib";
+    if (!mes_grant || !test_grant) {
+        const char *missing = !mes_grant ? "mes" : "test_buf";
         evf(env, "compute", "grant '%s' not found in layout", missing);
         return r3_substep_fail(kR3SecPre, 0, "missing-grant");
     }
@@ -176,17 +195,18 @@ R3SubstepResult amdgpu::compute_v11_0_substep(const R3Io *io, const R3SubstepEnv
     const uint64_t cmp_ring_off = mes_off + amdgpu::kMesCmpRingOff;
     const uint64_t cmp_wb_off   = mes_off + amdgpu::kMesCmpWbOff;
     const uint64_t cmp_fence_off = mes_off + amdgpu::kMesCmpWbOff + amdgpu::kMesWbFenceOff;
+    /* IB preamble (RELEASE_MEM) lives in the D7 test buffer, not the CSIB
+     * grant: CSIB is the Gfx/RLC clear-state region (S11 writes its 960 dw
+     * table there), while the preamble is compute's own submission data. */
+    const uint64_t ib_off    = test_grant->start + kComputeIbPreambleOff;
 
-    /* IB preamble (RELEASE_MEM) goes at csib grant start. */
-    const uint64_t csib_off   = csib_grant->start;
-
-    /* Test buffer offset (D7). */
+    /* WRITE_DATA target in the same D7 grant. */
     const uint64_t test_off  = test_grant->start + kComputeBufOff;
 
     /* Fence sequence number. */
     constexpr uint32_t kSeq = 1u;
 
-    /* -- (A) Pre-load the IB preamble with RELEASE_MEM into csib grant ---
+    /* -- (A) Pre-load the IB preamble with RELEASE_MEM into the D7 page --
      * The IB contains exactly one RELEASE_MEM packet (8 dwords) that writes
      * the fence. We load it via the bus callback. */
     {
@@ -197,10 +217,10 @@ R3SubstepResult amdgpu::compute_v11_0_substep(const R3Io *io, const R3SubstepEnv
             evf(env, "compute", "RELEASE_MEM builder failed (n=%u)", n);
             return r3_substep_fail(kR3SecSeq, 1, "ib-build-release-mem");
         }
-        if (!bus_write_multi(io, csib_off, ib_pkt, n)) {
-            evf(env, "compute", "csib write failed at off 0x%llx",
-                static_cast<unsigned long long>(csib_off));
-            return r3_substep_fail(kR3SecSeq, 1, "csib-bar0-write");
+        if (!bus_write_multi(io, ib_off, ib_pkt, n)) {
+            evf(env, "compute", "IB write failed at off 0x%llx",
+                static_cast<unsigned long long>(ib_off));
+            return r3_substep_fail(kR3SecSeq, 1, "ib-bar0-write");
         }
     }
 
@@ -242,10 +262,10 @@ R3SubstepResult amdgpu::compute_v11_0_substep(const R3Io *io, const R3SubstepEnv
         wptr += n;
     }
 
-    /* (B3) INDIRECT_BUFFER: jump to csib preamble (RELEASE_MEM).  4 dwords.
-     * Uses the csib grant's VM address.  vmid=0, compute=true. */
+    /* (B3) INDIRECT_BUFFER: jump to the D7 preamble (RELEASE_MEM).  4 dwords.
+     * VM address = fb_mc + D7 offset (vmid0 FB aperture).  compute=true. */
     {
-        const uint64_t ib_va = fb_mc + csib_off;
+        const uint64_t ib_va = fb_mc + ib_off;
         uint32_t n = amdgpu::pm4_indirect_buffer(pkt, ib_va, kComputeIbDw, 0, true);
         if (n != 4) {
             evf(env, "compute", "INDIRECT_BUFFER builder failed (n=%u)", n);

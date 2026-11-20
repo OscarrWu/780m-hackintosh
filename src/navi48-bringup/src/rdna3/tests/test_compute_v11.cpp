@@ -12,9 +12,10 @@
  * firing the RELEASE_MEM fence (64-bit seq at the named MC address) - exactly
  * the effects compute_v11_0_substep then verifies through the same bus.
  *
- * Branches: full chain, missing grant, fence timeout, SCRATCH_REG0 mismatch,
- * test-buffer mismatch, submit-tail abort (hdp_flush false), null io/env, and
- * the S12 branches (null env, layout-not-ok, pass).
+ * Branches: full chain, missing test_buf grant, csib grant absent (S13 no
+ * longer needs it), fence timeout, SCRATCH_REG0 mismatch, test-buffer
+ * mismatch, submit-tail abort (hdp_flush false), null io/env, and the S12
+ * branches (null env, layout-not-ok, pass).
  *
  * Planted-break guards:
  *   - the RELEASE_MEM preload expectation is built HERE from the packet spec
@@ -24,8 +25,11 @@
  *   - the ring expectations pin the byte-offset semantics: SET_UCONFIG_REG at
  *     ring dword 0 (window offset 0x40, magic 0xCAFEDEAD), WRITE_DATA at
  *     dword 3 (dst = fb_mc + test_buf grant start), INDIRECT_BUFFER at
- *     dword 8 (IB = fb_mc + csib grant start, 8 dwords, vmid 0, VALID), so
- *     reordering the chain or swapping the two VM forms fails;
+ *     dword 8 (IB = fb_mc + test_buf grant start + 0x800, 8 dwords, vmid 0,
+ *     VALID), so reordering the chain or swapping the two VM forms fails;
+ *   - the preamble placement is pinned too: it must sit inside D7, clear of
+ *     the WRITE_DATA target, the S11 RLC table (mes + kMesCsibOff) and the
+ *     csib grant, and no bus write may land at the csib grant start;
  *   - every bus (VRAM) access must carry a carveout BYTE OFFSET (< the BAR0
  *     window), never an MC address, and the doorbell must be index 6 carrying
  *     the full wptr (12 dwords), so an MC-form bus offset or a partial wptr
@@ -68,6 +72,10 @@ constexpr uint32_t kScratchDword = kGc1Base + 0x2040u;
 /* SET_UCONFIG_REG window-relative offset naming SCRATCH_REG0 (0xC000+0x40). */
 constexpr uint32_t kUconfigWinOff = 0x40u;
 constexpr uint32_t kMagic = 0xCAFEDEADu;
+
+/* S13 IB preamble sub-offset inside the test_buf grant (page 0, clear of the
+ * WRITE_DATA target at the grant start). */
+constexpr uint64_t kIbPreambleOff = 0x800ull;
 
 /* Expected packet words, derived from the nvd.h shapes HERE (never from the
  * builders under test - a builder regression must fail these constants). */
@@ -413,13 +421,18 @@ static void test_s13_happy_path(void)
     CHECK(build_fixture(f, d), "s13 fixture");
 
     const R3LayoutPlan &plan = f.rt.layout;
+    const R3Grant *test_grant = r3_layout_grant(&plan, "test_buf");
+    const R3Grant *csib_grant = r3_layout_grant(&plan, "csib");
     const uint64_t mes_off = grant_start(plan, "mes");
     const uint64_t cmp_ring_off = mes_off + kMesCmpRingOff;
     const uint64_t cmp_wb_off = mes_off + kMesCmpWbOff;
     const uint64_t cmp_fence_off = cmp_wb_off + kMesWbFenceOff;
     const uint64_t csib_off = grant_start(plan, "csib");
     const uint64_t test_off = grant_start(plan, "test_buf");
-    CHECK(mes_off != 0ull && csib_off != 0ull && test_off != 0ull, "s13 grants present");
+    const uint64_t preamble_off = test_off + kIbPreambleOff;
+    CHECK(test_grant && csib_grant && mes_off != 0ull && csib_off != 0ull &&
+              test_off != 0ull,
+          "s13 grants present");
     d.ring_off = cmp_ring_off;
     /* Plant a stale released fence (the S11 seq) so only the pre-clear can
      * make the first poll start from zero. */
@@ -428,14 +441,15 @@ static void test_s13_happy_path(void)
     R3SubstepResult r = compute_v11_0_substep(&f.io, &f.env);
     CHECK(r3_substep_ok(&r), "s13 happy path must pass (got %s)", r.name);
 
-    /* (A) RELEASE_MEM preload at the csib grant start: 8-dword form, fence
-     * MC address = fb_mc + mes + kMesCmpWbOff + kMesWbFenceOff, seq 1. */
+    /* (A) RELEASE_MEM preload at test_buf + 0x800 (page 0 of D7): 8-dword
+     * form, fence MC address = fb_mc + mes + kMesCmpWbOff + kMesWbFenceOff,
+     * seq 1. */
     const uint64_t fence_mc = kFbMcBase + cmp_fence_off;
     const uint32_t rm[8] = {
-        b0_32(d, csib_off + 0ull),  b0_32(d, csib_off + 4ull),
-        b0_32(d, csib_off + 8ull),  b0_32(d, csib_off + 12ull),
-        b0_32(d, csib_off + 16ull), b0_32(d, csib_off + 20ull),
-        b0_32(d, csib_off + 24ull), b0_32(d, csib_off + 28ull),
+        b0_32(d, preamble_off + 0ull),  b0_32(d, preamble_off + 4ull),
+        b0_32(d, preamble_off + 8ull),  b0_32(d, preamble_off + 12ull),
+        b0_32(d, preamble_off + 16ull), b0_32(d, preamble_off + 20ull),
+        b0_32(d, preamble_off + 24ull), b0_32(d, preamble_off + 28ull),
     };
     CHECK(rm[0] == kExpRmW0, "rm w0 0x%x (want 0x%x)", rm[0], kExpRmW0);
     CHECK(rm[1] == kExpRmW1, "rm w1 0x%x (want 0x%x)", rm[1], kExpRmW1);
@@ -447,9 +461,32 @@ static void test_s13_happy_path(void)
     CHECK(rm[5] == 1u, "rm seq %u", rm[5]);
     CHECK(rm[6] == 0u && rm[7] == 0u, "rm pad w6=0x%x w7=0x%x", rm[6], rm[7]);
 
+    /* The preamble must live inside the D7 test_buf grant, clear of the
+     * WRITE_DATA target at the grant start, of the S11 RLC table (960 dw at
+     * mes + kMesCsibOff) and of the layout "csib" grant. */
+    const uint64_t rlc_off = mes_off + kMesCsibOff;
+    CHECK(preamble_off >= test_grant->start + 0x100ull &&
+              preamble_off + 32ull <= test_grant->end,
+          "preamble 0x%llx not inside test_buf [0x%llx,0x%llx)",
+          static_cast<unsigned long long>(preamble_off),
+          static_cast<unsigned long long>(test_grant->start),
+          static_cast<unsigned long long>(test_grant->end));
+    CHECK(preamble_off + 32ull <= test_grant->start + 0x1000ull,
+          "preamble must stay inside test_buf page 0 (S8/S9/S11 pages follow)");
+    CHECK(preamble_off + 32ull <= rlc_off || preamble_off >= rlc_off + 960ull * 4ull,
+          "preamble overlaps the S11 RLC table at 0x%llx",
+          static_cast<unsigned long long>(rlc_off));
+    CHECK(preamble_off + 32ull <= csib_grant->start || preamble_off >= csib_grant->end,
+          "preamble overlaps the csib grant");
+    /* S7's GART verification magic sits at page 0 + 0x100 (gmc_v11_0.h:92);
+     * the preamble must not clobber that slot either. */
+    CHECK(preamble_off + 32ull <= test_grant->start + 0x100ull ||
+              preamble_off >= test_grant->start + 0x104ull,
+          "preamble overlaps the S7 GART magic slot at test_buf+0x100");
+
     /* (B) ring packets at cmp_ring_off, byte-offset semantics per dword. */
     const uint64_t test_va = kFbMcBase + test_off;
-    const uint64_t ib_va = kFbMcBase + csib_off;
+    const uint64_t ib_va = kFbMcBase + preamble_off;
     const uint32_t ring[12] = {
         b0_32(d, cmp_ring_off + 0ull),   b0_32(d, cmp_ring_off + 4ull),
         b0_32(d, cmp_ring_off + 8ull),   b0_32(d, cmp_ring_off + 12ull),
@@ -503,11 +540,13 @@ static void test_s13_happy_path(void)
               "vram op %zu is not a carveout offset (bar %u off 0x%llx)", i,
               d.vram_ops[i].bar, static_cast<unsigned long long>(d.vram_ops[i].off));
     }
-    bool saw_csib_w = false, saw_ring_w = false, saw_wb_w = false;
+    bool saw_preamble_w = false, saw_csib_w = false, saw_ring_w = false;
+    bool saw_wb_w = false;
     bool saw_ring_r = false, saw_fence_r = false, saw_buf_r = false;
     for (size_t i = 0; i < d.vram_ops.size(); i++) {
         const BusOp &bo = d.vram_ops[i];
         if (bo.write) {
+            saw_preamble_w = saw_preamble_w || bo.off == preamble_off;
             saw_csib_w = saw_csib_w || bo.off == csib_off;
             saw_ring_w = saw_ring_w || bo.off == cmp_ring_off;
             saw_wb_w = saw_wb_w || (bo.off == cmp_wb_off + kMesWbWptrOff && bo.dwords == 2u);
@@ -517,7 +556,8 @@ static void test_s13_happy_path(void)
             saw_buf_r = saw_buf_r || bo.off == test_off;
         }
     }
-    CHECK(saw_csib_w, "no bus write at the csib grant start");
+    CHECK(saw_preamble_w, "no bus write at the IB preamble (test_buf+0x800)");
+    CHECK(!saw_csib_w, "IB preamble must not be written into the csib grant");
     CHECK(saw_ring_w, "no bus write at the compute ring start");
     CHECK(saw_wb_w, "no 2-dword bus write at the WB wptr slot");
     CHECK(saw_ring_r, "no bus drain read of the ring");
@@ -540,6 +580,34 @@ static void test_s13_happy_path(void)
     }
     CHECK(saw_fence_w0, "no 2-dword zero pre-clear of the fence slot");
     CHECK(fence_w_idx < wb_w_idx, "fence pre-clear must precede the submit tail");
+}
+
+static void test_s13_csib_grant_absent(void)
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d), "csib-absent fixture");
+    /* S13 no longer reads the D4 csib grant: drop it and the chain must
+     * still pass because the preamble lives in D7. */
+    bool dropped = false;
+    for (uint32_t i = 0; i < f.rt.layout.grant_count; i++) {
+        if (strcmp(f.rt.layout.grants[i].tag, "csib") == 0) {
+            for (uint32_t j = i; j + 1u < f.rt.layout.grant_count; j++)
+                f.rt.layout.grants[j] = f.rt.layout.grants[j + 1u];
+            f.rt.layout.grant_count--;
+            dropped = true;
+            break;
+        }
+    }
+    CHECK(dropped, "csib grant to drop");
+    d.ring_off = grant_start(f.rt.layout, "mes") + kMesCmpRingOff;
+
+    R3SubstepResult r = compute_v11_0_substep(&f.io, &f.env);
+    CHECK(r3_substep_ok(&r), "S13 must not require the csib grant (got %s)", r.name);
+    const uint64_t preamble_off =
+        grant_start(f.rt.layout, "test_buf") + kIbPreambleOff;
+    CHECK(b0_32(d, preamble_off) == kExpRmW0, "preamble w0 0x%x",
+          b0_32(d, preamble_off));
 }
 
 static void test_s13_missing_grant(void)
@@ -691,6 +759,7 @@ int main(void)
 {
     test_s12();
     test_s13_happy_path();
+    test_s13_csib_grant_absent();
     test_s13_missing_grant();
     test_s13_stale_fence_precleared();
     test_s13_fence_timeout();
