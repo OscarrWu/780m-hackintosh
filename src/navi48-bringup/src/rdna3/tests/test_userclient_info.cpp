@@ -16,6 +16,7 @@
 // without any real defect.
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOLib.h>   // dalshim: IOLog no-op
+#include "amd/pm4_v11.h"
 
 #include <cstdio>
 #include <cstring>
@@ -82,6 +83,11 @@ static void test_abi_pure(void) {
     CHECK(kN48R3SelBoFree == 3);
     CHECK(kN48R3SelSubmit == 4);
     CHECK(kN48R3SelFenceRead == 5);
+    CHECK(kN48R3SelReadLog == 10);     // 基座 Navi48UserClientABI.h:31
+    CHECK(kN48R3SelLogReset == 14);    // 基座 :48，避开 11 Metrics
+    CHECK(kN48R3SelLogConsume == 15);  // 基座 :53，避开 12 PowerState
+    CHECK((int)kN48R3SelLogReset != (int)kNavi48SelMetrics);
+    CHECK((int)kN48R3SelLogConsume != (int)kNavi48SelPowerState);
     CHECK(kN48R3SelBoImportHost == 21);
     CHECK(kN48R3DomainUMA == 0);
     CHECK(kN48R3DomainGTT == 1);
@@ -159,7 +165,13 @@ static void test_abi_pure(void) {
     uint32_t pkt[5];
     const uint32_t magic = 0xCAFEDEADu;
     CHECK(n48r3_pm4_write_data(pkt, fb + 0x100, magic) == 5);
-    CHECK(pkt[0] == 0xC0370003u && pkt[1] == 0x00100500u);
+    CHECK(pkt[0] == 0xC0033700u && pkt[1] == 0x00100500u);
+    // 头必须与 pm4_v11 的 packet3 构造一致（TYPE3, op 0x37, count 3）
+    CHECK(pkt[0] == ((amdgpu::kPm4Type3 << amdgpu::kPm4PacketTypeShift) |
+                     (amdgpu::kPm4OpWriteData << amdgpu::kPm4PacketOpShift) |
+                     (3u << amdgpu::kPm4PacketCountShift)));
+    CHECK(pkt[1] == ((amdgpu::kPm4WdDstSelMemory << amdgpu::kPm4WdDstSelShift) |
+                     amdgpu::kPm4WdWrConfirm));
     CHECK(pkt[2] == (uint32_t)((fb + 0x100) & 0xFFFFFFFFull));
     CHECK(pkt[3] == (uint32_t)((fb + 0x100) >> 32));
     CHECK(pkt[4] == magic);

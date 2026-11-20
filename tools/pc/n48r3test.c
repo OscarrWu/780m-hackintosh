@@ -1386,10 +1386,12 @@ static void test_abi_pure(void) {
                                  &out_h, &out_ibs) == -2,
             "cs_in_validate rejects illegal IB");
 
-    /* WRITE_DATA packet shape used by the compute round-trip. */
+    /* WRITE_DATA packet shape used by the compute round-trip.
+     * Header provenance: pm4_v11.cpp:46-59 packet3(0x37,3) / nullarc
+     * mesboot.c:227 (0xC0033700, 0x00100500, VA lo, VA hi, data). */
     n = n48r3_pm4_write_data(pkt, n48r3_va_strip(gva) + 0x100u,
                              N48R3_COMPUTE_MAGIC);
-    T_CHECK(n == 5 && pkt[0] == 0xC0370003u && pkt[1] == 0x00100500u &&
+    T_CHECK(n == 5 && pkt[0] == 0xC0033700u && pkt[1] == 0x00100500u &&
             pkt[2] == (uint32_t)((n48r3_va_strip(gva) + 0x100u) & 0xffffffffu) &&
             pkt[3] == (uint32_t)((n48r3_va_strip(gva) + 0x100u) >> 32) &&
             pkt[4] == N48R3_COMPUTE_MAGIC,

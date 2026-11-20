@@ -59,10 +59,11 @@ enum N48R3Selector {
     kN48R3SelFenceRead  = 5,   /* in: seq, timeout_us        out: observed(lo,hi), timed_out */
     /* 6-8 reserved */
 
-    /* 既有 log selectors（继承自 Navi48） */
+    /* 既有 log selectors（继承自 Navi48；基座 ABI 为 10/14/15，见
+     * Navi48UserClientABI.h:31,48,53 与 NaviR3UserClient.cpp:169-174 派发） */
     kN48R3SelReadLog    = 10,
-    kN48R3SelLogReset   = 11,
-    kN48R3SelLogConsume = 12,
+    kN48R3SelLogReset   = 14,
+    kN48R3SelLogConsume = 15,
 
     /* 登记编号、未实现：返回 kIOReturnUnsupported */
     kN48R3SelBoImportHost = 21,
@@ -242,13 +243,14 @@ static inline int n48r3_bo_alloc_args(uint64_t size, uint64_t domain)
 }
 
 /* WRITE_DATA 包构造（compute 子命令的用户 IB 用；值照 pm4_v11.cpp:46-59 的
- * golden 形态：0xC0370003 头 / 0x00100500 控制字 / dst lo / dst hi / data）。
+ * golden 形态：0xC0033700 头（TYPE3, op 0x37, count 3）/ 0x00100500 控制字 /
+ * dst lo / dst hi / data）。
  * dst 为 48 位 MC/VM 地址（用户侧用 n48r3_va_strip(gpu_va) 得到）。 */
 static inline int n48r3_pm4_write_data(uint32_t out[5], uint64_t dst_va48,
                                        uint32_t data)
 {
     if (!out || (dst_va48 & 3ull) != 0ull) return -1;
-    out[0] = 0xC0370003u;
+    out[0] = 0xC0033700u;
     out[1] = 0x00100500u;
     out[2] = (uint32_t)(dst_va48 & 0xFFFFFFFFull);
     out[3] = (uint32_t)(dst_va48 >> 32);
