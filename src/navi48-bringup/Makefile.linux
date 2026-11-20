@@ -142,7 +142,7 @@ CXX_SRCS := $(wildcard src/common/*.cpp src/rdna3/*.cpp) src/ipdiscovery.cpp src
                       src/amd/gfx_v11_*.cpp src/amd/sdma_v6_*.cpp \
                       src/amd/mes_v11_*.cpp src/amd/ih_v6_*.cpp \
                       src/amd/gmc_v11_*.cpp \
-                      src/amd/pm4_v11*.cpp src/amd/mqd_v11*.cpp src/amd/compute_v11*.cpp)
+                      src/amd/pm4_v11*.cpp src/amd/compute_v11*.cpp)
 
 C_SRCS   := src/kmod_info.c
 INFO_PLIST := Info-rdna3.plist
