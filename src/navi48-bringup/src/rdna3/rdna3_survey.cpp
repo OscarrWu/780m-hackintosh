@@ -177,9 +177,11 @@ static bool r3_aux_export(const TgtLogSink *sink, const R3AuxEvidence *ev) {
 // D3 line assembly: raw registers in, one evidence line out per discovery copy.
 // Phoenix carries the FB_LOCATION registers twice: the GC(gfxhub) copy at GC seg0
 // + 0x1678/0x1679/0x15a7 and the MMHUB copy at MMHUB seg1 + 0x8ec/0x8ed/0x8d7
-// (archived PhxNativeABI.h:68-70; Linux mmhub_v3_0_1.c:507/516). Which copy the
-// VBIOS programmed is not proven, so both are read and labelled; the target
-// dual-read decides the authoritative one. The system aperture is a logical page
+// (archived PhxNativeABI.h:68-70; Linux mmhub_v3_0_1.c:507/516). Linux reads the
+// FB location through MMHUB (gmc_v11_0.c:661, mmhub funcs get_fb_location), and
+// nullarc follows the same order, so MMHUB is primary and GC the fallback; both
+// are still read and labelled. A selected copy whose MC base is zero is not a
+// valid FB location and fails the gate. The system aperture is a logical page
 // number ( >>18 per gfxhub_v3_0.c:161-164 / mmhub_v3_0.c:178-181 ); the MMHUB
 // aperture offset is not archived, so only the GC copy carries the gtt conversion.
 // ---------------------------------------------------------------------------
@@ -222,8 +224,8 @@ static void r3_fb_line(char *out, size_t cap, R3FbCopy copy, const R3FbCopyWords
                  "PASS copy=%s fb_mc_base=0x%llx fb_mc_top=0x%llx fb_size=0x%llx "
                  "fb_offset=0x%llx gtt_lo=0x%llx gtt_hi=0x%llx gtt_size=0x%llx "
                  "raw_ap=0x%08x/0x%08x (aperture >>18 per gfxhub_v3_0.c:161-164/"
-                 "mmhub_v3_0.c:178-181 (archived); authoritative copy to be confirmed "
-                 "by dual-read on target)",
+                 "mmhub_v3_0.c:178-181 (archived); authoritative copy: MMHUB per "
+                 "gmc_v11_0.c:661, GC fallback)",
                  r3_fb_copy_label(copy), (unsigned long long)mc_base,
                  (unsigned long long)mc_top, (unsigned long long)fb_size,
                  (unsigned long long)((uint64_t)(w.fb_off & 0x00ffffffu) << 24),
@@ -233,18 +235,25 @@ static void r3_fb_line(char *out, size_t cap, R3FbCopy copy, const R3FbCopyWords
         snprintf(out, cap,
                  "PASS copy=%s fb_mc_base=0x%llx fb_mc_top=0x%llx fb_size=0x%llx "
                  "fb_offset=0x%llx system_aperture=not-read (MMHUB aperture offset not "
-                 "archived); authoritative copy to be confirmed by dual-read on target",
+                 "archived); authoritative copy: MMHUB per gmc_v11_0.c:661, GC fallback",
                  r3_fb_copy_label(copy), (unsigned long long)mc_base,
                  (unsigned long long)mc_top, (unsigned long long)fb_size,
                  (unsigned long long)((uint64_t)(w.fb_off & 0x00ffffffu) << 24));
     }
 }
 
-// Emits one line per copy. A copy is usable only when its discovery base resolved and every
-// word read back; the first usable copy (GC preferred) supplies the cached MC base.
+// Emits one line per copy for evidence. Selection follows the Linux order:
+// MMHUB first, GC as fallback (gmc_v11_0.c:661). A selected copy whose MC base
+// is zero is rejected: an all-zero FB location is not a valid answer, and
+// skipping it silently would hide a mis-programmed VBIOS.
 static bool r3_fb_emit(R3SurveyLines *lines, const R3FbCopyWords *copies,
                        uint64_t *mc_base_out) {
-    bool any = false;
+    static const R3FbCopy kPrefer[R3_FB_COPY_COUNT] = {
+        R3_FB_COPY_MMHUB,
+        R3_FB_COPY_GC,
+    };
+    bool usable[R3_FB_COPY_COUNT] = {};
+    uint64_t mc[R3_FB_COPY_COUNT] = {};
     for (int i = 0; i < R3_FB_COPY_COUNT; i++) {
         const R3FbCopy copy = (R3FbCopy)i;
         const R3FbCopyWords &w = copies[i];
@@ -262,13 +271,24 @@ static bool r3_fb_emit(R3SurveyLines *lines, const R3FbCopyWords *copies,
             continue;
         }
         char text[R3_SURVEY_LINE_CHARS];
-        uint64_t mc = 0;
-        r3_fb_line(text, sizeof text, copy, w, &mc);
+        r3_fb_line(text, sizeof text, copy, w, &mc[i]);
         r3_lines_add(lines, "d3-fb", text);
-        if (!any && mc_base_out) *mc_base_out = mc;
-        any = true;
+        usable[i] = true;
     }
-    return any;
+    if (mc_base_out) *mc_base_out = 0;
+    for (int i = 0; i < R3_FB_COPY_COUNT; i++) {
+        const R3FbCopy copy = kPrefer[i];
+        if (!usable[copy]) continue;
+        if (mc[copy] == 0) {
+            addf(lines, "d3-fb",
+                 "FAIL copy=%s fb_mc_base=0 (selected copy has no FB location)",
+                 r3_fb_copy_label(copy));
+            return false;
+        }
+        if (mc_base_out) *mc_base_out = mc[copy];
+        return true;
+    }
+    return false;
 }
 
 typedef uint32_t (*R3FbReadWord)(void *user, R3FbCopy copy, uint32_t reg);
@@ -287,15 +307,15 @@ static bool r3_fb_item(R3SurveyLines *lines, R3FbReadWord read, void *user,
         uint32_t ap_lo_reg, ap_hi_reg;
     };
     const Plan plans[R3_FB_COPY_COUNT] = {
+        {R3_FB_COPY_MMHUB, mmhub_available, 0x08ecu, 0x08edu, 0x08d7u, false, 0u, 0u},
         {R3_FB_COPY_GC,    gc_available,    0x1678u, 0x1679u, 0x15a7u, true,
          0x167du, 0x167eu},
-        {R3_FB_COPY_MMHUB, mmhub_available, 0x08ecu, 0x08edu, 0x08d7u, false, 0u, 0u},
     };
 
     R3FbCopyWords copies[R3_FB_COPY_COUNT] {};
     for (int i = 0; i < R3_FB_COPY_COUNT; i++) {
         const Plan &p = plans[i];
-        R3FbCopyWords &w = copies[i];
+        R3FbCopyWords &w = copies[p.copy];
         w.resolved = p.available;
         if (!p.available) continue;
         w.fb_base = read(user, p.copy, p.base_reg);

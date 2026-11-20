@@ -390,7 +390,7 @@ static uint32_t fake_fb_read(void *user, R3FbCopy copy, uint32_t reg) {
 static void test_fb_dual_copy() {
     // Fake discovery: both copies resolved with distinct words. The survey must read the GC
     // copy at its five offsets and the MMHUB copy at 0x8ec/0x8ed/0x8d7, then emit one line
-    // per copy (D-01). A regression to a single read leaves n_mm at 0 and fails here.
+    // per copy (D-01). MMHUB is the selected copy (Linux gmc_v11_0.c:661); GC is fallback.
     FakeFb f {};
     f.gc[0] = 0x00123456u;
     f.gc[1] = 0x00123457u;
@@ -414,8 +414,8 @@ static void test_fb_dual_copy() {
     CHECK(count_lines_containing(&lines, "copy=GC(gfxhub)") == 1);
     CHECK(count_lines_containing(&lines, "copy=MMHUB") == 1);
     CHECK(count_lines_containing(&lines,
-                                 "authoritative copy to be confirmed by dual-read on target") == 2);
-    CHECK(mc_base == ((uint64_t)0x00123456u << 24));   // first usable copy (GC) wins
+                                 "authoritative copy: MMHUB per gmc_v11_0.c:661, GC fallback") == 2);
+    CHECK(mc_base == ((uint64_t)0x00120000u << 24));   // selected copy (MMHUB) wins
     CHECK(count_lines_containing(&lines, "fb_mc_base=0x120000000000") == 1);
     CHECK(count_lines_containing(&lines, "system_aperture=not-read") == 1);
 
@@ -423,6 +423,8 @@ static void test_fb_dual_copy() {
     f.n_gc = f.n_mm = 0;
     r3_lines_init(&lines);
     CHECK(r3_fb_item(&lines, fake_fb_read, &f, true, false, &mc_base));
+
+    CHECK(mc_base == ((uint64_t)0x00123456u << 24));   // GC fallback when MMHUB unavailable
     CHECK(f.n_gc == 5);
     CHECK(f.n_mm == 0);
     CHECK(lines.count == 2);
@@ -435,6 +437,34 @@ static void test_fb_dual_copy() {
     CHECK(f.n_mm == 0);
     CHECK(count_lines_containing(&lines, "FAIL copy=GC(gfxhub) unavailable") == 1);
     CHECK(count_lines_containing(&lines, "FAIL copy=MMHUB unavailable") == 1);
+}
+
+static void test_fb_mc_zero_rejected() {
+    // #7: a resolved copy with a zero MC base is not a valid FB location, and the
+    // gate must fail instead of skipping it. A valid GC copy must not paper over it.
+    FakeFb f {};
+    f.gc[0] = 0x00123456u;
+    f.gc[1] = 0x00123457u;
+    f.gc[2] = 0x00000010u;
+    f.mm[0] = 0u;
+    f.mm[1] = 0x00120001u;
+    f.mm[2] = 0x00000020u;
+
+    R3SurveyLines lines {};
+    r3_lines_init(&lines);
+    uint64_t mc_base = 0xdeadbeefu;
+    CHECK(!r3_fb_item(&lines, fake_fb_read, &f, true, true, &mc_base));
+    CHECK(mc_base == 0);
+    CHECK(count_lines_containing(&lines, "FAIL copy=MMHUB fb_mc_base=0") == 1);
+
+    // The fallback copy is subject to the same zero check.
+    f.n_gc = f.n_mm = 0;
+    f.gc[0] = 0u;
+    r3_lines_init(&lines);
+    mc_base = 0xdeadbeefu;
+    CHECK(!r3_fb_item(&lines, fake_fb_read, &f, true, false, &mc_base));
+    CHECK(mc_base == 0);
+    CHECK(count_lines_containing(&lines, "FAIL copy=GC(gfxhub) fb_mc_base=0") == 1);
 }
 
 static void test_fb_aperture_conversion() {
@@ -653,6 +683,7 @@ int main() {
     test_aux_evidence_boundary();
     test_mm_write_audit();
     test_fb_dual_copy();
+    test_fb_mc_zero_rejected();
     test_fb_aperture_conversion();
     test_frame_delta_wrap();
     test_uma_d0_source();
