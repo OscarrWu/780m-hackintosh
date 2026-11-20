@@ -124,8 +124,10 @@ constexpr uint32_t kMesScratchBytes            = 0x2000u; /* default page + reso
 constexpr uint32_t kMesKiqRingDwords            = 1024u; /* 4 KiB */
 constexpr uint32_t kMesSchRingDwords            = 1024u; /* 4 KiB */
 
-/* CSIB sub-offset inside the C5 mes grant (after queue structures + scratch).
- * 0x2000 (8 KiB) for 960 dw preamble + header. Placed by layout allocator at D4. */
+/* CSIB table sub-offset inside the C5 "mes" grant (after queue structures +
+ * scratch): 0x2000 (8 KiB) for the 960 dw preamble + header written by S11.
+ * This is NOT the D4 "csib" layout grant: D4 is a separate Gfx-owned 8 KiB
+ * grant after C5, while S11's table lives in this C5-internal region. */
 constexpr uint32_t kMesCsibOff                  = kMesRegionBytes + kMesScratchBytes; /* 0x16000 */
 constexpr uint32_t kMesCsibBytes                = 0x2000u;
 constexpr uint32_t kMesCsibHeader               = 0x0D000000u;

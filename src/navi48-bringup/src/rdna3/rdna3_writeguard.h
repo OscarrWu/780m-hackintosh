@@ -59,11 +59,13 @@
 #define R3_WG_AUX_WINDOW_COUNT 25u
 #define R3_WG_WINDOW_COUNT (R3_WG_MM_WINDOW_COUNT + R3_WG_AUX_WINDOW_COUNT)
 #define R3_WG_GRANT_MAX 200u
-/* 写守卫 grant 表容量：全链预算 176 项 + 24 行预留（rdna3_ip_entries.h 预算契约）。
+/* 写守卫 grant 表容量：全链预算 196 项（rdna3_ip_entries.h 预算契约；其中
+ * reg 182 + layout 14）+ 4 行预留。
  * 数值一致性由该头文件的 static_assert 机械保证（R3_WG_BUDGET_TOTAL <=
  * R3_WG_GRANT_MAX）。容量只是兜底：越界的第一道拦截是批量注册前的
  * r3_wg_reserve() 预算检查（prep/stage 入口），此宏仅供表数组与诊断使用。
- * 2026-11-20 主 agent 裁决：IH 输入行 +6 使全链预算 170→176，容量 192→200。
+ * 2026-11-20 主 agent 裁决：IH 输入行 +6 使全链预算 170→176，容量 192→200；
+ * 后续登记使全链预算为 196，容量维持 200（IH 6 条已计入 196）。
  * GRANT_MAX 是防松胀上限而非硬件约束；防松胀由"实际注册计数 vs 预算常数"的
  * 机械断言承担（见 rdna3_ip_entries.h 与 test_write_budget）。 */
 

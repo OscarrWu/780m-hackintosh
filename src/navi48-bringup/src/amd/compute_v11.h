@@ -7,7 +7,8 @@
  * The IB chain stores a magic value and the substep verifies it via the fence
  * (poll < 1 ms).  This exercises the full PM4 submission path through the MES
  * scheduler: CP uconfig, WRITE_DATA to the test-buf page (D7), IB jump into the
- * shader preamble buffer (CSIB + D4), and RELEASE_MEM with EOP interrupt.
+ * IB preamble at D7 test_buf+0x800 (kComputeIbPreambleOff), and RELEASE_MEM
+ * with EOP interrupt.  The D4 "csib" grant stays untouched for Gfx/RLC.
  *
  * Dependencies: mes_queue_v11_0_substep (S12) must have completed, making the
  * compute queue live and the MQD/ring/fence structures initialised.
