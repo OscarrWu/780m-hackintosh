@@ -240,6 +240,22 @@ static_assert(kGartRows[kGartVbindRowCount].golden == nullptr &&
               kGartRows[kGartVbindRowCount + 1u].dwords == kInvArmEngines * 2u,
               "arm rows must trail the vbind set");
 
+/* GCVM_L2_PROTECTION_FAULT_CNTL (0x15c4) is verified read-only in this phase.
+ * Linux programs it at GART enable (gmc_v11_0.c:243-284); the mesboot window
+ * measured kGmcFaultDefault. Only the 13 enable-default bits and the two top
+ * control bits carry meaning here, so the gate checks exactly those and leaves
+ * the register untouched. */
+constexpr uint32_t kGmcFaultCntlLowMask = 0x00001fffu;
+constexpr uint32_t kGmcFaultCntlHighMask = 0xc0000000u;
+constexpr uint32_t kGmcFaultCntlWantLow = kGmcFaultDefault & kGmcFaultCntlLowMask;
+constexpr uint32_t kGmcFaultCntlWantHigh = kGmcFaultDefault & kGmcFaultCntlHighMask;
+
+static bool fault_cntl_ok(uint32_t v)
+{
+    return (v & kGmcFaultCntlLowMask) == kGmcFaultCntlWantLow &&
+           (v & kGmcFaultCntlHighMask) == kGmcFaultCntlWantHigh;
+}
+
 constexpr R3WriteRowReg kVmid8Rows[] = {
     /* GC VM_CONTEXT8 group (golden) */
     {&r3gold::kGcvmContext8Cntl, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1,
@@ -271,9 +287,11 @@ constexpr R3WriteRowReg kVmid8Rows[] = {
      WClass::State, WNeed::OnSuccessPath, "gmc:mm-ctx8-end-lo"},
     {&r3gold::kMmvmContext8PageTableEndAddrHi32, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1,
      WClass::State, WNeed::OnSuccessPath, "gmc:mm-ctx8-end-hi"},
-    /* fault default (golden) */
+    /* fault default: read-only gate. Linux programs it at GART enable
+     * (gmc_v11_0.c:243-284); this batch only resolves the address and verifies
+     * the reset default, so the row is Optional (never demanded as a write). */
     {&r3gold::kGcvmL2ProtectionFaultCntl, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1,
-     WClass::State, WNeed::OnSuccessPath, "gmc:fault-default"},
+     WClass::State, WNeed::Optional, "gmc:fault-default"},
     /* invalidate engine 17 (registered by S7; declared for the expect set) */
     {&r3gold::kGcvmInvalidateEng17Req, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1,
      WClass::Protocol, WNeed::OnSuccessPath, "gmc:inv-req"},
@@ -1417,13 +1435,16 @@ R3SubstepResult seq_vmid8_invalidate(Gmc &s)
 R3SubstepResult seq_fault_default(Gmc &s)
 {
     R3SubstepResult r = r3_substep_pass();
-    /* Test-window FAULT_DEFAULT (mesboot env_on("FAULT_DEFAULT") measured
-     * value: all seven protection-fault enable-default bits set). */
-    if (reg_write(s, s.rows_addr[14], kGmcFaultDefault, kR3WState, "gmc:fault-default")) {
-        r3_substep_note(&r, 0, 0, "fault default write failed");
-        return r3_substep_fail(kR3SecSeq, 4, kFailFaultDefault);
-    }
-    r3_substep_note(&r, s.rows_addr[14], kGmcFaultDefault, "fault default set");
+    /* GCVM_L2_PROTECTION_FAULT_CNTL is a read-only default check in this phase:
+     * the mesboot window measured kGmcFaultDefault (13 enable-default bits set,
+     * top two control bits clear), and Linux writes it at GART enable
+     * (gmc_v11_0.c:243-284), not in this substep. Verify, do not rewrite. */
+    bool ok = false;
+    const uint32_t fault = reg_read(s, s.rows_addr[14], &ok);
+    if (!ok || !fault_cntl_ok(fault))
+        return fail_note(kR3SecSeq, 4, kFailFaultDefault, s.rows_addr[14], fault,
+                         "fault-default read-only");
+    r3_substep_note(&r, s.rows_addr[14], fault, "fault default verified");
     return r;
 }
 
@@ -1466,10 +1487,9 @@ R3SubstepResult chk_vmid8(Gmc &s)
         }
     }
     const uint32_t fault = reg_read(s, s.rows_addr[14], &ok);
-    if (!ok || fault != kGmcFaultDefault) {
-        r3_substep_note(&r, s.rows_addr[14], fault, "fault-default");
-        return r3_substep_fail(kR3SecChk, 5, kFailVmid8Chk);
-    }
+    if (!ok || !fault_cntl_ok(fault))
+        return fail_note(kR3SecChk, 5, kFailVmid8Chk, s.rows_addr[14], fault,
+                         "fault-default");
     r3_substep_note(&r, s.rows_addr[14], fault, "vmid8 gate ok");
     return r;
 }

@@ -426,7 +426,7 @@ static bool build_fixture(Fixture &f, Dev &d)
     d.bar5[kMmhub1 + 0x0740u] = 0x01fffe00u;
     d.bar5[kMmhub1 + 0x0748u] = 0x01fffe00u;
     /* FAULT_CNTL reset */
-    d.bar5[kGc0 + 0x15c4u] = 0xc0000000u;
+    d.bar5[kGc0 + 0x15c4u] = 0x00001ffcu; /* FAULT_CNTL reset default (13 enable bits) */
     /* SDMA RB_RPTR */
     d.bar5[kSdma0 + 0x0083u] = 0u;
 
@@ -1019,7 +1019,7 @@ static void test_s9_vmid8(void)
     CHECK(d.bar5[kGc0 + 0x1723u] == 0u, "gc ctx8 start lo");
     CHECK(d.bar5[kGc0 + 0x1743u] == 0xffffffffu, "gc ctx8 end lo");
     CHECK(d.bar5[kMmhub1 + 0x0748u] == kGmcVbindCntl, "mmhub ctx8 cntl");
-    CHECK(d.bar5[kGc0 + 0x15c4u] == kGmcFaultDefault, "fault default");
+    CHECK(d.bar5[kGc0 + 0x15c4u] == 0x00001ffcu, "fault default verified read-only");
     /* PER_VMID invalidate carried bit 8 */
     CHECK(d.bar5[kGc0 + 0x16BCu] == (kGmcInvBase | (1u << 8) | 1u),
           "gc inv req vmid8 (got 0x%x)", d.bar5[kGc0 + 0x16BCu]);
@@ -1046,6 +1046,58 @@ static void test_s9_vmid8(void)
           "chain budget == 43 (got %u)", r3_wg_grant_count());
 }
 
+/* #6 regression: FAULT_CNTL (0x15c4) is verified read-only. The old path
+ * rewrote it with kGmcFaultDefault; seed a value with the top control bits set
+ * and require a fail-closed rejection that leaves it untouched. */
+static void test_s9_fault_default_readonly(void)
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d), "fixture");
+    d.bar5[kGc0 + 0x15c4u] = 0xc0001ffcu;
+    reset_fake_mem();
+    r3_writeguard_install_mm();
+    prepare_sdma(f);
+    R3SubstepResult r = uma_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s6 in fault seq (name=%s step=%u)", r.name, r.step);
+    r = gart_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s7 in fault seq (name=%s step=%u)", r.name, r.step);
+    r = gpuvm0_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s8 in fault seq (name=%s step=%u)", r.name, r.step);
+    r = vmid8_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecFail, "bad FAULT_CNTL rejected");
+    CHECK(r.section == kR3SecSeq && r.step == 4u,
+          "rejected at seq step 4 (section=%u step=%u)",
+          static_cast<unsigned>(r.section), r.step);
+    CHECK(d.bar5[kGc0 + 0x15c4u] == 0xc0001ffcu,
+          "FAULT_CNTL untouched (got 0x%x)", d.bar5[kGc0 + 0x15c4u]);
+}
+
+/* #6 regression: the low 13 enable bits are checked too, not just the top
+ * control bits. One flipped low bit must also fail closed and stay untouched. */
+static void test_s9_fault_default_low_bits(void)
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d), "fixture");
+    d.bar5[kGc0 + 0x15c4u] = 0x00001ffdu;
+    reset_fake_mem();
+    r3_writeguard_install_mm();
+    prepare_sdma(f);
+    R3SubstepResult r = uma_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s6 in fault low-bits seq (name=%s step=%u)", r.name, r.step);
+    r = gart_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s7 in fault low-bits seq (name=%s step=%u)", r.name, r.step);
+    r = gpuvm0_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s8 in fault low-bits seq (name=%s step=%u)", r.name, r.step);
+    r = vmid8_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecFail, "bad FAULT_CNTL low bits rejected");
+    CHECK(r.section == kR3SecSeq && r.step == 4u,
+          "rejected at seq step 4 (section=%u step=%u)",
+          static_cast<unsigned>(r.section), r.step);
+    CHECK(d.bar5[kGc0 + 0x15c4u] == 0x00001ffdu,
+          "FAULT_CNTL untouched (got 0x%x)", d.bar5[kGc0 + 0x15c4u]);
+}
 } /* namespace */
 
 int main(void)
@@ -1065,6 +1117,8 @@ int main(void)
     test_s7_shadow_readback_mismatch();
     test_s8_gpuvm0();
     test_s9_vmid8();
+    test_s9_fault_default_readonly();
+    test_s9_fault_default_low_bits();
     printf("test_gmc: %u checks, %u failed\n", g_checks, g_fail);
     return g_fail == 0u ? 0 : 1;
 }
