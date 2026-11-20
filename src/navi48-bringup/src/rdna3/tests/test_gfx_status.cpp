@@ -2,9 +2,9 @@
  * test_gfx_status.cpp - host tests for the GFX 11.0.1 readiness + constants-init substep
  * (K6 / requirement C3.1-C3.3, tech plan §3.3 + §8.1 + §10).
  *
- * Everything runs on a RAM-backed fake of BAR5: the substep's only writes are the declared
- * W1.5 rows, so the fake records every write and proves nothing else reaches it. Golden values
- * come from independent sources, never from the code under test (H4):
+ * Everything runs on a RAM-backed fake of BAR5: the substep writes only the stage-2 declared
+ * rows (four W1.5 + ten golden), so the fake records every write and proves nothing else
+ * reaches it. Golden values come from independent sources, never from the code under test (H4):
  *
  *   Offsets  re-transcribed here from gc_11_0_0_offset.h / gc_11_0_0_sh_mask.h (the
  *            expected numbers are literals in this file, not references to the header).
@@ -252,15 +252,39 @@ static RunResult run(Fixture &f, Dev &d)
     return out;
 }
 
-// The only writes the substep may issue are the four W1.5 declaration rows.
-static bool only_w15_writes(const Dev &d)
+// The only writes the substep may issue are the stage-2 declaration rows: four W1.5 rows and
+// G01-G10 golden rows, each at its own BASE_IDX.
+static bool only_declared_writes(const Dev &d)
 {
     for (uint32_t a : d.writes) {
         if (a != kGcBase0 + 0x0DA0u && a != kGcBase1 + 0x0900u &&
-            a != kGcBase1 + 0x09E4u && a != kGcBase1 + 0x09E3u)
+            a != kGcBase1 + 0x09E4u && a != kGcBase1 + 0x09E3u &&
+            a != kGcBase1 + 0x19A2u && a != kGcBase1 + 0x5087u &&
+            a != kGcBase1 + 0x5086u && a != kGcBase0 + 0x1F53u &&
+            a != kGcBase1 + 0x2E0Cu && a != kGcBase0 + 0x1025u &&
+            a != kGcBase1 + 0x0944u && a != kGcBase1 + 0x0960u &&
+            a != kGcBase0 + 0x12E2u && a != kGcBase1 + 0x19A3u)
             return false;
     }
     return true;
+}
+
+static uint32_t write_count(const Dev &d, uint32_t addr)
+{
+    uint32_t n = 0;
+    for (uint32_t a : d.writes)
+        if (a == addr)
+            n++;
+    return n;
+}
+
+static uint32_t read_count(const Dev &d, uint32_t addr)
+{
+    uint32_t n = 0;
+    for (uint32_t a : d.reads)
+        if (a == addr)
+            n++;
+    return n;
 }
 
 static bool ev_has(const Fixture &f, const char *needle)
@@ -310,7 +334,7 @@ static void test_offsets()
 
     // gc_11_0_0_sh_mask.h values.
     CHECK(amdgpu::kGfx11BootloadComplete == 0x80000000u, "BOOTLOAD_COMPLETE bit31");
-    CHECK(amdgpu::kGfx11CpStatCeBusy == 0x01000000u, "CP_STAT.CE_BUSY");
+    CHECK(amdgpu::kGfx11CpStatCeBusy == 0x04000000u, "CP_STAT.CE_BUSY bit26");
     CHECK(amdgpu::kGfx11CpStatPfpBusy == 0x00008000u, "CP_STAT.PFP_BUSY");
     CHECK(amdgpu::kGfx11CpStatMeBusy == 0x00020000u, "CP_STAT.ME_BUSY");
     CHECK(amdgpu::kGfx11CpStatCpBusy == 0x80000000u, "CP_STAT.CP_BUSY");
@@ -338,7 +362,10 @@ static void test_happy_path()
     CHECK(d.bar5[kGcBase0 + 0x0DA0u] == 0xFFu, "GRBM_CNTL.READ_TIMEOUT=0xff");
     CHECK(d.bar5[kGcBase1 + 0x09E4u] == 0x0000C00Cu, "SH_MEM_CONFIG=0xC00C");
     CHECK(d.bar5[kGcBase1 + 0x09E3u] == 0x20001000u, "SH_MEM_BASES=0x20001000");
-    CHECK(only_w15_writes(d), "only declared W1.5 registers written (%zu)", d.writes.size());
+    CHECK(only_declared_writes(d), "only declared rows written (%zu)", d.writes.size());
+    CHECK(d.writes.size() == 50u, "stage-2 writes: 40 W1.5 + 10 golden (got %zu)",
+          d.writes.size());
+    CHECK(d.bar5[kGcBase0 + 0x13DEu] == 0u, "G16 GB_ADDR_CONFIG never written");
     for (int v = 8; v < 16; v++) {
         CHECK(d.shm_config[v] == 0u && d.shm_bases[v] == 0u,
               "VMID%d left to init_compute_vmid (config=0x%08x bases=0x%08x)", v,
@@ -384,7 +411,7 @@ static void test_all_zero()
     CHECK(strcmp(rr.r.name, "chk:imu-not-running") == 0, "all-zero reason: %s", rr.r.name);
     CHECK(rr.r.section == kR3SecChk && rr.r.step == 1u, "all-zero section/step");
     CHECK(!rr.ready_bit, "no ready bit on failure");
-    CHECK(only_w15_writes(d), "no undeclared writes on failure");
+    CHECK(only_declared_writes(d), "no undeclared writes on failure");
     CHECK(prop_is(f, "N48R3EVID-gfx-done", "No"), "gfx-done property No");
 }
 
@@ -398,7 +425,7 @@ static void test_imu_read_failure()
     RunResult rr = run(f, d);
     CHECK(rr.r.status == kR3SsecFail && strcmp(rr.r.name, "chk:imu-unreadable") == 0,
           "IMU read failure: %s", rr.r.name);
-    CHECK(only_w15_writes(d), "no undeclared writes");
+    CHECK(only_declared_writes(d), "no undeclared writes");
 }
 
 static void test_records_not_gated()
@@ -433,7 +460,7 @@ static void test_bootload_absent()
     CHECK(rr.t1 - rr.t0 >= amdgpu::kGfx11AutoloadTimeoutUs,
           "waited the full budget (%llu us)", (unsigned long long)(rr.t1 - rr.t0));
     CHECK(!rr.ready_bit, "no ready bit");
-    CHECK(only_w15_writes(d), "no undeclared writes");
+    CHECK(only_declared_writes(d), "no undeclared writes");
 }
 
 static void test_bootload_unreadable()
@@ -606,7 +633,7 @@ static void test_grants()
     CHECK(build_fixture(f, d), "fixture");
     healthy(d);
     CHECK(run(f, d).r.status == kR3SsecOk, "grant run succeeded");
-    uint32_t td = 0, w15 = 0, bad = 0;
+    uint32_t td = 0, w15 = 0, golden = 0, bad = 0;
     for (uint32_t i = 0; i < r3_wg_grant_count(); i++) {
         const R3WgGrant *gr = r3_wg_grant(i);
         if (!gr)
@@ -619,10 +646,170 @@ static void test_grants()
             td++;
         else if (strncmp(gr->tag, "reg:gfx-w1.5-", 13) == 0)
             w15++;
+        else if (strcmp(gr->tag, "reg:gfx-golden") == 0)
+            golden++;
     }
     CHECK(td == 2u, "two teardown halt grants, got %u", td);
     CHECK(w15 == 4u, "four W1.5 grants, got %u", w15);
+    CHECK(golden == 10u, "ten golden grants, got %u", golden);
+    CHECK(r3_wg_grant_count() == 16u, "stage-2 grant count 16, got %u",
+          r3_wg_grant_count());
     CHECK(bad == 0u, "no foreign grants in the Gfx run (%u)", bad);
+}
+
+// =========================================================================================
+// G01-G10 golden writes, G16 read-only, B#25 CE_BUSY, stage-3 (deferred)
+// =========================================================================================
+static void test_golden_unconditional()
+{
+    // Linux applies the golden tables through an unconditional RMW. Preset every register to
+    // all-ones: a read-back-skipping implementation would leave 0xFFFFFFFF in place.
+    static const struct {
+        int base;
+        uint32_t off, mask, value;
+    } kGolden[10] = {
+        {1, 0x19A2u, 0x20000000u, 0x20000000u},
+        {1, 0x5087u, 0x9fff8fffu, 0x00000010u},
+        {1, 0x5086u, 0xffff8fffu, 0x00000010u},
+        {0, 0x1F53u, 0x0007ffffu, 0x0000c200u},
+        {1, 0x2E0Cu, 0xffff001bu, 0x00f01988u},
+        {0, 0x1025u, 0xf0ffffffu, 0x00880007u},
+        {1, 0x0944u, 0xfffffffdU, 0x00000008u},
+        {1, 0x0960u, 0xfff891ffu, 0x55480100u},
+        {0, 0x12E2u, 0xf7f7ffffu, 0x01030000u},
+        {1, 0x19A3u, 0xfcffffffu, 0x0000000au},
+    };
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d), "fixture");
+    healthy(d);
+    for (int i = 0; i < 10; i++)
+        d.set(kGolden[i].base == 0 ? kGcBase0 : kGcBase1, kGolden[i].off, 0xFFFFFFFFu);
+    RunResult rr = run(f, d);
+    CHECK(rr.r.status == kR3SsecOk, "golden run succeeded: %s", rr.r.name);
+    for (int i = 0; i < 10; i++) {
+        const uint32_t addr =
+            (kGolden[i].base == 0 ? kGcBase0 : kGcBase1) + kGolden[i].off;
+        const uint32_t want = (0xFFFFFFFFu & ~kGolden[i].mask) | (kGolden[i].value & kGolden[i].mask);
+        CHECK(d.bar5[addr] == want, "golden 0x%08x = 0x%08x (got 0x%08x)", addr, want,
+              d.bar5[addr]);
+        CHECK(write_count(d, addr) == 1u, "golden 0x%08x written once (got %u)", addr,
+              write_count(d, addr));
+    }
+    CHECK(ev_has(f, "S0c golden G01-G10 applied"), "golden evidence line");
+}
+
+static void test_gb_addr_read_only()
+{
+    {
+        Fixture f;
+        Dev d;
+        CHECK(build_fixture(f, d), "fixture");
+        healthy(d);
+        d.set(kGcBase0, 0x13DEu, 0x12345678u);
+        RunResult rr = run(f, d);
+        CHECK(rr.r.status == kR3SsecOk, "G16 read run: %s", rr.r.name);
+        CHECK(d.bar5[kGcBase0 + 0x13DEu] == 0x12345678u, "GB_ADDR_CONFIG unchanged");
+        CHECK(write_count(d, kGcBase0 + 0x13DEu) == 0u, "GB_ADDR_CONFIG never written");
+        CHECK(read_count(d, kGcBase0 + 0x13DEu) == 1u, "GB_ADDR_CONFIG read once");
+        CHECK(ev_has(f, "G16 GB_ADDR_CONFIG=0x12345678"), "G16 evidence line");
+    }
+    {
+        Fixture f;
+        Dev d;
+        CHECK(build_fixture(f, d), "fixture");
+        healthy(d);
+        d.fail_reads.push_back(kGcBase0 + 0x13DEu);
+        RunResult rr = run(f, d);
+        CHECK(rr.r.status == kR3SsecOk, "unreadable GB_ADDR_CONFIG is not fatal: %s",
+              rr.r.name);
+        CHECK(ev_has(f, "G16 GB_ADDR_CONFIG unreadable (recorded, not fatal)"),
+              "G16 unreadable evidence line");
+        CHECK(only_declared_writes(d), "no undeclared writes when G16 is unreadable");
+    }
+}
+
+static void test_ce_busy_bit()
+{
+    // B#25: CE_BUSY is bit26 (0x04000000). 0x01000000 must decode as not-CE-busy.
+    {
+        Fixture f;
+        Dev d;
+        CHECK(build_fixture(f, d), "fixture");
+        healthy(d);
+        d.set(kGcBase0, amdgpu::kGfx11CpStat, 0x04000000u);
+        RunResult rr = run(f, d);
+        CHECK(rr.r.status == kR3SsecFail, "nonzero CP_STAT cannot be ready");
+        CHECK(ev_has(f, "busy(ce=1 pfp=0 me=0 cp=0)"), "bit26 decodes as CE_BUSY");
+    }
+    {
+        Fixture f;
+        Dev d;
+        CHECK(build_fixture(f, d), "fixture");
+        healthy(d);
+        d.set(kGcBase0, amdgpu::kGfx11CpStat, 0x01000000u);
+        RunResult rr = run(f, d);
+        CHECK(rr.r.status == kR3SsecFail, "nonzero CP_STAT cannot be ready");
+        CHECK(ev_has(f, "busy(ce=0 pfp=0 me=0 cp=0)"), "0x01000000 is not CE_BUSY");
+    }
+}
+
+static void test_stage3_deferred()
+{
+    Fixture f;
+    Dev d;
+    CHECK(build_fixture(f, d), "fixture");
+    healthy(d);
+    CHECK(run(f, d).r.status == kR3SsecOk, "stage-2 precondition run");
+    d.writes.clear();
+    d.reads.clear();
+    d.set(kGcBase0, 0x1F72u, 0x10u);   // pre-set unrelated TRAP_EN bits
+    d.set(kGcBase1, 0x4C80u, 0x10u);   // pre-set unrelated RLC_SRM_CNTL bits
+
+    const uint64_t deny_before = r3_writeguard_deny_count();
+    R3SubstepResult r = amdgpu::gfx_v11_0_stage3_substep(&f.io, &f.env);
+    const uint64_t deny_after = r3_writeguard_deny_count();
+    CHECK(r.status == kR3SsecOk, "stage-3 succeeded: %s", r.name);
+    CHECK(deny_after == deny_before, "stage-3 caused no DENY (%llu)",
+          (unsigned long long)(deny_after - deny_before));
+
+    // G13 8 VMID x 8 writes + one final selector, G14 15 x 4, G17 one.
+    CHECK(d.writes.size() == 126u, "stage-3 write count 126 (got %zu)", d.writes.size());
+    CHECK(d.reads.size() == 9u, "stage-3 read count 9 (got %zu)", d.reads.size());
+    CHECK(write_count(d, kGcBase1 + 0x0900u) == 9u, "selector writes");
+    CHECK(write_count(d, kGcBase1 + 0x09E4u) == 8u, "G13 SH_MEM_CONFIG writes");
+    CHECK(write_count(d, kGcBase1 + 0x09E3u) == 8u, "G13 SH_MEM_BASES writes");
+    CHECK(write_count(d, kGcBase0 + 0x1F72u) == 8u, "G13 TRAP_EN writes");
+    CHECK(write_count(d, kGcBase1 + 0x4C80u) == 1u, "G17 RLC_SRM_CNTL write");
+    uint32_t gds_w = 0;
+    for (uint32_t i = 2u; i <= 30u; i += 2u) {
+        if (write_count(d, kGcBase0 + 0x20A0u + i) > 0u) gds_w++;
+        if (write_count(d, kGcBase0 + 0x20A1u + i) > 0u) gds_w++;
+    }
+    for (uint32_t i = 1u; i <= 15u; i++) {
+        if (write_count(d, kGcBase0 + 0x20C0u + i) > 0u) gds_w++;
+        if (write_count(d, kGcBase0 + 0x20D0u + i) > 0u) gds_w++;
+    }
+    CHECK(gds_w == 60u, "all 60 GDS row/offset combinations written (got %u)", gds_w);
+    CHECK(d.bar5[kGcBase0 + 0x1F72u] == 0x18u, "TRAP_EN ORed (0x10 -> 0x18)");
+    CHECK(d.bar5[kGcBase1 + 0x4C80u] == 0x13u, "RLC_SRM_CNTL ORed (0x10 -> 0x13)");
+    CHECK(d.bar5[kGcBase1 + 0x0900u] == 0u, "selector restored to VMID0");
+    CHECK(d.bar5[kGcBase1 + 0x09E3u] == 0x00010002u, "compute bases 0x00010002");
+    CHECK(d.shm_bases[8] == 0x00010002u, "VMID8 compute bases applied");
+    CHECK(d.shm_config[8] == 0x0000C00Cu, "VMID8 config 0xC00C");
+
+    uint32_t s3 = 0;
+    for (uint32_t i = 0; i < r3_wg_grant_count(); i++) {
+        const R3WgGrant *gr = r3_wg_grant(i);
+        if (gr && strcmp(gr->tag, "reg:gfx-stage3") == 0)
+            s3++;
+    }
+    CHECK(s3 == 62u, "62 stage-3 grants (60 GDS instances + SPI + RLC), got %u", s3);
+    CHECK(r3_wg_grant_count() == 78u, "stage-2 + stage-3 grants 78, got %u",
+          r3_wg_grant_count());
+    CHECK(ev_has(f, "G13 compute vmid8..15"), "G13 evidence");
+    CHECK(ev_has(f, "G14 GDS vmid1..15"), "G14 evidence");
+    CHECK(ev_has(f, "G17 RLC_SRM_CNTL"), "G17 evidence");
 }
 
 int main()
@@ -642,6 +829,10 @@ int main()
     test_preconditions();
     test_shmem_idempotent();
     test_grants();
+    test_golden_unconditional();
+    test_gb_addr_read_only();
+    test_ce_busy_bit();
+    test_stage3_deferred();
     printf("\n%d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

@@ -57,40 +57,43 @@ static void test_budget_arithmetic(void)
 {
     CHECK(R3_WG_BUDGET_LAYOUT_TOTAL == 14u,
           "layout total == 14 (got %u)", (unsigned)R3_WG_BUDGET_LAYOUT_TOTAL);
-    CHECK(R3_WG_BUDGET_REG_TOTAL == 162u,
-          "reg total == 162 (got %u)", (unsigned)R3_WG_BUDGET_REG_TOTAL);
+    CHECK(R3_WG_BUDGET_REG_TOTAL == 182u,
+          "reg total == 182 (got %u)", (unsigned)R3_WG_BUDGET_REG_TOTAL);
     CHECK(R3_WG_BUDGET_STAGE2 == 121u,
           "stage2 == 121 (got %u)", (unsigned)R3_WG_BUDGET_STAGE2);
-    CHECK(R3_WG_BUDGET_TOTAL == 176u,
-          "total == 176 (got %u)", (unsigned)R3_WG_BUDGET_TOTAL);
+    CHECK(R3_WG_BUDGET_TOTAL == 196u,
+          "total == 196 (got %u)", (unsigned)R3_WG_BUDGET_TOTAL);
     CHECK(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
           "contract total fits grant table (%u <= %u)",
           (unsigned)R3_WG_BUDGET_TOTAL, (unsigned)R3_WG_GRANT_MAX);
     /* 附录 A 账目的收尾恒等式：阶段2 + 阶段2后各分项 == 全链总量。 */
     CHECK(R3_WG_BUDGET_STAGE2 + kHdpGrantCount + kGmcSeqLayoutCount + kGartRowCount +
               kVmid8FirstInvalidateRow + kMesQueueLayoutCount + kGfxTeardownRowCount +
-              kIhTeardownRowCount + kIhInputRowCount == R3_WG_BUDGET_TOTAL,
+              kIhTeardownRowCount + kIhInputRowCount + kGfxStage2RowCount +
+              kGfxStage3RowCount == R3_WG_BUDGET_TOTAL,
           "stage2 + hdp + seq + gart + vmid8 + queue-layout + gfx-teardown + "
-          "ih-teardown + ih-input == total (%u+%u+%u+%u+%u+%u+%u+%u+%u = %u)",
+          "ih-teardown + ih-input + gfx-stage2 + gfx-stage3 == total "
+          "(%u+%u+%u+%u+%u+%u+%u+%u+%u+%u+%u = %u)",
           (unsigned)R3_WG_BUDGET_STAGE2, (unsigned)kHdpGrantCount,
           (unsigned)kGmcSeqLayoutCount, (unsigned)kGartRowCount,
           (unsigned)kVmid8FirstInvalidateRow, (unsigned)kMesQueueLayoutCount,
           (unsigned)kGfxTeardownRowCount, (unsigned)kIhTeardownRowCount,
-          (unsigned)kIhInputRowCount, (unsigned)R3_WG_BUDGET_TOTAL);
+          (unsigned)kIhInputRowCount, (unsigned)kGfxStage2RowCount,
+          (unsigned)kGfxStage3RowCount, (unsigned)R3_WG_BUDGET_TOTAL);
 }
 
 static void test_fill_to_capacity(void)
 {
     r3_writeguard_install_mm();
 
-    /* 先按全链预算 176 注册合成 reg grant：必须全部成功。 */
+    /* 先按全链预算 196 注册合成 reg grant：必须全部成功。 */
     for (uint32_t i = 0; i < R3_WG_BUDGET_TOTAL; i++) {
         CHECK(syn_reg(0x1000u + i * 4u) == 0, "contract row %u registers", i);
     }
     CHECK(r3_wg_grant_count() == R3_WG_BUDGET_TOTAL,
-          "grant_count == 176 (got %u)", r3_wg_grant_count());
+          "grant_count == 196 (got %u)", r3_wg_grant_count());
 
-    /* 继续注册到物理容量 R3_WG_GRANT_MAX（200 = 176 预算 + 24 预留）。 */
+    /* 继续注册到物理容量 R3_WG_GRANT_MAX（200 = 196 预算 + 4 行预留）。 */
     for (uint32_t i = R3_WG_BUDGET_TOTAL; i < R3_WG_GRANT_MAX; i++) {
         CHECK(syn_reg(0x1000u + i * 4u) == 0, "row %u fills spare slots", i);
     }

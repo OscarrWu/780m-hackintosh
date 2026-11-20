@@ -55,6 +55,10 @@ constexpr uint32_t kVmid8FirstInvalidateRow = 15u;  // S9 只注册前 15 行（
 constexpr uint32_t kVmid8RowCount           = 18u;  // 声明全集（expect 用；15..17 非 S9 注册）
 constexpr uint32_t kMesQueueLayoutCount     = 1u;   // mes S11 test_buf layout 计 1 条
 
+// ---- GFX 阶段2/阶段3 声明行（gfx_v11_0.cpp 内由 sizeof 反证） ----
+constexpr uint32_t kGfxStage2RowCount = 14u;  // 4 W1.5 + 10 golden (G01-G10)
+constexpr uint32_t kGfxStage3RowCount = 6u;   // 计划行（G13 5 + G17 1）；GDS 60 个 per-VMID 实例地址由 stage3 函数按 stride 动态登记，属 deferred 路径，不并入生产预算
+
 // ---- W1 拆除行（teardown-only，不属于阶段2 生产注册；GFX 行由 gfx_v11_0.cpp、IH 行由 ih_v6_0.cpp 注册） ----
 constexpr uint32_t kGfxTeardownRowCount = 2u;   // CP_ME_CNTL + CP_MEC_CNTL，gfx_v11_0.cpp "reg:gfx-teardown"
 
@@ -72,18 +76,19 @@ constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
     kPspRowCount + kSmuRowCount + kSdmaRowCount + kMesRowCount +
     kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
     kGartRowCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount +
-    kIhTeardownRowCount + kIhInputRowCount;                          // = 162
+    kIhTeardownRowCount + kIhInputRowCount +
+    kGfxStage2RowCount + kGfxStage3RowCount;                         // = 182
 constexpr uint32_t R3_WG_BUDGET_STAGE2 =
     kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
     kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
     kMesQueueRowCount;                                               // = 121
 constexpr uint32_t R3_WG_BUDGET_TOTAL =
-    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 176
+    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 196
 
 static_assert(R3_WG_BUDGET_STAGE2 == 121u, "阶段2 生产注册预算应为 121 项");
 static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
-static_assert(R3_WG_BUDGET_REG_TOTAL == 162u, "全链 reg 预算应为 162 项");
-static_assert(R3_WG_BUDGET_TOTAL == 176u, "全链写守卫预算应为 176 项");
+static_assert(R3_WG_BUDGET_REG_TOTAL == 182u, "全链 reg 预算应为 182 项");
+static_assert(R3_WG_BUDGET_TOTAL == 196u, "全链写守卫预算应为 196 项");
 static_assert(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
               "写守卫 grant 容量小于全链预算：请同步 R3_WG_GRANT_MAX");
 
@@ -96,14 +101,14 @@ static_assert(kVmid8RowCount <= R3_WG_EXPECT_MAX, "VMID8 行数超过 R3_WG_EXPE
 static_assert(kPspRowCount <= R3_WG_EXPECT_MAX, "PSP 行数超过 R3_WG_EXPECT_MAX");
 static_assert(kPspLayoutCount <= R3_WG_EXPECT_MAX, "PSP layout 数超过 R3_WG_EXPECT_MAX");
 static_assert(kSmuRowCount <= R3_WG_EXPECT_MAX, "SMU 行数超过 R3_WG_EXPECT_MAX");
-static_assert(kSdmaRowCount <= R3_WG_EXPECT_MAX, "SDMA 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kGfxStage2RowCount <= R3_WG_EXPECT_MAX, "GFX 阶段2 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kGfxStage3RowCount <= R3_WG_EXPECT_MAX, "GFX 阶段3 行数超过 R3_WG_EXPECT_MAX");
 
 // =========================================================================
 // GFX 11.0.1 — substep entry (read-only)
 // =========================================================================
 R3SubstepResult gfx_v11_0_substep(const R3Io *io, const R3SubstepEnv *env);
-constexpr uint32_t kGfxRowCount = 0;
-inline const R3WriteRowReg* getGfxRows(void) { return nullptr; }
+constexpr uint32_t kGfxRowCount = kGfxStage2RowCount + kGfxStage3RowCount;
 
 // GFX register constants — for rdna3 dump & teardown inspection.
 // Source: amd/gfx_v11_0.h (gc_11_0_0_offset.h / sh_mask.h)

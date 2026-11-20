@@ -112,8 +112,8 @@ constexpr uint32_t kGfx11BootloadComplete     = 0x80000000u; /* bit31 */
 //   CP_ME_CNTL.CE_HALT                   bit24 = 0x01000000  :24035
 //   CP_ME_CNTL.PFP_HALT                  bit26 = 0x04000000  :24037
 //   CP_ME_CNTL.ME_HALT                   bit28 = 0x10000000  :24039
-//   CP_STAT.CE_BUSY                      bit24 = 0x01000000  :6507
-constexpr uint32_t kGfx11CpStatCeBusy  = 0x01000000u;
+//   CP_STAT.CE_BUSY                      bit26 = 0x04000000  :6508
+constexpr uint32_t kGfx11CpStatCeBusy  = 0x04000000u;
 constexpr uint32_t kGfx11CpStatPfpBusy = 0x00008000u;
 constexpr uint32_t kGfx11CpStatMeBusy  = 0x00020000u;
 constexpr uint32_t kGfx11CpStatCpBusy  = 0x80000000u;
@@ -133,6 +133,13 @@ constexpr uint32_t kGfx11AutoloadTimeoutUs = 100000;
 constexpr uint32_t kGfx11AutoloadStepUs    = 1000;
 
 
+// Stage-3 (deferred, not on the production path): per-VMID compute/GDS init and RLC SRM.
+// Delivered as a complete function + host tests only; wiring it into the install sequence
+// is a later decision (implplan B G13/G14/G17). It requires the stage-2 Gfx substep to have
+// registered the shared GRBM/SH_MEM rows in the same boot.
+R3SubstepResult gfx_v11_0_stage3_substep(const R3Io *io, const R3SubstepEnv *env);
+
 } // namespace amdgpu
+
 
 #endif // NAVI48_GFX_V11_0_H
