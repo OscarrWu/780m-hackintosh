@@ -561,23 +561,31 @@ static void test_machine_config(const std::string &root) {
         const char *label;
         amdgpu::IPBlock block;
         unsigned maj, min, rev;
+        bool two_segments;
     };
     const Want wants[] = {
-        {"GC", amdgpu::IPBlock::GC, 11, 0, 1},
-        {"PSP (MP0)", amdgpu::IPBlock::MP0, 13, 0, 4},
-        {"SMU (MP1)", amdgpu::IPBlock::MP1, 13, 0, 4},
-        {"SDMA0", amdgpu::IPBlock::SDMA0, 6, 0, 1},
-        {"NBIO", amdgpu::IPBlock::NBIO, 7, 7, 0},
+        {"GC", amdgpu::IPBlock::GC, 11, 0, 1, true},
+        {"PSP (MP0)", amdgpu::IPBlock::MP0, 13, 0, 4, true},
+        {"SMU (MP1)", amdgpu::IPBlock::MP1, 13, 0, 4, true},
+        {"SDMA0", amdgpu::IPBlock::SDMA0, 6, 0, 1, true},
+        {"NBIO", amdgpu::IPBlock::NBIO, 7, 7, 0, true},
+        {"IH (OSSSYS)", amdgpu::IPBlock::OSSSYS, 6, 0, 1, false},
     };
     for (const Want &w : wants) {
         const Row row = find_md_row(text, w.label);
         CHECK(row.found, "machine-config row missing");
         if (!row.found) continue;
         unsigned b0 = 0, b1 = 0;
-        CHECK(std::sscanf(row.f3.c_str(), "0x%x / 0x%x", &b0, &b1) == 2,
-              "machine-config segment columns unparsable");
+        // IH (OSSSYS) carries a single segment in the table; every other row
+        // lists both b0 and b1, and losing a column must stay visible.
+        const int nb = std::sscanf(row.f3.c_str(), "0x%x / 0x%x", &b0, &b1);
+        const int want_cols = w.two_segments ? 2 : 1;
+        CHECK(nb == want_cols,
+              "machine-config segment columns differ from expectation");
         CHECK(seg_of(w.block, 0) == b0, "golden seg0 differs from machine-config");
-        CHECK(seg_of(w.block, 1) == b1, "golden seg1 differs from machine-config");
+        if (w.two_segments && nb == 2)
+            CHECK(seg_of(w.block, 1) == b1,
+                  "golden seg1 differs from machine-config");
 
         unsigned maj = 0, min = 0, rev = 0;
         CHECK(std::sscanf(row.f2.c_str(), "%u.%u.%u", &maj, &min, &rev) == 3,
@@ -597,6 +605,12 @@ static void test_machine_config(const std::string &root) {
           "MMHUB seg0 baseline");
     CHECK(seg_of(amdgpu::IPBlock::MMHUB, 1) == 0x0001A000u,
           "MMHUB seg1 baseline");
+
+    // A#8: the OSSSYS base is 0x10a0 (nullarc 780M discovery dump
+    // hardware/dumps/firebat_u6c/ip_discovery.txt:31, mesboot.c:564). 0x11400
+    // is LSDMA's base and must never come back as OSSSYS.
+    CHECK(seg_of(amdgpu::IPBlock::OSSSYS, 0) == 0x000010A0u,
+          "OSSSYS seg0 baseline (LSDMA 0x11400 is not OSSSYS)");
 
     const std::string::size_type fb = text.find("fb_mc_base=0x");
     CHECK(fb != std::string::npos, "machine-config FB baseline missing");

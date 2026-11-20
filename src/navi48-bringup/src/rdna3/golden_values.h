@@ -1024,7 +1024,7 @@ constexpr GoldenSegment kSegments[] = {
     {amdgpu::IPBlock::MMHUB, 1u, 0x0001A000u, "tmp/tech/E13 (survey); nullarc ip_discovery.txt:26"},
     {amdgpu::IPBlock::NBIO, 0u, 0x00000000u, "machine-config.md:129 (survey; group 0 is legitimately 0)"},
     {amdgpu::IPBlock::NBIO, 1u, 0x00000014u, "machine-config.md:129 (survey)"},
-    {amdgpu::IPBlock::OSSSYS, 0u, 0x00011400u, "machine-config.md:128 (survey; IH 6.0.1)"},
+    {amdgpu::IPBlock::OSSSYS, 0u, 0x000010A0u, "machine-config.md:130 (survey; IH 6.0.1, hwid=40); nullarc ip_discovery.txt:31"},
 };
 constexpr uint32_t kSegmentCount = sizeof(kSegments) / sizeof(kSegments[0]);
 
@@ -1041,6 +1041,7 @@ constexpr GoldenIpVersion kIpVersions[] = {
     {amdgpu::IPBlock::MP1, 13u, 0u, 4u, "machine-config.md:126"},
     {amdgpu::IPBlock::SDMA0, 6u, 0u, 1u, "machine-config.md:127"},
     {amdgpu::IPBlock::NBIO, 7u, 7u, 0u, "machine-config.md:129"},
+    {amdgpu::IPBlock::OSSSYS, 6u, 0u, 1u, "machine-config.md:130"},
 };
 constexpr uint32_t kIpVersionCount =
     sizeof(kIpVersions) / sizeof(kIpVersions[0]);
