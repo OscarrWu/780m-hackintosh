@@ -489,6 +489,13 @@ int invalidate_hubs(Gmc &s, uint32_t vmid, const char *ctx)
         return -1;
     }
 
+    /* No MMHUB private CID2 invalidation here, by design. Linux
+     * gmc_v11_0.c:294-305 issues one extra invalidation through
+     * hub->vm_l2_bank_select_reserved_cid2 only when that pointer is set;
+     * this part's hub is mmhub_v3_0_1, which (unlike mmhub_v3_0.c:508 and
+     * mmhub_v3_0_2.c:507) never initializes the field, so Linux skips it
+     * too. See hardware-state-assumptions.md §3 form 4 (audit B#22). */
+
     r3_io_hdp_flush(s.io);
     uint32_t sem = 0;
     if (r3_io_poll(s.io, s.mm_inv_sem, 1u, 1u, kGmcInvPolls, kGmcInvPollUs, &sem) != 1)
@@ -1117,12 +1124,20 @@ R3SubstepResult seq_gart_verify(Gmc &s)
 
         /* Eight slots are a fixed snapshot (rdna3_substep.h): the four poll
          * verdicts first, then the four publish-side observations. */
+        /* Segment bases come from IP discovery, never literals: GC seg0 is
+         * 0x1260 on this part (audit B#23), and MMHUB VM registers live in
+         * BASE_IDX 1 (seg1, measured 0x1a000). A missing base only costs the
+         * diagnostic log; the substep verdict was decided above. */
+        const uint32_t mm1 = s.ip->getBase(IPBlock::MMHUB, 1);
+        const uint32_t gc0 = s.ip->getBase(IPBlock::GC, 0);
+        if (mm1 == 0xffffffffu || gc0 == 0xffffffffu)
+            return f;
         bool diag_ok = false;
-        const uint32_t fault_status = r3_io_read32(s.io, 0x1a000u + 0x070Cu, &diag_ok);
-        r3_substep_note(&f, 0x1a000u + 0x070Cu, fault_status,
+        const uint32_t fault_status = r3_io_read32(s.io, mm1 + 0x070Cu, &diag_ok);
+        r3_substep_note(&f, mm1 + 0x070Cu, fault_status,
                         "gart-diag:mmhub-l2-fault-status");
-        const uint32_t fault_cntl = r3_io_read32(s.io, 0x1a000u + 0x0708u, &diag_ok);
-        r3_substep_note(&f, 0x1a000u + 0x0708u, fault_cntl,
+        const uint32_t fault_cntl = r3_io_read32(s.io, mm1 + 0x0708u, &diag_ok);
+        r3_substep_note(&f, mm1 + 0x0708u, fault_cntl,
                         "gart-diag:mmhub-l2-fault-cntl");
         r3_substep_note(&f, s.sdma_rptr_reg, rptr_now, "sdma rptr after poll");
 
@@ -1162,15 +1177,15 @@ R3SubstepResult seq_gart_verify(Gmc &s)
         evf(s.env, "gmc-gart", "diag sdma shadow hi=0x%x", s.sdma_shadow_hi);
 
         /* Remaining diagnostic set: process log only (no snapshot slots). */
-        const uint32_t mx_l1 = r3_io_read32(s.io, 0x1a000u + 0x08F3u, &diag_ok);
+        const uint32_t mx_l1 = r3_io_read32(s.io, mm1 + 0x08F3u, &diag_ok);
         evf(s.env, "gmc-gart", "diag mmhub-mx-l1=0x%x", mx_l1);
-        const uint32_t l2_cntl = r3_io_read32(s.io, 0x1a000u + 0x0700u, &diag_ok);
+        const uint32_t l2_cntl = r3_io_read32(s.io, mm1 + 0x0700u, &diag_ok);
         evf(s.env, "gmc-gart", "diag mmhub-l2-cntl=0x%x", l2_cntl);
-        const uint32_t fault_status_legacy = r3_io_read32(s.io, 0x1a000u + 0x070Au, &diag_ok);
+        const uint32_t fault_status_legacy = r3_io_read32(s.io, mm1 + 0x070Au, &diag_ok);
         evf(s.env, "gmc-gart", "diag mmhub-l2-0x070a=0x%x", fault_status_legacy);
-        const uint32_t mm_fb_off = r3_io_read32(s.io, 0x1a000u + 0x08D7u, &diag_ok);
+        const uint32_t mm_fb_off = r3_io_read32(s.io, mm1 + 0x08D7u, &diag_ok);
         evf(s.env, "gmc-gart", "diag mmhub-fb-offset=0x%x", mm_fb_off);
-        const uint32_t gc_fb_off = r3_io_read32(s.io, 0x10000u + 0x15A7u, &diag_ok);
+        const uint32_t gc_fb_off = r3_io_read32(s.io, gc0 + 0x15A7u, &diag_ok);
         evf(s.env, "gmc-gart", "diag gfxhub-fb-offset=0x%x", gc_fb_off);
         {
             volatile const uint64_t *tab =
@@ -1180,8 +1195,8 @@ R3SubstepResult seq_gart_verify(Gmc &s)
             evf(s.env, "gmc-gart", "diag pte0-hi=0x%x",
                 static_cast<uint32_t>(tab[0] >> 32u));
         }
-        const uint32_t def_lsb = r3_io_read32(s.io, 0x1a000u + 0x08D8u, &diag_ok);
-        const uint32_t def_msb = r3_io_read32(s.io, 0x1a000u + 0x08D9u, &diag_ok);
+        const uint32_t def_lsb = r3_io_read32(s.io, mm1 + 0x08D8u, &diag_ok);
+        const uint32_t def_msb = r3_io_read32(s.io, mm1 + 0x08D9u, &diag_ok);
         evf(s.env, "gmc-gart", "diag mmhub-default-addr=0x%x%08x", def_msb, def_lsb);
         return f;
     }

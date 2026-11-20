@@ -689,6 +689,10 @@ static void test_s7_verify_failure_readings(void)
     prepare_sdma(f);
     R3SubstepResult r = uma_v11_0_substep(&f.io, &f.env);
     CHECK(r.status == kR3SsecOk, "s6 in verify-failure seq (name=%s step=%u)", r.name, r.step);
+    /* Audit B#23: diagnostics must address GC through the discovered seg0
+     * base (kGc0), not the old 0x10000 literal. Poison the literal so a
+     * regression reads 0xdeadbeef instead of the register value. */
+    d.bar5[0x10000u + 0x15A7u] = 0xdeadbeefu;
     d.sdma_translate = false;
     r = gart_v11_0_substep(&f.io, &f.env);
     CHECK(r.status != kR3SsecOk, "s7 fails when the sdma write never lands");
@@ -702,7 +706,7 @@ static void test_s7_verify_failure_readings(void)
             saw_mismatch = true;
         if (strcmp(e.what, "gart-diag:mmhub-l2-fault-status") == 0) {
             saw_fault = true;
-            CHECK(e.value == d.bar5[0x1a000u + 0x070Cu],
+            CHECK(e.value == d.bar5[kMmhub1 + 0x070Cu],
                   "fault-status reading matches the register (got 0x%x)", e.value);
         }
         if (strcmp(e.what, "sdma rptr after poll") == 0)
@@ -735,6 +739,10 @@ static void test_s7_verify_failure_readings(void)
           "sdma status diag line");
     CHECK(strstr(n48log_host_text(), "gmc-gart: diag sdma shadow hi=0x") != nullptr,
           "sdma shadow hi diag line");
+    CHECK(strstr(n48log_host_text(), "gmc-gart: diag gfxhub-fb-offset=0x6a0c") != nullptr,
+          "gfxhub fb-offset uses the GC seg0 base, not 0x10000");
+    CHECK(strstr(n48log_host_text(), "gmc-gart: diag mmhub-fb-offset=0x6a0c") != nullptr,
+          "mmhub fb-offset uses the MMHUB seg1 base");
 }
 
 /* A register that accepts the write but never latches it must be caught by the arming readback:
