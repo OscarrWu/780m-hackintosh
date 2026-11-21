@@ -73,6 +73,7 @@ struct Dev {
     std::vector<uint32_t> bar5;
     uint64_t now;
     std::vector<uint32_t> writes;
+    std::vector<uint64_t> doorbells;
     uint32_t sdma_rptr;
     bool sdma_translate;
     uint32_t stuck_dword; /* accepts the write but latches nothing (readback stays stale) */
@@ -184,6 +185,7 @@ static uint64_t g_sdma_ring_off = 0; /* BAR0 byte offset of the SDMA ring */
 
 /* gmc_v11_0.cpp keeps this offset file-local; the fixtures repeat it here. */
 static constexpr uint32_t kSdmaShadowOff = 0x2000u;
+static constexpr uint32_t kGmcBarDoorbell = 2u;
 
 static bool in_sdma_window(uint64_t off)
 {
@@ -288,6 +290,17 @@ static bool io_bus(void *ctx, uint32_t bar, uint64_t off, uint64_t *value, bool 
     Dev &d = *static_cast<Dev *>(ctx);
     if (!value || dwords == 0u || dwords > 2u)
         return false;
+    if (bar == kGmcBarDoorbell) {
+        /* BAR2: 64-bit doorbell aperture. Only the SDMA0 queue0 index is
+         * modelled; the write publishes the wptr shadow to the engine. */
+        if (!write || dwords != 2u || (off & 7ull) != 0ull || off > 0x1000ull)
+            return false;
+        d.doorbells.push_back(*value);
+        d.trace.push_back({'D', static_cast<uint32_t>(off >> 2)});
+        if (off == 0x800ull)
+            mcu_poll(d);
+        return true;
+    }
     if (bar != R3_IO_BAR_VRAM)
         return false;
     if ((off & 3ull) != 0ull ||
@@ -463,6 +476,9 @@ static bool build_fixture(Fixture &f, Dev &d)
     f.env.hdp_flush_dword = 0x80000u;
     f.env.hdp_flush_valid = true;
     f.env.strict_expect = true;
+    f.env.sdma_doorbell = 0x200u;
+    f.env.sdma_doorbell_valid = true;
+
 
     memset(&f.io, 0, sizeof(f.io));
     f.io.ctx = &d;
@@ -604,8 +620,10 @@ static void test_s7_gart(void)
     r = gart_v11_0_substep(&f.io, &f.env);
     CHECK(r.status == kR3SsecOk, "s7 ok (name=%s step=%u)", r.name, r.step);
     /* W1: one 20-byte packet was appended; both pointers are BYTE offsets. */
-    CHECK(d.bar5[kSdma0 + 0x0085u] == 20u, "doorbell wptr is a byte offset (got 0x%x)",
-          d.bar5[kSdma0 + 0x0085u]);
+    CHECK(d.doorbells.size() == 1u && d.doorbells[0] == 20u,
+          "doorbell wptr is a byte offset (got 0x%llx)",
+          d.doorbells.empty() ? 0ull : (unsigned long long)d.doorbells[0]);
+    CHECK(d.bar5[kSdma0 + 0x0085u] == 0u, "no RB_WPTR MMIO kick");
     CHECK(d.bar5[kSdma0 + 0x0083u] == 20u, "consumed rptr is a byte offset (got 0x%x)",
           d.bar5[kSdma0 + 0x0083u]);
     /* VMID0 flat configuration on both hubs (CNTL is an RMW: DEPTH stays 0) */
@@ -680,8 +698,10 @@ static void test_s7_gart_nonzero_rptr(void)
     CHECK(d.bar5[kSdma0 + 0x0083u] == 100u, "s6 does not move the sdma rptr");
     r = gart_v11_0_substep(&f.io, &f.env);
     CHECK(r.status == kR3SsecOk, "s7 ok with rptr=100 (name=%s step=%u)", r.name, r.step);
-    CHECK(d.bar5[kSdma0 + 0x0085u] == 120u, "doorbell = 100+20 bytes (got 0x%x)",
-          d.bar5[kSdma0 + 0x0085u]);
+    CHECK(d.doorbells.size() == 1u && d.doorbells[0] == 120u,
+          "doorbell = 100+20 bytes (got 0x%llx)",
+          d.doorbells.empty() ? 0ull : (unsigned long long)d.doorbells[0]);
+    CHECK(d.bar5[kSdma0 + 0x0085u] == 0u, "no RB_WPTR MMIO kick");
     CHECK(d.bar5[kSdma0 + 0x0083u] == 120u, "consumed rptr = 120 bytes (got 0x%x)",
           d.bar5[kSdma0 + 0x0083u]);
     const R3Grant *tb = r3_layout_grant(&f.rt.layout, "test_buf");
@@ -819,28 +839,29 @@ static void test_s7_visibility_ordering(void)
           r.name, r.step);
     CHECK(d.flush_at < d.trace.size(), "hdp flush recorded in the trace");
 
-    size_t bytes_before = 0u, kick_before = 0u, kick_after = 0u, reads_after = 0u;
+    size_t bytes_before = 0u, db_before = 0u, db_after = 0u, reads_after = 0u;
     for (size_t i = mark; i < d.trace.size(); i++) {
         if (i < d.flush_at && d.trace[i].kind == 'B')
             bytes_before++;
-        if (d.trace[i].kind == 'M') {
+        if (d.trace[i].kind == 'D') {
             if (i < d.flush_at)
-                kick_before++;
+                db_before++;
             else
-                kick_after++;
+                db_after++;
         }
     }
     for (size_t i = d.flush_at + 1; i < d.trace.size(); i++) {
-        if (d.trace[i].kind == 'M')
+        if (d.trace[i].kind == 'D')
             break;
         if (d.trace[i].kind == 'R')
             reads_after++;
     }
 
     CHECK(bytes_before == 6u, "six sdma writes before flush (got %zu)", bytes_before);
-    CHECK(kick_before == 0u, "no kick before flush (got %zu)", kick_before);
-    CHECK(kick_after == 2u, "both kick writes after flush (got %zu)", kick_after);
-    CHECK(reads_after == 6u, "six readbacks between flush and kick (got %zu)", reads_after);
+    CHECK(db_before == 0u, "no doorbell before flush (got %zu)", db_before);
+    CHECK(db_after == 1u, "the doorbell follows the flush (got %zu)", db_after);
+    CHECK(reads_after == 6u, "six readbacks between flush and doorbell (got %zu)",
+          reads_after);
 }
 
 /* Discriminating experiment: with a publishing flush the engine consumes the
@@ -860,8 +881,10 @@ static void test_s7_mcu_poll_semantics(void)
           r.name, r.step);
     CHECK(d.flush_copies, "fixture defaults to publishing flushes");
     CHECK(d.mcu_polls >= 1u, "mcu polled the queue shadow (got %u)", d.mcu_polls);
-    CHECK(d.bar5[kSdma0 + 0x0085u] == 20u, "kick wptr is 20 bytes (got 0x%x)",
-          d.bar5[kSdma0 + 0x0085u]);
+    CHECK(d.bar5[kSdma0 + 0x0085u] == 0u, "no RB_WPTR MMIO kick");
+    CHECK(d.doorbells.size() == 1u && d.doorbells[0] == 20u,
+          "kick wptr is 20 bytes (got 0x%llx)",
+          d.doorbells.empty() ? 0ull : (unsigned long long)d.doorbells[0]);
     CHECK(d.bar5[kSdma0 + 0x0083u] == 20u, "engine consumed 20 bytes (got 0x%x)",
           d.bar5[kSdma0 + 0x0083u]);
     CHECK(bar0_read32(d, g_sdma_ring_off + kSdmaShadowOff) == 20u,
@@ -894,8 +917,10 @@ static void test_s7_stale_shadow_no_consume(void)
     CHECK(r.status != kR3SsecOk, "s7 fails when the flush does not publish");
     CHECK(r.step == 4u, "s7 fails at the verify step (got %u)", r.step);
 
-    CHECK(d.bar5[kSdma0 + 0x0085u] == 0x14u, "kick wrote wptr=0x14 (got 0x%x)",
-          d.bar5[kSdma0 + 0x0085u]);
+    CHECK(d.doorbells.size() == 1u && d.doorbells[0] == 0x14u,
+          "kick wrote wptr=0x14 (got 0x%llx)",
+          d.doorbells.empty() ? 0ull : (unsigned long long)d.doorbells[0]);
+    CHECK(d.bar5[kSdma0 + 0x0085u] == 0u, "no RB_WPTR MMIO kick");
     CHECK(d.bar5[kSdma0 + 0x0083u] == 0u, "device consumed nothing (got 0x%x)",
           d.bar5[kSdma0 + 0x0083u]);
     CHECK(d.mcu_polls >= 1u, "mcu polled the queue shadow (got %u)", d.mcu_polls);
@@ -1039,6 +1064,23 @@ static void test_s8_gpuvm0(void)
     CHECK(got == kGmcTestMagic, "sdma wrote through the gpuvm (got 0x%x)", got);
 }
 
+static void test_s7_doorbell_index_missing(void)
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d), "fixture");
+    reset_fake_mem();
+    r3_writeguard_install_mm();
+    prepare_sdma(f);
+    f.env.sdma_doorbell_valid = false;
+    R3SubstepResult r = uma_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecOk, "s6 in no-doorbell seq (name=%s step=%u)", r.name, r.step);
+    r = gart_v11_0_substep(&f.io, &f.env);
+    CHECK(r.status == kR3SsecFail, "s7 fails closed without a doorbell index");
+    CHECK(strcmp(r.name, "prep:no-doorbell-index") == 0, "name %s", r.name);
+    CHECK(d.doorbells.empty(), "no doorbell write reached the aperture");
+}
+
 static void test_s9_vmid8(void)
 {
     Dev d;
@@ -1081,11 +1123,12 @@ static void test_s9_vmid8(void)
               (unsigned long long)*e, (unsigned long long)want);
     }
     /* W4/§7.2: the same install_mm accumulates sdma layout (1) + S6 layouts (6)
-     * + S7 GART rows (22) + S9 vmid8 first-15 rows = 44 grants. */
+     * + S7 GART rows (20) + the runtime SDMA doorbell (1) + S9 vmid8 first-15
+     * rows = 43 grants. */
     CHECK(r3_wg_grant_count() ==
-              kGmcSeqLayoutCount + kGartRowCount + kVmid8FirstInvalidateRow +
-              kSdmaLayoutCount,
-          "chain budget == 44 (got %u)", r3_wg_grant_count());
+              kGmcSeqLayoutCount + kGartRowCount + kGartDoorbellCount +
+              kVmid8FirstInvalidateRow + kSdmaLayoutCount,
+          "chain budget == 43 (got %u)", r3_wg_grant_count());
 }
 
 /* #6 regression: FAULT_CNTL (0x15c4) is verified read-only. The old path
@@ -1157,6 +1200,7 @@ int main(void)
     test_s7_stale_shadow_no_consume();
     test_s7_packet_readback_mismatch();
     test_s7_shadow_readback_mismatch();
+    test_s7_doorbell_index_missing();
     test_s8_gpuvm0();
     test_s9_vmid8();
     test_s9_fault_default_readonly();

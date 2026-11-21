@@ -349,6 +349,8 @@ static bool build_fixture(Fixture &f, Dev &d, bool psp_ready = true,
     f.env.hdp_flush_dword = 0x80000u;
     f.env.hdp_flush_valid = true;
     f.env.strict_expect = true;
+    f.env.sdma_doorbell = 0x200u;
+    f.env.sdma_doorbell_valid = true;
 
     memset(&f.io, 0, sizeof(f.io));
     f.io.ctx = &d;
@@ -515,6 +517,8 @@ static void test_register_golden(void)
         {"UTCL1_CNTL", kRegSdma0Utcl1Cntl, 0x003c},
         {"UTCL1_PAGE", kRegSdma0Utcl1Page, 0x003f},
         {"QUEUE0_DOORBELL", kRegSdma0Queue0Doorbell, 0x0092},
+        {"QUEUE0_DOORBELL_LOG", kRegSdma0Queue0DoorbellLog, 0x00a9},
+        {"QUEUE0_DOORBELL_OFFSET", kRegSdma0Queue0DoorbellOffset, 0x00ab},
     };
     for (const Row &r : rows)
         CHECK(r.got == r.want, "%s: got 0x%x want 0x%x", r.name, r.got, r.want);
@@ -524,6 +528,9 @@ static void test_register_golden(void)
     CHECK(kSdmaOpWrite == 2, "SDMA_OP_WRITE");
     CHECK(kSdmaSubopWriteLinear == 0, "SDMA_SUBOP_WRITE_LINEAR");
     CHECK(kSdmaQueue0DoorbellEnableMask == 0x10000000u, "DOORBELL.ENABLE bit28");
+    CHECK(kSdmaQueue0DoorbellEnableShift == 28u, "DOORBELL.ENABLE shift 28");
+    CHECK(kSdmaDoorbellOffsetMask == 0x0ffffffcu, "DOORBELL_OFFSET mask");
+    CHECK(kSdmaDoorbellOffsetShift == 2u, "DOORBELL_OFFSET shift 2");
     CHECK(kUtcl1CntlRespModeMask == 0x00000600u && kUtcl1CntlRespModeShift == 9,
           "UTCL1_CNTL.RESP_MODE bits 9-10");
     CHECK(kUtcl1CntlRedoDelayMask == 0x0000001fu && kUtcl1CntlRedoDelayShift == 0,
@@ -663,11 +670,15 @@ static void test_happy_path(void)
     const uint32_t sem_timer = kSdmaBase0 + kRegSdma0SemWaitFailTimerCntl;
     const uint32_t watchdog = kSdmaBase0 + kRegSdma0WatchdogCntl;
     const uint32_t doorbell = kSdmaBase0 + kRegSdma0Queue0Doorbell;
+    const uint32_t doorbell_off = kSdmaBase0 + kRegSdma0Queue0DoorbellOffset;
     CHECK(d.bar5[sem_timer] == 0u, "SEM_WAIT_FAIL_TIMER_CNTL cleared");
     CHECK(d.bar5[watchdog] == (kSdmaWatchdogHangCount & kSdmaWatchdogHangCountMask),
           "WATCHDOG_CNTL hang count 0x%x", d.bar5[watchdog]);
-    CHECK((d.bar5[doorbell] & kSdmaQueue0DoorbellEnableMask) == 0u,
-          "QUEUE0_DOORBELL.ENABLE cleared");
+    CHECK((d.bar5[doorbell] & kSdmaQueue0DoorbellEnableMask) != 0u,
+          "QUEUE0_DOORBELL.ENABLE set (0x%08x)", d.bar5[doorbell]);
+    CHECK((d.bar5[doorbell_off] & kSdmaDoorbellOffsetMask) ==
+              ((0x200u << kSdmaDoorbellOffsetShift) & kSdmaDoorbellOffsetMask),
+          "QUEUE0_DOORBELL_OFFSET = 0x800 (0x%08x)", d.bar5[doorbell_off]);
 
     /* S5: UTCL1 programmed with Linux values; non-owned bits preserved. */
     const uint32_t utcl1_cntl = kSdmaBase0 + kRegSdma0Utcl1Cntl;
@@ -995,6 +1006,18 @@ static void test_readback_unreadable(void)
     CHECK(copy && strcmp(copy, "unreadable") == 0, "copy prop unreadable");
 }
 
+static void test_pre_no_doorbell_index(void)
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d), "fixture");
+    f.env.sdma_doorbell_valid = false;
+    RunResult rr = run(f, d);
+    CHECK(rr.r.status == kR3SsecFail, "must fail without a doorbell index");
+    CHECK(strcmp(rr.r.name, "prep:no-doorbell-index") == 0, "name %s", rr.r.name);
+    CHECK(d.writes.empty(), "no MMIO write before the doorbell check");
+}
+
 static void test_window_never_opens(void)
 {
     // SDMA-03: the window readback is evidence only. The substep proceeds and writes
@@ -1131,6 +1154,7 @@ static void test_relocated_grant(void)
 
 int main(void)
 {
+    test_pre_no_doorbell_index();
     test_register_golden();
     test_happy_path();
     test_psp_not_ready();

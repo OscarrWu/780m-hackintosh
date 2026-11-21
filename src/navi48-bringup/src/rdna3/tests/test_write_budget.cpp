@@ -59,8 +59,8 @@ static void test_budget_arithmetic(void)
           "layout total == 14 (got %u)", (unsigned)R3_WG_BUDGET_LAYOUT_TOTAL);
     CHECK(R3_WG_BUDGET_REG_TOTAL == 185u,
           "reg total == 185 (got %u)", (unsigned)R3_WG_BUDGET_REG_TOTAL);
-    CHECK(R3_WG_BUDGET_STAGE2 == 123u,
-          "stage2 == 123 (got %u)", (unsigned)R3_WG_BUDGET_STAGE2);
+    CHECK(R3_WG_BUDGET_STAGE2 == 124u,
+          "stage2 == 124 (got %u)", (unsigned)R3_WG_BUDGET_STAGE2);
     CHECK(R3_WG_BUDGET_TOTAL == 199u,
           "total == 199 (got %u)", (unsigned)R3_WG_BUDGET_TOTAL);
     CHECK(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
@@ -68,18 +68,19 @@ static void test_budget_arithmetic(void)
           (unsigned)R3_WG_BUDGET_TOTAL, (unsigned)R3_WG_GRANT_MAX);
     /* 附录 A 账目的收尾恒等式：阶段2 + 阶段2后各分项 == 全链总量。 */
     CHECK(R3_WG_BUDGET_STAGE2 + kHdpGrantCount + kGmcSeqLayoutCount + kGartRowCount +
-              kVmid8FirstInvalidateRow + kMesQueueLayoutCount + kGfxTeardownRowCount +
-              kIhTeardownRowCount + kIhInputRowCount + kGfxStage2RowCount +
-              kGfxStage3RowCount == R3_WG_BUDGET_TOTAL,
-          "stage2 + hdp + seq + gart + vmid8 + queue-layout + gfx-teardown + "
-          "ih-teardown + ih-input + gfx-stage2 + gfx-stage3 == total "
-          "(%u+%u+%u+%u+%u+%u+%u+%u+%u+%u+%u = %u)",
+              kGartDoorbellCount + kVmid8FirstInvalidateRow + kMesQueueLayoutCount +
+              kGfxTeardownRowCount + kIhTeardownRowCount + kIhInputRowCount +
+              kGfxStage2RowCount + kGfxStage3RowCount == R3_WG_BUDGET_TOTAL,
+          "stage2 + hdp + seq + gart + gart-db + vmid8 + queue-layout + "
+          "gfx-teardown + ih-teardown + ih-input + gfx-stage2 + gfx-stage3 == total "
+          "(%u+%u+%u+%u+%u+%u+%u+%u+%u+%u+%u+%u = %u)",
           (unsigned)R3_WG_BUDGET_STAGE2, (unsigned)kHdpGrantCount,
           (unsigned)kGmcSeqLayoutCount, (unsigned)kGartRowCount,
-          (unsigned)kVmid8FirstInvalidateRow, (unsigned)kMesQueueLayoutCount,
-          (unsigned)kGfxTeardownRowCount, (unsigned)kIhTeardownRowCount,
-          (unsigned)kIhInputRowCount, (unsigned)kGfxStage2RowCount,
-          (unsigned)kGfxStage3RowCount, (unsigned)R3_WG_BUDGET_TOTAL);
+          (unsigned)kGartDoorbellCount, (unsigned)kVmid8FirstInvalidateRow,
+          (unsigned)kMesQueueLayoutCount, (unsigned)kGfxTeardownRowCount,
+          (unsigned)kIhTeardownRowCount, (unsigned)kIhInputRowCount,
+          (unsigned)kGfxStage2RowCount, (unsigned)kGfxStage3RowCount,
+          (unsigned)R3_WG_BUDGET_TOTAL);
 }
 
 static void test_fill_to_capacity(void)
