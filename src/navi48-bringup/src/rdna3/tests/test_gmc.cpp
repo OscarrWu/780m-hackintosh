@@ -1143,6 +1143,24 @@ static void test_s9_vmid8(void)
         CHECK(*e == want, "s9 leaf pte (got 0x%llx want 0x%llx)",
               (unsigned long long)*e, (unsigned long long)want);
     }
+    /* FixB: the fence reuses the S9 page, so the VMID8 mapping must still
+     * consume exactly three pool pages (PDB1, PDB0, leaf).  A fourth page
+     * would mean an identity alias was added (rejected FixA direction). */
+    uint32_t pool_pages = 0u;
+    for (uint32_t p = 0u; p < kGmcPtPoolPages; p++) {
+        const uint8_t *pg = g_mem.buf[2].data() + kGmcPtRootBytes +
+                            static_cast<uint64_t>(p) * 4096u;
+        bool nz = false;
+        for (uint32_t b = 0u; b < 4096u; b++) {
+            if (pg[b] != 0u) {
+                nz = true;
+                break;
+            }
+        }
+        if (nz)
+            pool_pages++;
+    }
+    CHECK(pool_pages == 3u, "vmid8 pool pages used=%u (want 3)", pool_pages);
     /* W4/§7.2: the same install_mm accumulates sdma layout (1) + S6 layouts (6)
      * + S7 GART rows (20) + the runtime SDMA doorbell (1) + the CSDMA range
      * triplet (3) + S9 vmid8 first-15 rows = 46 grants. */
