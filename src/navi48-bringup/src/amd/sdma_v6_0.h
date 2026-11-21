@@ -6,8 +6,8 @@
  * write the wptr shadow copy, open the MINOR_PTR_UPDATE window and program RB_WPTR,
  * unhalt F32 + enable RB/IB (clearing doorbell ENABLE, zeroing SEM_WAIT_FAIL_TIMER
  * and arming WATCHDOG QUEUE_HANG_COUNT), poll the fence (2 s budget), compare the
- * target byte by byte (C4.2) and record UTCL1 defaults. SDMA0_STATUS_REG is the
- * cross evidence (S8).
+ * target byte by byte (C4.2), program UTCL1 at S5 and record it at S8.
+ * SDMA0_STATUS_REG is the cross evidence (S8).
  *
  * Address spaces (the two-space trap documented by K4):
  *   - R3Grant::start/size are BAR0 byte offsets; CPU copies use only BAR0 (B4).
@@ -84,6 +84,26 @@ constexpr uint32_t kStatusRbEmptyMask           = 0x00000004u; /* shift 2  */
 constexpr uint32_t kSdmaQueue0DoorbellEnableMask   = 0x10000000u; /* shift 28 */
 constexpr uint32_t kSdmaWatchdogHangCountMask      = 0x000000ffu; /* shift 0  */
 
+/* --- UTCL1_CNTL / UTCL1_PAGE fields ------------------------------------------------
+ * gc_11_0_0_sh_mask.h:389-400 (UTCL1_CNTL), :433-449 (UTCL1_PAGE). Linux programs
+ * both in sdma_v6_0_gfx_resume_instance() before the F32 unhalt
+ * (sdma_v6_0.c:583-596). Values are register bit masks; shifts are separate because
+ * field_set() takes both. Policy values: sdma_common.h:31,41.
+ */
+constexpr uint32_t kUtcl1CntlRedoDelayMask   = 0x0000001fu; /* shift 0  */
+constexpr uint32_t kUtcl1CntlRedoDelayShift  = 0;
+constexpr uint32_t kUtcl1CntlRespModeMask    = 0x00000600u; /* shift 9  */
+constexpr uint32_t kUtcl1CntlRespModeShift   = 9;
+constexpr uint32_t kUtcl1PageRmwKeepMask     = 0x00ff0fffu; /* Linux :592: clears bits 12-15 and 24-31 (bit24 re-set below) */
+constexpr uint32_t kUtcl1PagePolicyMask      = 0x0000f000u; /* bits 12-15 */
+constexpr uint32_t kUtcl1PageRdPolicyShift   = 12;
+constexpr uint32_t kUtcl1PageWrPolicyShift   = 14;
+constexpr uint32_t kUtcl1PageLlcNoAllocMask  = 0x01000000u; /* shift 24 */
+constexpr uint32_t kUtcl1CntlRedoDelayValue  = 9u;  /* Linux :586 */
+constexpr uint32_t kUtcl1CntlRespModeValue   = 3u;  /* Linux :585 */
+constexpr uint32_t kUtcl1PageRdL2Noa         = 2u;  /* CACHE_READ_POLICY_L2__DEFAULT */
+constexpr uint32_t kUtcl1PageWrL2Bypass      = 3u;  /* CACHE_WRITE_POLICY_L2__DEFAULT */
+
 /* --- WRITE_LINEAR packet (sdma_v6_0_0_pkt_open.h) --------------------------------
  * DW0 = header (op = SDMA_OP_WRITE, sub-op = SDMA_SUBOP_WRITE_LINEAR), DW1 = dst lo,
  * DW2 = dst hi, DW3 = count (data dwords - 1), DW4.. = data dwords.
@@ -128,10 +148,14 @@ static_assert((1u << kSdmaRbSize) == kSdmaRingDwords, "RB_SIZE must describe the
 
 constexpr uint32_t kSdmaFencePollUs     = 100;
 constexpr uint32_t kSdmaFenceBudgetUs   = 2000000; /* C4.2/S5: 2 s */
-/* Linux sdma_v6_0.c:577-581: max(usec_timeout / 100000, 1) with usec_timeout = 100 ms
- * per unit here, i.e. 2 s / 100 ms = 20. */
-constexpr uint32_t kSdmaWatchdogHangCount =
-    (kSdmaFenceBudgetUs / 100000u) > 1u ? (kSdmaFenceBudgetUs / 100000u) : 1u;
+/* Linux sdma_v6_0.c:577-581: max(usec_timeout / 100000, 1). amdgpu's default
+ * usec_timeout is 100 ms (amdgpu.h:278 AMDGPU_MAX_USEC_TIMEOUT = 100000 us), so the
+ * upstream count is 1. The 2 s fence budget is our poll bound, not the hardware
+ * watchdog; deriving the count from it made the watchdog expire together with the
+ * fence timeout and obscured the attribution of S7 failures (stage-2 D-4 class b).
+ * If real-silicon evidence shows a legitimate operation reset by 100 ms, restore 20
+ * and re-record the finding. */
+constexpr uint32_t kSdmaWatchdogHangCount = 1u;
 constexpr uint32_t kSdmaFencePolls      = kSdmaFenceBudgetUs / kSdmaFencePollUs;
 
 

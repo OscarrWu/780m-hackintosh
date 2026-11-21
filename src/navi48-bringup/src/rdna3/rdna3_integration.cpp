@@ -108,7 +108,7 @@ uint32_t register_smu(const IPBaseTable *ip)
     return n;
 }
 
-/* SDMA: layout:sdma + 17 reg rows. Step2: declaration table. */
+/* SDMA: layout:sdma + 19 reg rows. Step2: declaration table. */
 uint32_t register_sdma(const R3LayoutPlan *plan, const IPBaseTable *ip)
 {
     uint32_t n = 0;
@@ -281,7 +281,7 @@ int r3_integration_register_production(const R3LayoutPlan *plan,
         return -1;
     if (register_smu(ip) != 3u)
         return -1;
-    if (register_sdma(plan, ip) != 1u + 17u)
+    if (register_sdma(plan, ip) != 1u + amdgpu::getSdmaRowCount())
         return -1;
     if (register_mes(plan, ip) != 1u + amdgpu::getMesRowCount() + amdgpu::getMesDoorbellCount())
         return -1;

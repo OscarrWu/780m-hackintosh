@@ -524,7 +524,21 @@ static void test_register_golden(void)
     CHECK(kSdmaOpWrite == 2, "SDMA_OP_WRITE");
     CHECK(kSdmaSubopWriteLinear == 0, "SDMA_SUBOP_WRITE_LINEAR");
     CHECK(kSdmaQueue0DoorbellEnableMask == 0x10000000u, "DOORBELL.ENABLE bit28");
-    CHECK(kSdmaWatchdogHangCount == 20u, "WATCHDOG hang count 2s/100ms");
+    CHECK(kUtcl1CntlRespModeMask == 0x00000600u && kUtcl1CntlRespModeShift == 9,
+          "UTCL1_CNTL.RESP_MODE bits 9-10");
+    CHECK(kUtcl1CntlRedoDelayMask == 0x0000001fu && kUtcl1CntlRedoDelayShift == 0,
+          "UTCL1_CNTL.REDO_DELAY bits 0-4");
+    CHECK(kUtcl1PageRmwKeepMask == 0x00ff0fffu,
+          "UTCL1_PAGE Linux :592 keep mask clears bits 12-15 and 24-31");
+    CHECK(kUtcl1PagePolicyMask == 0x0000f000u, "UTCL1_PAGE RD/WR policy bits 12-15");
+    CHECK(kUtcl1PageLlcNoAllocMask == 0x01000000u, "UTCL1_PAGE LLC_NOALLOC bit 24");
+    CHECK(kUtcl1PageRdL2Noa == 2u && kUtcl1PageWrL2Bypass == 3u,
+          "sdma_common.h:31,41 default policies");
+    CHECK(kUtcl1CntlRespModeValue == 3u && kUtcl1CntlRedoDelayValue == 9u,
+          "Linux :585-586 programmed values");
+    CHECK(kUtcl1PageRdPolicyShift == 12u && kUtcl1PageWrPolicyShift == 14u,
+          "UTCL1_PAGE RD/WR policy shifts");
+    CHECK(kSdmaWatchdogHangCount == 1u, "WATCHDOG hang count 1 (Linux 100 ms unit)");
     CHECK(kWriteUntilDstLoOff == 1, "WRITE dst lo");
     CHECK(kWriteUntilDstHiOff == 2, "WRITE dst hi");
     CHECK(kWriteUntilCountOff == 3, "WRITE count");
@@ -545,6 +559,10 @@ static void test_register_golden(void)
 static void test_happy_path(void)
 {
     Dev d;
+    /* boot10 real-silicon readings: the S5 RMW must keep the bits this driver
+     * does not own (boot10 saw RESP_MODE=1 and REDO_DELAY=8 here). */
+    d.bar5[kSdmaBase0 + kRegSdma0Utcl1Cntl] = 0x1f000288u;
+    d.bar5[kSdmaBase0 + kRegSdma0Utcl1Page] = 0x010cec20u;
     Fixture f;
     CHECK(build_fixture(f, d), "fixture");
     const R3Grant *g = r3_layout_grant(&f.rt.layout, "sdma");
@@ -650,6 +668,19 @@ static void test_happy_path(void)
           "WATCHDOG_CNTL hang count 0x%x", d.bar5[watchdog]);
     CHECK((d.bar5[doorbell] & kSdmaQueue0DoorbellEnableMask) == 0u,
           "QUEUE0_DOORBELL.ENABLE cleared");
+
+    /* S5: UTCL1 programmed with Linux values; non-owned bits preserved. */
+    const uint32_t utcl1_cntl = kSdmaBase0 + kRegSdma0Utcl1Cntl;
+    const uint32_t utcl1_page = kSdmaBase0 + kRegSdma0Utcl1Page;
+    CHECK(d.bar5[utcl1_cntl] == 0x1f000689u,
+          "UTCL1_CNTL RESP_MODE=3 REDO_DELAY=9, reserved bits kept (0x%08x)",
+          d.bar5[utcl1_cntl]);
+    CHECK(d.bar5[utcl1_page] == 0x010cec20u,
+          "UTCL1_PAGE RD=NOA WR=BYPASS LLC_NOALLOC (0x%08x)", d.bar5[utcl1_page]);
+    CHECK(wm_find(utcl1_cntl, WClass::State) != nullptr,
+          "manifest s5-utcl1-cntl");
+    CHECK(wm_find(utcl1_page, WClass::State) != nullptr,
+          "manifest s5-utcl1-page");
 
     /* S4: the manifest line for the WPTR write carries both window readings. */
     const R3WMEntry *w = wm_find(rb_wptr, WClass::Protocol);

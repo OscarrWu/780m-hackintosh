@@ -6,11 +6,11 @@
  *   S2  stage the copy source pattern and one WRITE_LINEAR packet + one fence packet (②)
  *   S3  publish the write pointer into its shadow copy (③, SDMA-01)
  *   S4  program queue0 RB/RPTR/WB + open MINOR_PTR_UPDATE=1 -> RB_WPTR -> =0 (③/④)
- *   S5  SEM_WAIT_FAIL_TIMER=0, arm WATCHDOG, DOORBELL.ENABLE=0, F32 unhalt,
- *       RB_ENABLE, IB_ENABLE (④)
+ *   S5  SEM_WAIT_FAIL_TIMER=0, arm WATCHDOG, DOORBELL.ENABLE=0, UTCL1 CNTL/PAGE,
+ *       F32 unhalt, RB_ENABLE, IB_ENABLE (④)
  *   S6  poll the fence dword in the writeback buffer, 2 s budget
  *   S7  read the target back through BAR0 and compare byte by byte (C4.2)
- *   S8  SDMA0_STATUS_REG cross evidence + UTCL1_CNTL/PAGE record (C-12 Deviation)
+ *   S8  SDMA0_STATUS_REG cross evidence + UTCL1_CNTL/PAGE program/record evidence
  *
  * WRITE_LINEAR has a destination address but no source address: the CPU stages the
  * source buffer's bytes into the packet payload, so the source and the destination are
@@ -616,6 +616,76 @@ R3SubstepResult seq_queue_enable(Sdma &s)
         return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
     }
 
+    /* Linux sdma_v6_0_gfx_resume_instance() programs the UTCL1 translator at this
+     * point: after our watchdog/doorbell steps and before the F32 unhalt
+     * (sdma_v6_0.c:583-596). RESP_MODE=3 selects the non-copy response path
+     * (:583-585); REDO_DELAY=9 is the retry delay (:586). UTCL1_PAGE clears the
+     * RD/WR L2 policy fields and bits 24-31 (:592), then restores the defaults plus LLC_NOALLOC
+     * (:593-595). boot10 recorded RESP_MODE=1 before this change; that reading
+     * alone does not prove the S7 fault cause. */
+    {
+        const uint32_t utcl1_cntl = s.sdma0_base + kRegSdma0Utcl1Cntl;
+        const uint32_t utcl1_page = s.sdma0_base + kRegSdma0Utcl1Page;
+
+        const uint32_t cntl_before = reg_read(s, utcl1_cntl, &ok);
+        if (!ok) {
+            evf(s.env, "sdma-seq", "S5 UTCL1_CNTL read failed @0x%x", utcl1_cntl);
+            return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
+        }
+        const uint32_t cntl_v =
+            field_set(field_set(cntl_before, kUtcl1CntlRespModeMask,
+                                kUtcl1CntlRespModeShift, kUtcl1CntlRespModeValue),
+                      kUtcl1CntlRedoDelayMask, kUtcl1CntlRedoDelayShift,
+                      kUtcl1CntlRedoDelayValue);
+        if (!reg_write(s, utcl1_cntl, cntl_v, kR3WState, "s5-utcl1-cntl")) {
+            evf(s.env, "sdma-seq", "S5 UTCL1_CNTL write failed @0x%x", utcl1_cntl);
+            return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
+        }
+
+        const uint32_t page_before = reg_read(s, utcl1_page, &ok);
+        if (!ok) {
+            evf(s.env, "sdma-seq", "S5 UTCL1_PAGE read failed @0x%x", utcl1_page);
+            return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
+        }
+        const uint32_t page_v =
+            (page_before & kUtcl1PageRmwKeepMask) |
+            (kUtcl1PageRdL2Noa << kUtcl1PageRdPolicyShift) |
+            (kUtcl1PageWrL2Bypass << kUtcl1PageWrPolicyShift) |
+            kUtcl1PageLlcNoAllocMask;
+        if (!reg_write(s, utcl1_page, page_v, kR3WState, "s5-utcl1-page")) {
+            evf(s.env, "sdma-seq", "S5 UTCL1_PAGE write failed @0x%x", utcl1_page);
+            return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
+        }
+
+        /* Readback is evidence only: Linux never reads these registers back, and a
+         * mismatch must not gate S5 (the S6/S7 probes must stay attributable). Only
+         * the fields this driver owns are compared; the other bits are not owned
+         * here. An unreadable readback is recorded, never gated. */
+        bool rok = false, pok = false;
+        const uint32_t cntl_back = reg_read(s, utcl1_cntl, &rok);
+        const uint32_t page_back = reg_read(s, utcl1_page, &pok);
+        const uint32_t cntl_want =
+            (kUtcl1CntlRespModeValue << kUtcl1CntlRespModeShift) |
+            (kUtcl1CntlRedoDelayValue << kUtcl1CntlRedoDelayShift);
+        const uint32_t page_want =
+            (kUtcl1PageRdL2Noa << kUtcl1PageRdPolicyShift) |
+            (kUtcl1PageWrL2Bypass << kUtcl1PageWrPolicyShift) |
+            kUtcl1PageLlcNoAllocMask;
+        const bool cntl_ok =
+            rok && ((cntl_back & (kUtcl1CntlRespModeMask | kUtcl1CntlRedoDelayMask)) ==
+                    cntl_want);
+        const bool page_ok =
+            pok && ((page_back & (kUtcl1PagePolicyMask | kUtcl1PageLlcNoAllocMask)) ==
+                    page_want);
+        evf(s.env, "sdma-seq",
+            "S5 UTCL1_CNTL 0x%08x->0x%08x back=0x%08x%s "
+            "UTCL1_PAGE 0x%08x->0x%08x back=0x%08x%s",
+            cntl_before, cntl_v, cntl_back,
+            cntl_ok ? "" : (rok ? "(mismatch)" : "(unreadable)"),
+            page_before, page_v, page_back,
+            page_ok ? "" : (pok ? "(mismatch)" : "(unreadable)"));
+    }
+
     /* Linux order: unhalt the engine before RB_ENABLE, then IB_ENABLE. */
     const uint32_t cur_rb = reg_read(s, rb_cntl, &ok);
     if (!ok) {
@@ -741,9 +811,8 @@ R3SubstepResult chk_status(Sdma &s)
         return r;
     }
 
-    /* C-12 Deviation: MC passthrough needs no UTCL1 VMID/page programming (nullarc
-     * evidence on the same silicon). Stage 3 will add the Linux UTCL1 setup. Record the
-     * current defaults; an unreadable value is recorded, never gated. */
+    /* UTCL1 is programmed at S5 (Linux sdma_v6_0.c:583-596). S8 records the post-state
+     * as cross evidence; an unreadable value is recorded, never gated. */
     const uint32_t utcl1_cntl = s.sdma0_base + kRegSdma0Utcl1Cntl;
     const uint32_t utcl1_page = s.sdma0_base + kRegSdma0Utcl1Page;
     bool uok = false, pok = false;
@@ -752,7 +821,7 @@ R3SubstepResult chk_status(Sdma &s)
     s.utcl1_ok = uok && pok;
     evf(s.env, "sdma-chk",
         "S8 SDMA0_STATUS_REG=0x%08x idle=%u rb_empty=%u (cross evidence); "
-        "UTCL1_CNTL=0x%08x%s UTCL1_PAGE=0x%08x%s (defaults, C-12 Deviation)",
+        "UTCL1_CNTL=0x%08x%s UTCL1_PAGE=0x%08x%s (programmed at S5, recorded at S8)",
         v, (v & kStatusIdleMask) ? 1u : 0u, (v & kStatusRbEmptyMask) ? 1u : 0u,
         s.utcl1_cntl, uok ? "" : "(unreadable)", s.utcl1_page,
         pok ? "" : "(unreadable)");
@@ -849,7 +918,7 @@ R3SubstepResult sdma_v6_0_substep(const R3Io *io, const R3SubstepEnv *env)
 }
 
 /* Step2: declaration table (rdna3_writeguard.h R3WriteRowReg), the single source of truth
- * for the SDMA register write set. 17 rows, P5: unique address per row. */
+ * for the SDMA register write set. 19 rows, P5: unique address per row. */
 namespace {
 constexpr R3WriteRowReg kSdmaRows[] = {
     {&r3gold::kSdma0Queue0RbCntl,       static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::State,    WNeed::Required,      "s4-rb-cntl"},
@@ -868,10 +937,12 @@ constexpr R3WriteRowReg kSdmaRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0SemWaitFailTimerCntl, 1, WClass::State,  WNeed::Required,      "s5-sem-wait-timer"},
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0WatchdogCntl, 1, WClass::State,          WNeed::Required,      "s5-watchdog"},
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0Doorbell, 1, WClass::State,         WNeed::OnSuccessPath, "s5-doorbell"},
+    {&r3gold::kSdma0Utcl1Cntl,          static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::State,    WNeed::Required,      "s5-utcl1-cntl"},
+    {&r3gold::kSdma0Utcl1Page,          static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::State,    WNeed::Required,      "s5-utcl1-page"},
     {&r3gold::kSdma0F32Cntl,            static_cast<uint8_t>(IPBlock::SDMA0), 1, 0, 1, WClass::State,    WNeed::Required,      "s5-f32-unhalt"},
 };
 static_assert(sizeof(kSdmaRows) / sizeof(kSdmaRows[0]) == kSdmaRowCount,
-              "sdma declaration table must have 17 rows");
+              "sdma declaration table must have 19 rows");
 constexpr const char *kSdmaLayoutTag = "sdma";
 } // anonymous namespace
 
