@@ -41,7 +41,7 @@ constexpr uint32_t kPspLayoutCount   = 5u;   // psp_v13_0.cpp kPspLayouts[]（5 
 constexpr uint32_t kPspRowCount      = 5u;   // psp_v13_0.cpp kPspRows[]（MP0 C2PMSG 5 行）
 constexpr uint32_t kSmuRowCount      = 3u;   // smu_v13_0.cpp kSmuRows[]（MP1 C2PMSG 3 行）
 constexpr uint32_t kSdmaLayoutCount  = 1u;   // sdma_v6_0.cpp layout:sdma 计 1 条
-constexpr uint32_t kSdmaRowCount     = 19u;  // sdma_v6_0.cpp kSdmaRows[]（19 行）
+constexpr uint32_t kSdmaRowCount     = 20u;  // sdma_v6_0.cpp kSdmaRows[]（20 行）
 constexpr uint32_t kMesLayoutCount   = 1u;   // mes_v11_0.cpp layout:mes 计 1 条
 constexpr uint32_t kMesRowCount      = 74u;  // mes_v11_0.cpp kMesRows[]（52 hub + 10 S0-S5 + 12 HQD）
 constexpr uint32_t kMesDoorbellCount = 4u;   // mes_v11_0.cpp kMesDoorbells[]（kiq+sch+cmp+gfx）
@@ -50,7 +50,8 @@ constexpr uint32_t kMesQueueRowCount = 11u;  // mes_v11_0.cpp kMesQueueRows[]（
 // ---- 阶段2之后（S6..S11 增量）常量 ----
 constexpr uint32_t kHdpGrantCount           = 1u;   // stages.cpp reg:hdp-flush 共享窗口 1 条
 constexpr uint32_t kGmcSeqLayoutCount       = 6u;   // gmc_v11_0.cpp S6 uma 6 条 layout
-constexpr uint32_t kGartRowCount            = 22u;  // gmc_v11_0.cpp kGartRows[]（含 2 条 inv-arm + 1 条 fault-record）
+constexpr uint32_t kGartRowCount            = 20u;  // gmc_v11_0.cpp kGartRows[]（17 vbind + 2 inv-arm + 1 fault-record）
+constexpr uint32_t kGartDoorbellCount       = 1u;   // gmc_v11_0.cpp "reg:gmc-db"（SDMA0 QUEUE0 运行期门铃 1 条）
 constexpr uint32_t kVmid8FirstInvalidateRow = 15u;  // S9 只注册前 15 行（15..17 由 S7 已注册）
 constexpr uint32_t kVmid8RowCount           = 18u;  // 声明全集（expect 用；15..17 非 S9 注册）
 constexpr uint32_t kMesQueueLayoutCount     = 1u;   // mes S11 test_buf layout 计 1 条
@@ -75,17 +76,17 @@ constexpr uint32_t R3_WG_BUDGET_LAYOUT_TOTAL =
 constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
     kPspRowCount + kSmuRowCount + kSdmaRowCount + kMesRowCount +
     kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
-    kGartRowCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount +
+    kGartRowCount + kGartDoorbellCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount +
     kIhTeardownRowCount + kIhInputRowCount +
     kGfxStage2RowCount + kGfxStage3RowCount;                         // = 185
 constexpr uint32_t R3_WG_BUDGET_STAGE2 =
     kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
     kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
-    kMesQueueRowCount;                                               // = 123
+    kMesQueueRowCount;                                               // = 124
 constexpr uint32_t R3_WG_BUDGET_TOTAL =
     R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 199
 
-static_assert(R3_WG_BUDGET_STAGE2 == 123u, "阶段2 生产注册预算应为 123 项");
+static_assert(R3_WG_BUDGET_STAGE2 == 124u, "阶段2 生产注册预算应为 124 项");
 static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
 static_assert(R3_WG_BUDGET_REG_TOTAL == 185u, "全链 reg 预算应为 185 项");
 static_assert(R3_WG_BUDGET_TOTAL == 199u, "全链写守卫预算应为 199 项");
@@ -97,6 +98,7 @@ static_assert(kMesRowCount <= R3_WG_EXPECT_MAX, "MES 声明行数超过 R3_WG_EX
 static_assert(kMesDoorbellCount <= R3_WG_EXPECT_MAX, "MES 门铃数超过 R3_WG_EXPECT_MAX");
 static_assert(kMesQueueRowCount <= R3_WG_EXPECT_MAX, "MES 队列行数超过 R3_WG_EXPECT_MAX");
 static_assert(kGartRowCount <= R3_WG_EXPECT_MAX, "GART 行数超过 R3_WG_EXPECT_MAX");
+static_assert(kGartDoorbellCount <= R3_WG_EXPECT_MAX, "GART 门铃数超过 R3_WG_EXPECT_MAX");
 static_assert(kVmid8RowCount <= R3_WG_EXPECT_MAX, "VMID8 行数超过 R3_WG_EXPECT_MAX");
 static_assert(kPspRowCount <= R3_WG_EXPECT_MAX, "PSP 行数超过 R3_WG_EXPECT_MAX");
 static_assert(kPspLayoutCount <= R3_WG_EXPECT_MAX, "PSP layout 数超过 R3_WG_EXPECT_MAX");

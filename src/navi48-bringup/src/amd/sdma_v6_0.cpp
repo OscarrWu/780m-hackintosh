@@ -65,6 +65,8 @@ constexpr const char *kFailZero        = "seq:zero-fill";
 constexpr const char *kFailRing        = "seq:ring-packet";
 constexpr const char *kFailQueue       = "seq:queue-regs";
 constexpr const char *kFailWindow      = "seq:wptr-window";
+constexpr const char *kFailNoDoorbell  = "prep:no-doorbell-index";
+constexpr const char *kFailDoorbellCfg = "seq:doorbell-config";
 constexpr const char *kFailShadow      = "seq:wptr-shadow";
 constexpr const char *kFailFence       = "seq:fence-timeout";
 constexpr const char *kFailReadUnread  = "chk:readback-unreadable";
@@ -280,6 +282,12 @@ R3SubstepResult pre(Sdma &s)
     if (!s.env->hdp_flush_valid) {
         evf(s.env, "sdma-pre", "P0 no HDP visibility window (submit would be unsafe)");
         return r3_substep_fail(kR3SecPre, 0, kFailNoHdp);
+    }
+
+    if (!s.env->sdma_doorbell_valid) {
+        evf(s.env, "sdma-pre",
+            "P0 no SDMA doorbell index (runtime doorbell unassigned)");
+        return r3_substep_fail(kR3SecPre, 0, kFailNoDoorbell);
     }
 
     const IPBaseTable *ip = static_cast<const IPBaseTable *>(s.env->ip);
@@ -557,6 +565,43 @@ R3SubstepResult seq_wptr_window(Sdma &s)
         return r3_substep_fail(kR3SecSeq, 4, kFailWindow);
     }
 
+    /* Linux sdma_v6_0_gfx_resume_instance() writes RB_WPTR (sdma_v6_0.c:547-550),
+     * then reads DOORBELL/DOORBELL_OFFSET (:552-553), sets ENABLE=1 and
+     * OFFSET=ring->doorbell_index (:555-558), writes both back (:562-563), and only
+     * then drops MINOR_PTR_UPDATE (:574). Keep that relative order inside the
+     * protected window. OFFSET is DWORD-indexed with shift 2
+     * (sdma0_4_2_sh_mask.h:1230-1231): index 0x200 lands as 0x800. */
+    const uint32_t doorbell = s.sdma0_base + kRegSdma0Queue0Doorbell;
+    const uint32_t doorbell_off = s.sdma0_base + kRegSdma0Queue0DoorbellOffset;
+    bool dbok = false;
+    const uint32_t cur_db = reg_read(s, doorbell, &dbok);
+    bool offok = false;
+    const uint32_t cur_off = reg_read(s, doorbell_off, &offok);
+    if (!dbok || !offok) {
+        evf(s.env, "sdma-seq",
+            "S4 DOORBELL read failed (db_ok=%d off_ok=%d)", dbok ? 1 : 0,
+            offok ? 1 : 0);
+        if (!reg_write(s, minor, 0u, kR3WProtocol, "s4-window-close")) {
+            evf(s.env, "sdma-seq",
+                "S4 MINOR_PTR_UPDATE=0 cleanup write failed after DOORBELL read failure");
+        }
+        return r3_substep_fail(kR3SecSeq, 4, kFailDoorbellCfg);
+    }
+    const uint32_t db_v = field_set(cur_db, kSdmaQueue0DoorbellEnableMask,
+                                    kSdmaQueue0DoorbellEnableShift, 1u);
+    const uint32_t off_v = field_set(cur_off, kSdmaDoorbellOffsetMask,
+                                     kSdmaDoorbellOffsetShift,
+                                     s.env->sdma_doorbell);
+    if (!reg_write(s, doorbell, db_v, kR3WState, "s4-doorbell-enable") ||
+        !reg_write(s, doorbell_off, off_v, kR3WState, "s4-doorbell-offset")) {
+        evf(s.env, "sdma-seq", "S4 DOORBELL.ENABLE/OFFSET write failed");
+        if (!reg_write(s, minor, 0u, kR3WProtocol, "s4-window-close")) {
+            evf(s.env, "sdma-seq",
+                "S4 MINOR_PTR_UPDATE=0 cleanup write failed after DOORBELL write failure");
+        }
+        return r3_substep_fail(kR3SecSeq, 4, kFailDoorbellCfg);
+    }
+
     if (!reg_write(s, minor, 0u, kR3WProtocol, "s4-window-close")) {
         snprintf(s.wptr_ctx, sizeof(s.wptr_ctx), "s4-wptr-window pre=%u post=close-failed",
                  pre);
@@ -593,28 +638,19 @@ R3SubstepResult seq_queue_enable(Sdma &s)
 
     bool ok = false;
 
-    /* SDMA-04: Linux clears the semaphore wait-fail timer and arms the hang counter;
-     * clearing DOORBELL.ENABLE prevents a residue from kicking queue0. */
+    /* SDMA-04: Linux clears the semaphore wait-fail timer and arms the hang counter.
+     * DOORBELL.ENABLE/OFFSET are already programmed in S4 and must stay enabled;
+     * S5 only observes the register for the evidence line (read-only, not gated). */
     if (!reg_write(s, sem_timer, 0u, kR3WState, "s5-sem-wait-timer") ||
         !reg_write(s, watchdog, kSdmaWatchdogHangCount & kSdmaWatchdogHangCountMask,
                    kR3WState, "s5-watchdog")) {
         evf(s.env, "sdma-seq", "S5 SEM_WAIT_FAIL_TIMER/WATCHDOG write failed");
         return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
     }
-    uint32_t cur_db = reg_read(s, doorbell, &ok);
-    if (!ok) {
-        evf(s.env, "sdma-seq", "S5 QUEUE0_DOORBELL read failed @0x%x", doorbell);
-        return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
-    }
-    const uint32_t db = field_clear(cur_db, kSdmaQueue0DoorbellEnableMask);
-    if (!fence_barrier(s)) {
-        evf(s.env, "sdma-seq", "S5 HDP flush failed before doorbell");
-        return r3_substep_fail(kR3SecSeq, 5, kFailHdp);
-    }
-    if (!reg_write(s, doorbell, db, kR3WState, "s5-doorbell-enable-clear")) {
-        evf(s.env, "sdma-seq", "S5 QUEUE0_DOORBELL.ENABLE=0 write failed");
-        return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
-    }
+    const uint32_t cur_db = reg_read(s, doorbell, &ok);
+    if (!ok)
+        evf(s.env, "sdma-seq",
+            "S5 QUEUE0_DOORBELL read failed @0x%x (recorded, not gated)", doorbell);
 
     /* Linux sdma_v6_0_gfx_resume_instance() programs the UTCL1 translator at this
      * point: after our watchdog/doorbell steps and before the F32 unhalt
@@ -718,7 +754,7 @@ R3SubstepResult seq_queue_enable(Sdma &s)
 
     evf(s.env, "sdma-seq",
         "S5 sem_timer=0 watchdog=%u doorbell=0x%08x f32=0x%08x rb=0x%08x ib=0x%08x",
-        kSdmaWatchdogHangCount & kSdmaWatchdogHangCountMask, db, f32,
+        kSdmaWatchdogHangCount & kSdmaWatchdogHangCountMask, cur_db, f32,
         cur_rb | kRbCntlRbEnableMask, cur_ib | kIbCntlIbEnableMask);
     return r3_substep_pass();
 }
@@ -729,6 +765,15 @@ R3SubstepResult seq_fence(Sdma &s)
     uint32_t polls = 0;
     uint32_t last = 0;
     bool found = false;
+    /* 改动四: 进入轮询前 fence 必须为 0（L1 预清证据）。boot11 的 S6 以
+     * "0 polls" 通过，说明值在轮询前就已是期望值；若此处非 0，则 S6 的通过
+     * 可能是旧值残留，需回查 fence 预清。只读观测，读失败标 (unreadable)。 */
+    {
+        uint64_t pre = 0ull;
+        const bool pre_ok = bus_read(s, s.fence_bar0, 1u, &pre);
+        evf(s.env, "sdma-seq", "s6-fence-preclear=0x%08x%s",
+            static_cast<uint32_t>(pre), pre_ok ? "" : "(unreadable)");
+    }
 
     for (; polls < kSdmaFencePolls; polls++) {
         uint64_t v = 0;
@@ -918,7 +963,7 @@ R3SubstepResult sdma_v6_0_substep(const R3Io *io, const R3SubstepEnv *env)
 }
 
 /* Step2: declaration table (rdna3_writeguard.h R3WriteRowReg), the single source of truth
- * for the SDMA register write set. 19 rows, P5: unique address per row. */
+ * for the SDMA register write set. 20 rows, P5: unique address per row. */
 namespace {
 constexpr R3WriteRowReg kSdmaRows[] = {
     {&r3gold::kSdma0Queue0RbCntl,       static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::State,    WNeed::Required,      "s4-rb-cntl"},
@@ -934,15 +979,16 @@ constexpr R3WriteRowReg kSdmaRows[] = {
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0RbWptrPollAddrHi, 1, WClass::State, WNeed::Required,     "s4-wptr-poll-hi"},
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0RbWptrPollAddrLo, 1, WClass::State, WNeed::Required,     "s4-wptr-poll-lo"},
     {&r3gold::kSdma0Queue0MinorPtrUpdate, static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::Protocol, WNeed::Required,    "s4-window"},
+    {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0Doorbell, 1, WClass::State, WNeed::Required, "s4-doorbell-enable"},
+    {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0DoorbellOffset, 1, WClass::State, WNeed::Required, "s4-doorbell-offset"},
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0SemWaitFailTimerCntl, 1, WClass::State,  WNeed::Required,      "s5-sem-wait-timer"},
     {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0WatchdogCntl, 1, WClass::State,          WNeed::Required,      "s5-watchdog"},
-    {nullptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, kRegSdma0Queue0Doorbell, 1, WClass::State,         WNeed::OnSuccessPath, "s5-doorbell"},
     {&r3gold::kSdma0Utcl1Cntl,          static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::State,    WNeed::Required,      "s5-utcl1-cntl"},
     {&r3gold::kSdma0Utcl1Page,          static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1, WClass::State,    WNeed::Required,      "s5-utcl1-page"},
     {&r3gold::kSdma0F32Cntl,            static_cast<uint8_t>(IPBlock::SDMA0), 1, 0, 1, WClass::State,    WNeed::Required,      "s5-f32-unhalt"},
 };
 static_assert(sizeof(kSdmaRows) / sizeof(kSdmaRows[0]) == kSdmaRowCount,
-              "sdma declaration table must have 19 rows");
+              "sdma declaration table must have 20 rows");
 constexpr const char *kSdmaLayoutTag = "sdma";
 } // anonymous namespace
 

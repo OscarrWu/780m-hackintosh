@@ -471,7 +471,7 @@ kern_return_t run_stage(BringupContext &ctx, BringupStage s) {
         // NBIO S2A doorbell range for SDMA0 (Linux sdma_v7_0_gfx_resume via nbio->sdma_doorbell_range):
         // index = doorbell_index.sdma_engine[0] << 1 (64-bit doorbells), range size 20.
         r = nbif_v6_3_1_sdma_doorbell_range(dev, 0, true, (int)(dev.doorbell.index.sdma_engine[0] << 1), 20);
-        if (r != kIOReturnSuccess) INIT_LOG("SDMAInit: sdma_doorbell_range failed %#x (SDMA also kicks RB_WPTR via MMIO)", r);
+        if (r != kIOReturnSuccess) INIT_LOG("SDMAInit: sdma_doorbell_range failed %#x (SDMA runtime kick uses the BAR2 doorbell)", r);
         r = sdma_init_full(dev, ctx.psp, ctx.gmc, ctx.sdma);
         if (r != kIOReturnSuccess) return r;
         // 0.0.657 (GitHub issue #1): the SDMA0_DCC_CNTL no-PTE compression clear (0xaabe -> 0xaaaa) lands BEFORE any SDMA copy,

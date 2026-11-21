@@ -293,6 +293,12 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
     for (uint32_t i = 0; i < 5u; i++)
         ic->env.mes_aggregated[i] = d.doorbell.index.mes_aggregated[i];
     ic->env.mes_aggregated_valid = true;
+    /* SDMA0 QUEUE0 doorbell: sdma_engine[] is a QWORD index, so shift left once for the
+     * DWORD offset the engine filters on (Linux sdma_v6_0.c:1358-1359). A zero value means
+     * the layout never ran; the SDMA prep then fails closed instead of kicking index 0. */
+    ic->env.sdma_doorbell = d.doorbell.index.sdma_engine[0] << 1;
+    ic->env.sdma_doorbell_valid = ic->env.sdma_doorbell != 0u;
+
 
     /* T-E: bind the sysmem allocator so GMC substeps (S6-S9) can allocate
      * D1-D3 system memory. The allocator was set up by the driver via

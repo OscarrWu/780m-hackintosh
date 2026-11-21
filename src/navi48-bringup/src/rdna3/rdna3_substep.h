@@ -337,6 +337,12 @@ struct R3SubstepEnv {
     // false until then, and SET_HW fails closed rather than sending zero doorbells.
     uint32_t           mes_aggregated[5];
     bool               mes_aggregated_valid;
+    // SDMA0 QUEUE0 doorbell: DeviceContext.doorbell.index.sdma_engine[0] << 1, i.e. the
+    // DWORD index into the BAR2 doorbell aperture (Linux sdma_v6_0.c:1358-1359). The
+    // integration syncs it after bind_env; the SDMA prep fails closed when valid is false,
+    // so a missing sync cannot silently program OFFSET=0 and kick index 0.
+    uint32_t           sdma_doorbell;
+    bool               sdma_doorbell_valid;
     bool               strict_expect;  // Step2: true=host test (expectation failure→substep fail)
                                       //        false=true hardware (record only, no gate)
 

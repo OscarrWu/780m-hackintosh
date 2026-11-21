@@ -60,6 +60,8 @@ constexpr uint32_t kRegSdma0WatchdogCntl           = 0x002e; /* :74-75 */
 constexpr uint32_t kRegSdma0Utcl1Cntl              = 0x003c; /* :98-99 */
 constexpr uint32_t kRegSdma0Utcl1Page              = 0x003f; /* :104-105 */
 constexpr uint32_t kRegSdma0Queue0Doorbell         = 0x0092; /* :224-225 */
+constexpr uint32_t kRegSdma0Queue0DoorbellLog    = 0x00a9; /* :246-247 */
+constexpr uint32_t kRegSdma0Queue0DoorbellOffset = 0x00ab; /* :250-251 */
 
 
 constexpr int kSdma0BaseIdx   = 0; /* regSDMA0_*_BASE_IDX */
@@ -83,6 +85,9 @@ constexpr uint32_t kStatusIdleMask              = 0x00000001u; /* shift 0  */
 constexpr uint32_t kStatusRbEmptyMask           = 0x00000004u; /* shift 2  */
 constexpr uint32_t kSdmaQueue0DoorbellEnableMask   = 0x10000000u; /* shift 28 */
 constexpr uint32_t kSdmaWatchdogHangCountMask      = 0x000000ffu; /* shift 0  */
+constexpr uint32_t kSdmaQueue0DoorbellEnableShift  = 28;
+constexpr uint32_t kSdmaDoorbellOffsetMask         = 0x0ffffffcu; /* shift 2 */
+constexpr uint32_t kSdmaDoorbellOffsetShift        = 2;
 
 /* --- UTCL1_CNTL / UTCL1_PAGE fields ------------------------------------------------
  * gc_11_0_0_sh_mask.h:389-400 (UTCL1_CNTL), :433-449 (UTCL1_PAGE). Linux programs

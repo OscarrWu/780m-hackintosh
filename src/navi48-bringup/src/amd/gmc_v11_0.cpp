@@ -34,6 +34,7 @@
 #endif
 
 #include "amdgpu_ip.h"
+#include "sdma_v6_0.h"
 #include "../rdna3/golden_values.h"
 #include "../rdna3/rdna3_layout.h"
 #include "../rdna3/rdna3_runtime.h"
@@ -82,6 +83,7 @@ constexpr const char *kFailNoGrant = "pre:no-grant";
 constexpr const char *kFailNoSysmem = "pre:no-sysmem";
 constexpr const char *kFailRegister = "pre:register";
 constexpr const char *kFailRegisterFull = "pre:register-full";
+constexpr const char *kFailNoDoorbell = "prep:no-doorbell-index";
 constexpr const char *kFailMcMismatch = "seq:mc-mismatch";
 constexpr const char *kFailLayout = "seq:layout";
 constexpr const char *kFailGartRegs = "seq:gart-regs";
@@ -115,13 +117,22 @@ constexpr uint32_t kGmcSdmaRingOff = 0x000000u;
 constexpr uint32_t kGmcSdmaRbRptrOff = 0x0083u;  // kept as fast-path, golden resolver preferred
 /* WPTR shadow offset within SDMA grant (sdma_v6_0.h:109). */
 constexpr uint32_t kGmcSdmaWptrShadowOff = 0x2000u;
-/* sdma_submit failure steps (W3 verdicts). Doorbell is reserved for phase 2
- * and must not be used by the phase-1 submit path. */
+/* BAR2 doorbell aperture (R3Io::bus bar index) and the 64-bit store width
+ * (Linux WDOORBELL64, sdma_v6_0.c:224). */
+constexpr uint32_t kGmcBarDoorbell = 2u;
+constexpr uint32_t kGmcSdmaDoorbellDwords = 2u;
+/* NBIO S2A SDMA0 doorbell-range entry (nbio_7_7_0_offset.h, BASE_IDX 2).
+ * Read-only diagnostic: it shows whether the range window covers our index. */
+constexpr uint32_t kGmcS2aDoorbellEntry2Off = 0x01cdu;
+/* sdma_submit failure steps (W3 verdicts). The runtime doorbell store is the
+ * Linux ring_set_wptr wake-up (sdma_v6_0.c ring_set_wptr), not a phase-2
+ * reservation: the submit path kicks the queue through it. */
 enum : uint32_t {
     kSdmaStepNone = 0u,
     kSdmaStepFlush = 1u,
     kSdmaStepPktBack = 2u,
     kSdmaStepShadowBack = 3u,
+    kSdmaStepDoorbell = 4u,
 };
 /* MMHUB invalidate engine 17 golden symbols added in T-E;
  * mmhub_3_0_1_offset.h (BASE_IDX=1): ENG17_SEM=0x0762, ENG17_REQ=0x0774. */
@@ -172,8 +183,10 @@ WClass to_wclass(R3WClassId id)
 
 /* ---- row declaration tables (the single source of truth for the write set) ----
  * S7/S8 share one table: the vmBind register sequence is the same register
- * group (VM_CONTEXT0) on both hubs, plus the invalidate trio and the SDMA
- * submission pair. S9 has its own table (VM_CONTEXT8 + fault default); its
+ * group (VM_CONTEXT0) on both hubs, plus the invalidate trio. The SDMA
+ * submission is no longer a register pair here: Linux ring_set_wptr kicks the
+ * queue through the BAR2 doorbell, which is an absolute row (sdma_db_row), not
+ * an IP-base register. S9 has its own table (VM_CONTEXT8 + fault default); its
  * invalidate rows are declared but NOT re-registered (S7 owns those windows). */
 constexpr R3WriteRowReg kGartRows[] = {
     /* GC VM_CONTEXT0 group (golden) */
@@ -213,11 +226,6 @@ constexpr R3WriteRowReg kGartRows[] = {
      WClass::Protocol, WNeed::OnSuccessPath, "gmc:mm-inv-sem"},
     {&r3gold::kMmvmInvalidateEng17Req, static_cast<uint8_t>(IPBlock::MMHUB), 1, 0, 1,
      WClass::Protocol, WNeed::OnSuccessPath, "gmc:mm-inv-req"},
-    /* SDMA submission (golden) */
-    {&r3gold::kSdma0Queue0RbWptr, static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1,
-     WClass::Protocol, WNeed::OnSuccessPath, "gmc:sdma-wptr"},
-    {&r3gold::kSdma0Queue0MinorPtrUpdate, static_cast<uint8_t>(IPBlock::SDMA0), 0, 0, 1,
-     WClass::Protocol, WNeed::OnSuccessPath, "gmc:sdma-minor"},
     /* invalidation engine address-range arming (S7 only): 18 engines x 2
      * adjacent dwords per hub (Linux program_invalidation, stride 2) */
     {nullptr, static_cast<uint8_t>(IPBlock::GC), 0, kGcInvArmLoOff, 36u,
@@ -235,7 +243,7 @@ static_assert(sizeof(kGartRows) / sizeof(kGartRows[0]) == kGartRowCount,
 /* Rows [0, kGartVbindRowCount) are the vmBind/invalidate/SDMA set S8 re-walks;
  * the arm rows start at this index and are written by S7 only (the registers
  * persist across substeps, so S8 neither rewrites nor expects them). */
-constexpr uint32_t kGartVbindRowCount = 19u;
+constexpr uint32_t kGartVbindRowCount = 17u;
 static_assert(kGartVbindRowCount <= R3_WG_EXPECT_MAX,
               "gart vbind expectation set exceeds R3_WG_EXPECT_MAX");
 static_assert(kGartVbindRowCount < kGartRowCount, "vbind row subset");
@@ -336,7 +344,7 @@ struct Gmc {
 
     /* frequently used rows, copied out for readability */
     uint32_t gc_inv_req, gc_inv_ack, mm_inv_sem, mm_inv_req, mm_inv_ack;
-    uint32_t sdma_wptr, sdma_minor;
+    R3WriteRowAbs sdma_db_row;
     /* last sdma_submit, kept for the S7 failure diagnostic (W3) */
     uint32_t sdma_rptr_reg;
     uint32_t sdma_rptr_before;
@@ -362,6 +370,9 @@ struct Gmc {
     uint32_t entry_f32_cntl;
     uint32_t entry_rptr_fetch;
     uint32_t entry_rptr_fetch_hi;
+    uint32_t entry_doorbell;
+    uint32_t entry_doorbell_offset;
+    uint32_t entry_doorbell_log;
 
     /* grants / sysmem blocks */
     const R3Grant *sdma_grant;
@@ -455,17 +466,24 @@ void capture_gart_entry(Gmc &s)
         ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0RbRptrFetch);
     s.entry_rptr_fetch_hi = sdma0 == 0xffffffffu
         ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0RbRptrFetchHi);
+    s.entry_doorbell = sdma0 == 0xffffffffu
+        ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0Queue0Doorbell);
+    s.entry_doorbell_offset = sdma0 == 0xffffffffu
+        ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0Queue0DoorbellOffset);
+    s.entry_doorbell_log = sdma0 == 0xffffffffu
+        ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0Queue0DoorbellLog);
 }
 
 void log_gart_entry(const Gmc &s, const char *when)
 {
     evf(s.env, "gmc-gart",
         "diag s7-entry(%s): ctx0 cntl=0x%x pdb=0x%x%08x start=0x%x%08x end=0x%x%08x "
-        "f32=0x%x rptr-fetch=0x%x%08x",
+        "f32=0x%x rptr-fetch=0x%x%08x db=0x%x db-off=0x%x db-log=0x%x",
         when, s.entry_ctx0_cntl, s.entry_ctx0_pdb_hi, s.entry_ctx0_pdb_lo,
         s.entry_ctx0_start_hi, s.entry_ctx0_start_lo, s.entry_ctx0_end_hi,
         s.entry_ctx0_end_lo, s.entry_f32_cntl, s.entry_rptr_fetch_hi,
-        s.entry_rptr_fetch);
+        s.entry_rptr_fetch, s.entry_doorbell, s.entry_doorbell_offset,
+        s.entry_doorbell_log);
 }
 
 int bus_write(Gmc &s, uint64_t bar0_off, uint32_t value, uint32_t dwords, const char *ctx)
@@ -478,6 +496,23 @@ int bus_write(Gmc &s, uint64_t bar0_off, uint32_t value, uint32_t dwords, const 
         return -1;
     uint64_t v = value;
     s.io->bus(s.io->ctx, R3_IO_BAR_VRAM, bar0_off, &v, true, dwords);
+    return 0;
+}
+
+/* Kick the SDMA queue the way Linux ring_set_wptr does: a 64-bit store at
+ * index*4 in the BAR2 aperture. The caller has already fenced and flushed the
+ * host data path, so this helper does not repeat the HDP flush. */
+int gmc_doorbell_write(Gmc &s, uint32_t index, uint32_t value, const char *ctx)
+{
+    if (r3_wg_classify(index, kGmcSdmaDoorbellDwords, WClass::Protocol, ctx) !=
+        WVerdict::TxnRead)
+        return -1;
+    if (s.io->fence)
+        s.io->fence(s.io->ctx);
+    uint64_t v = value;
+    if (!s.io->bus(s.io->ctx, kGmcBarDoorbell, static_cast<uint64_t>(index) * 4ull,
+                   &v, true, kGmcSdmaDoorbellDwords))
+        return -1;
     return 0;
 }
 
@@ -758,12 +793,35 @@ int sdma_submit(Gmc &s, uint64_t dst_va, uint32_t value, const char *ctx)
     }
     s.sdma_fail_step = kSdmaStepNone;
 
-    /* protected WPTR update (nullarc: MINOR_PTR_UPDATE=1, write, =0) */
+    /* Linux ring_set_wptr: the engine reads the RB_WPTR shadow from memory, but
+     * only the 64-bit BAR2 doorbell store makes it look (sdma_v6_0.c:224). The
+     * expect row is re-armed here because verify_and_clear drops the set. */
     r3_wg_arm_substep(WSubstep::Gmc);
-    if (reg_write(s, s.sdma_minor, 1u, kR3WProtocol, ctx) ||
-        reg_write(s, s.sdma_wptr, wptr_bytes, kR3WProtocol, ctx) ||
-        reg_write(s, s.sdma_minor, 0u, kR3WProtocol, ctx))
+    if (!s.env->sdma_doorbell_valid) {
+        evf(s.env, "gmc-gart", "sdma submit: no doorbell index");
+        s.sdma_fail_step = kSdmaStepDoorbell;
         return -1;
+    }
+    if (r3_wg_expect_abs_writes(&s.sdma_db_row, 1u, WSubstep::Gmc) != 0) {
+        s.sdma_fail_step = kSdmaStepDoorbell;
+        return -1;
+    }
+    if (gmc_doorbell_write(s, s.sdma_db_row.addr, wptr_bytes, "gmc:sdma-db")) {
+        s.sdma_fail_step = kSdmaStepDoorbell;
+        return -1;
+    }
+    {
+        bool wok = false, rok = false;
+        const uint32_t rb_wptr_after =
+            reg_read(s, sdma_base + kRegSdma0Queue0RbWptr, &wok);
+        const uint32_t rptr_fetch_after =
+            reg_read(s, sdma_base + kRegSdma0RbRptrFetch, &rok);
+        evf(s.env, "gmc-gart",
+            "sdma-db-after: index=0x%x wptr=0x%x rb_wptr=0x%x%s rptr-fetch=0x%x%s",
+            s.sdma_db_row.addr, wptr_bytes, rb_wptr_after,
+            wok ? "" : "(unreadable)", rptr_fetch_after,
+            rok ? "" : "(unreadable)");
+    }
     s.sdma_rptr_reg = rptr_reg;
     s.sdma_rptr_before = rptr_bytes;
     s.last_sdma_wptr_bytes = wptr_bytes;
@@ -1068,14 +1126,19 @@ R3SubstepResult pre_gart(const R3Io *io, const R3SubstepEnv *env)
     if (g_gmc_fb_phys_base == 0)
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
 
-    /* 预算预检：整张 GART 行表（kGartRowCount 条）一次性预留；表满在阶段入口
-     * 失败（pre:register-full），不再逐条 register 折叠成 pre:register。 */
-    if (r3_wg_reserve(kGartRowCount) != 0) {
+    if (!env->sdma_doorbell_valid)
+        return r3_substep_fail(kR3SecPre, 0, kFailNoDoorbell);
+
+    const uint32_t need_rows = kGartRowCount + kGartDoorbellCount;
+    /* 预算预检：整张 GART 行表（kGartRowCount 条）加运行期 SDMA 门铃
+     * （kGartDoorbellCount 条）一次性预留；表满在阶段入口失败
+     * （pre:register-full），不再逐条 register 折叠成 pre:register。 */
+    if (r3_wg_reserve(need_rows) != 0) {
         evf(s.env, "gmc-gart", "grant budget: need=%u used=%u cap=%u",
-            kGartRowCount, r3_wg_grant_count(),
+            need_rows, r3_wg_grant_count(),
             static_cast<uint32_t>(R3_WG_GRANT_MAX));
         R3SubstepResult fr = r3_substep_fail(kR3SecPre, 0, kFailRegisterFull);
-        r3_substep_note(&fr, kGartRowCount, r3_wg_grant_count(), "gart need/used");
+        r3_substep_note(&fr, need_rows, r3_wg_grant_count(), "gart need/used");
         return fr;
     }
     const uint32_t grant_before = r3_wg_grant_count();
@@ -1094,16 +1157,39 @@ R3SubstepResult pre_gart(const R3Io *io, const R3SubstepEnv *env)
         if (rc != 0)
             return r3_substep_fail(kR3SecPre, 0, kFailRegister);
     }
-    if (r3_wg_grant_count() - grant_before != kGartRowCount) {
+    /* SDMA0 QUEUE0 doorbell: a BAR2 absolute row, not IP-base+offset, so it is
+     * registered separately and tracked as R3WriteRowAbs. sdma_submit re-arms
+     * the expect row on every call because verify_and_clear drops the set. */
+    if (r3_wg_register_reg(env->sdma_doorbell, kGmcSdmaDoorbellDwords,
+                           WClass::Protocol, WSubstep::Gmc, "reg:gmc-db") != 0) {
+        evf(s.env, "gmc-gart", "register doorbell index=0x%x failed",
+            env->sdma_doorbell);
+        return r3_substep_fail(kR3SecPre, 0, kFailRegister);
+    }
+    s.sdma_db_row.addr = env->sdma_doorbell;
+    s.sdma_db_row.dwords = kGmcSdmaDoorbellDwords;
+    s.sdma_db_row.cls = WClass::Protocol;
+    s.sdma_db_row.need = WNeed::OnSuccessPath;
+    s.sdma_db_row.ctx = "gmc:sdma-db";
+    if (r3_wg_grant_count() - grant_before != need_rows) {
         evf(s.env, "gmc-gart", "register increment %u != %u",
-            r3_wg_grant_count() - grant_before, kGartRowCount);
+            r3_wg_grant_count() - grant_before, need_rows);
         return r3_substep_fail(kR3SecPre, 0, kFailRegisterFull);
+    }
+    /* S2A read-only diagnostic: entry2 carries the SDMA0 range window the
+     * NBIF programmed (sdma_doorbell_range). Logged only; never gates. */
+    if (!s.ip->isResolved(IPBlock::NBIO, 2u)) {
+        evf(s.env, "gmc-gart", "s2a entry2: NBIO base unavailable");
+    } else {
+        bool s2a_ok = false;
+        const uint32_t nbio2 = s.ip->getBase(IPBlock::NBIO, 2u);
+        const uint32_t entry2 = reg_read(s, nbio2 + kGmcS2aDoorbellEntry2Off, &s2a_ok);
+        evf(s.env, "gmc-gart", "s2a entry2=0x%x%s", entry2,
+            s2a_ok ? "" : "(unreadable)");
     }
     s.gc_inv_req = s.rows_addr[14];
     s.mm_inv_sem = s.rows_addr[15];
     s.mm_inv_req = s.rows_addr[16];
-    s.sdma_wptr = s.rows_addr[17];
-    s.sdma_minor = s.rows_addr[18];
     if (resolve_inv_addrs(s))
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
     return r3_substep_pass();
@@ -1242,6 +1328,15 @@ R3SubstepResult seq_gart_verify(Gmc &s)
             "verify-fail: sdma rptr%s=0x%x (dword=0x%x) before=0x%x doorbell-wptr=0x%x",
             rptr_ok ? "" : "(unreadable)", rptr_now, rptr_now >> 2u,
             s.sdma_rptr_before, s.last_sdma_wptr_bytes);
+        const uint32_t db_base = s.ip->getBase(IPBlock::SDMA0, 0);
+        bool db_ok = false, off_ok = false;
+        const uint32_t db_now = db_base == 0xffffffffu
+            ? 0u : reg_read(s, db_base + kRegSdma0Queue0Doorbell, &db_ok);
+        const uint32_t db_off_now = db_base == 0xffffffffu
+            ? 0u : reg_read(s, db_base + kRegSdma0Queue0DoorbellOffset, &off_ok);
+        evf(s.env, "gmc-gart", "sdma-db-state: doorbell=0x%x%s offset=0x%x%s",
+            db_now, db_ok ? "" : "(unreadable)", db_off_now,
+            off_ok ? "" : "(unreadable)");
 
         log_gart_entry(s, "poll-fail");
         r3_substep_note(&f, static_cast<uint32_t>(s.test_grant->start + kGmcTestPageIntra),
@@ -1381,8 +1476,11 @@ R3SubstepResult pre_gpuvm0(const R3Io *io, const R3SubstepEnv *env)
     if (g_gmc_fb_phys_base == 0)
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
 
+    if (!env->sdma_doorbell_valid)
+        return r3_substep_fail(kR3SecPre, 0, kFailNoDoorbell);
     /* the write windows were registered by S7 (same addresses, same owner);
-     * resolve the row addresses for the expect set */
+     * resolve the row addresses for the expect set. The absolute doorbell row is
+     * not an IP-base row, so it is rebuilt here after the run_* memset. */
     for (uint32_t i = 0; i < kGartRowCount; i++) {
         uint32_t addr = 0;
         if (!row_addr(s.ip, kGartRows[i], &addr))
@@ -1392,8 +1490,11 @@ R3SubstepResult pre_gpuvm0(const R3Io *io, const R3SubstepEnv *env)
     s.gc_inv_req = s.rows_addr[14];
     s.mm_inv_sem = s.rows_addr[15];
     s.mm_inv_req = s.rows_addr[16];
-    s.sdma_wptr = s.rows_addr[17];
-    s.sdma_minor = s.rows_addr[18];
+    s.sdma_db_row.addr = env->sdma_doorbell;
+    s.sdma_db_row.dwords = kGmcSdmaDoorbellDwords;
+    s.sdma_db_row.cls = WClass::Protocol;
+    s.sdma_db_row.need = WNeed::OnSuccessPath;
+    s.sdma_db_row.ctx = "gmc:sdma-db";
     if (resolve_inv_addrs(s))
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
     return r3_substep_pass();
