@@ -42,6 +42,8 @@
 #include "../rdna3/rdna3_runtime.h"
 #include "../rdna3/rdna3_writeguard.h"
 
+#include "nbio_v7_7.h"
+
 namespace amdgpu {
 namespace {
 
@@ -60,6 +62,7 @@ constexpr const char *kFailNoCpu       = "pre:sdma-cpu";
 constexpr const char *kFailPspReady    = "pre:psp-not-ready";
 constexpr const char *kFailPspLatched  = "pre:psp-latched";
 constexpr const char *kFailNoHdp       = "pre:no-hdp-window";
+constexpr const char *kFailNoNbio      = "pre:no-nbio-rsmu";
 constexpr const char *kFailHdp         = "seq:hdp-flush";
 constexpr const char *kFailZero        = "seq:zero-fill";
 constexpr const char *kFailRing        = "seq:ring-packet";
@@ -67,8 +70,11 @@ constexpr const char *kFailQueue       = "seq:queue-regs";
 constexpr const char *kFailWindow      = "seq:wptr-window";
 constexpr const char *kFailNoDoorbell  = "prep:no-doorbell-index";
 constexpr const char *kFailDoorbellCfg = "seq:doorbell-config";
+constexpr const char *kFailRange       = "seq:csdma-range";
 constexpr const char *kFailShadow      = "seq:wptr-shadow";
-constexpr const char *kFailFence       = "seq:fence-timeout";
+constexpr const char *kFailSentinel    = "seq:dst-sentinel";
+constexpr const char *kFailDstUntouched = "seq:dst-untouched";
+constexpr const char *kFailDstUnread    = "seq:dst-unreadable";
 constexpr const char *kFailReadUnread  = "chk:readback-unreadable";
 constexpr const char *kFailReadMismatch = "chk:readback-mismatch";
 constexpr const char *kFailStatus      = "chk:status";
@@ -152,6 +158,11 @@ struct Sdma {
     bool                utcl1_ok;
     bool                fence_measured;
     bool                copy_ok;
+    uint32_t            f32_after;
+    bool                f32_after_ok;
+    uint32_t            nbio_rsmu_base;
+    uint32_t            csdma_range_addr;
+    R3WriteRowAbs       csdma_rows[3];
 
     /* The writeguard stores the ctx pointer in the manifest. We publish "pre=1" when the
      * WPTR write happens and overwrite the same buffer with the post reading after the
@@ -303,6 +314,24 @@ R3SubstepResult pre(Sdma &s)
     s.sdma0_base = ip->getBase(IPBlock::SDMA0, kSdma0BaseIdx);
     s.sdma_f32_base = ip->getBase(IPBlock::SDMA0, kSdmaF32BaseIdx);
 
+    if (!ip->isResolved(IPBlock::NBIO, nbio_v7_7::kRsmuBaseIdx) ||
+        !ip->isResolved(IPBlock::NBIO, nbio_v7_7::kCsdmaBaseIdx)) {
+        evf(s.env, "sdma-pre",
+            "P0 NBIO base unresolved (rsmu=%d csdma=%d)",
+            ip->isResolved(IPBlock::NBIO, nbio_v7_7::kRsmuBaseIdx) ? 1 : 0,
+            ip->isResolved(IPBlock::NBIO, nbio_v7_7::kCsdmaBaseIdx) ? 1 : 0);
+        return r3_substep_fail(kR3SecPre, 0, kFailNoNbio);
+    }
+    s.nbio_rsmu_base = ip->getBase(IPBlock::NBIO, nbio_v7_7::kRsmuBaseIdx);
+    s.csdma_range_addr = ip->getBase(IPBlock::NBIO, nbio_v7_7::kCsdmaBaseIdx) +
+                         nbio_v7_7::kCsdmaDoorbellRangeOff;
+    s.csdma_rows[0] = {s.csdma_range_addr, 1u, WClass::Protocol,
+                       WNeed::Required, "sdma:csdma-range"};
+    s.csdma_rows[1] = {s.nbio_rsmu_base + nbio_v7_7::kRsmuIndexOff, 1u,
+                       WClass::Protocol, WNeed::Required, "sdma:csdma-index"};
+    s.csdma_rows[2] = {s.nbio_rsmu_base + nbio_v7_7::kRsmuDataOff, 1u,
+                       WClass::Protocol, WNeed::Required, "sdma:csdma-data"};
+
     /* D3/§8.2: S0 pre for the SDMA0 version observation (before the F32 unhalt). It is
      * evidence only and never gates; the S8 post is recorded separately. */
     bool vok = false;
@@ -413,6 +442,18 @@ R3SubstepResult seq_zero_and_stage(Sdma &s)
     if (!write_dwords(s, s.src_bar0, pattern, kSdmaCopyDwords, "s2-copy-source")) {
         evf(s.env, "sdma-seq", "S2 source buffer stage failed");
         return r3_substep_fail(kR3SecSeq, 2, kFailRing);
+    }
+
+    /* S6 criterion: pre-fill the copy destination with a value the WRITE_LINEAR
+     * pattern can never produce, so a stale pattern from a previous round cannot
+     * be mistaken for "this round copied" (FixH orthogonal fix). */
+    uint32_t sentinel[kSdmaCopyDwords];
+    for (uint32_t i = 0; i < kSdmaCopyDwords; i++)
+        sentinel[i] = kSdmaSentinel;
+    if (!write_dwords(s, s.dst_bar0, sentinel, kSdmaCopyDwords,
+                      "s2-dst-sentinel")) {
+        evf(s.env, "sdma-seq", "S2 dst sentinel stage failed");
+        return r3_substep_fail(kR3SecSeq, 2, kFailSentinel);
     }
 
     uint32_t pkt[kWriteUntilData0Off + kSdmaCopyDwords + kWriteUntilData0Off + 1u];
@@ -602,6 +643,35 @@ R3SubstepResult seq_wptr_window(Sdma &s)
         return r3_substep_fail(kR3SecSeq, 4, kFailDoorbellCfg);
     }
 
+    /* Linux sdma_v6_0.c:565-568: after the queue doorbell is configured and
+     * before MINOR_PTR_UPDATE drops, route the CSDMA doorbells to this engine
+     * (nbio_v7_7.c:64-85). The register is reached through the RSMU pair. */
+    {
+        uint32_t range_before = 0u, range_after = 0u;
+        const nbio_v7_7::RangeResult rr =
+            nbio_v7_7::program_csdma_doorbell_range(
+                s.io, *static_cast<const IPBaseTable *>(s.env->ip),
+                s.env->sdma_doorbell, kSdmaDoorbellRangeSize, true,
+                &range_before, &range_after);
+        if (rr != nbio_v7_7::RangeResult::Ok) {
+            evf(s.env, "sdma-seq",
+                "S4 csdma-range failed reason=%u index=0x%x size=%u "
+                "before=0x%08x after=0x%08x",
+                static_cast<unsigned>(rr), s.env->sdma_doorbell,
+                kSdmaDoorbellRangeSize, range_before, range_after);
+            if (!reg_write(s, minor, 0u, kR3WProtocol, "s4-window-close")) {
+                evf(s.env, "sdma-seq",
+                    "S4 MINOR_PTR_UPDATE=0 cleanup failed after csdma-range");
+            }
+            return r3_substep_fail(kR3SecSeq, 4, kFailRange);
+        }
+        evf(s.env, "sdma-seq",
+            "S4 csdma-range index=0x%x size=%u before=0x%08x after=0x%08x "
+            "(OFFSET|SIZE verified)",
+            s.env->sdma_doorbell, kSdmaDoorbellRangeSize, range_before,
+            range_after);
+    }
+
     if (!reg_write(s, minor, 0u, kR3WProtocol, "s4-window-close")) {
         snprintf(s.wptr_ctx, sizeof(s.wptr_ctx), "s4-wptr-window pre=%u post=close-failed",
                  pre);
@@ -741,6 +811,12 @@ R3SubstepResult seq_queue_enable(Sdma &s)
         return r3_substep_fail(kR3SecSeq, 5, kFailQueue);
     }
 
+    bool f32ok = false;
+    s.f32_after = reg_read(s, f32_cntl, &f32ok);
+    s.f32_after_ok = f32ok;
+    evf(s.env, "sdma-seq", "S5 f32-after=0x%08x%s (read-only observation)",
+        s.f32_after, f32ok ? "" : "(unreadable)");
+
     const uint32_t cur_ib = reg_read(s, ib_cntl, &ok);
     if (!ok) {
         evf(s.env, "sdma-seq", "S5 IB_CNTL read failed @0x%x", ib_cntl);
@@ -765,44 +841,58 @@ R3SubstepResult seq_fence(Sdma &s)
     uint32_t polls = 0;
     uint32_t last = 0;
     bool found = false;
-    /* 改动四: 进入轮询前 fence 必须为 0（L1 预清证据）。boot11 的 S6 以
-     * "0 polls" 通过，说明值在轮询前就已是期望值；若此处非 0，则 S6 的通过
-     * 可能是旧值残留，需回查 fence 预清。只读观测，读失败标 (unreadable)。 */
+    bool dst_changed = false;
+    uint64_t dst_first = 0ull;
     {
         uint64_t pre = 0ull;
         const bool pre_ok = bus_read(s, s.fence_bar0, 1u, &pre);
         evf(s.env, "sdma-seq", "s6-fence-preclear=0x%08x%s",
             static_cast<uint32_t>(pre), pre_ok ? "" : "(unreadable)");
     }
-
-    for (; polls < kSdmaFencePolls; polls++) {
-        uint64_t v = 0;
-        if (!bus_read(s, s.fence_bar0, 1u, &v)) {
-            evf(s.env, "sdma-seq", "S6 fence read failed @bar0 0x%llx",
-                static_cast<unsigned long long>(s.fence_bar0));
-            return r3_substep_fail(kR3SecSeq, 6, kFailFence);
+    {
+        bool fok = false;
+        const uint32_t f32_now =
+            reg_read(s, s.sdma_f32_base + kRegSdma0F32Cntl, &fok);
+        evf(s.env, "sdma-seq", "s6-f32=0x%08x%s (read-only observation)",
+            f32_now, fok ? "" : "(unreadable)");
+    }
+    /* Completion criterion = the destination was overwritten (sentinel gone);
+     * the fence is only a same-round observation. The fence may already be
+     * written when S5 enables the queue, so gating on it alone would mistake
+     * "engine never fetched" for completion. */
+    for (; polls < kSdmaFencePolls;) {
+        polls++;
+        if (!bus_read(s, s.dst_bar0, 2u, &dst_first)) {
+            evf(s.env, "sdma-seq", "S6 dst read unreadable @bar0 0x%llx",
+                static_cast<unsigned long long>(s.dst_bar0));
+            return r3_substep_fail(kR3SecSeq, 6, kFailDstUnread);
         }
-        last = static_cast<uint32_t>(v);
-        if (last == kSdmaFenceMagic) {
-            found = true;
+        if (dst_first != ~0ull) {
+            dst_changed = true;
             break;
+        }
+        uint64_t v = 0ull;
+        if (bus_read(s, s.fence_bar0, 1u, &v)) {
+            last = static_cast<uint32_t>(v);
+            found = (last == kSdmaFenceMagic);
         }
         r3_io_udelay(s.io, kSdmaFencePollUs);
     }
-
     s.fence_measured = s.io->now_us != nullptr;
     s.fence_us = s.fence_measured
                      ? static_cast<uint32_t>(s.io->now_us(s.io->ctx) - t0)
                      : polls * kSdmaFencePollUs;
-    if (!found) {
+    evf(s.env, "sdma-seq", "S6 fence observe=0x%08x %s after %u us (%u polls)",
+        last, found ? "seen" : "not-seen", s.fence_us, polls);
+    if (!dst_changed) {
         evf(s.env, "sdma-seq",
-            "S6 fence timeout after %u us (%u polls), last=0x%08x want=0x%08x",
-            s.fence_us, polls, last, kSdmaFenceMagic);
-        return r3_substep_fail(kR3SecSeq, 6, kFailFence);
+            "S6 dst untouched (still 0x%016llx) after %u us (%u polls): "
+            "engine did not consume the ring",
+            static_cast<unsigned long long>(dst_first), s.fence_us, polls);
+        return r3_substep_fail(kR3SecSeq, 6, kFailDstUntouched);
     }
-
-    evf(s.env, "sdma-seq", "S6 fence=0x%08x after %u us (%u polls)",
-        last, s.fence_us, polls);
+    evf(s.env, "sdma-seq", "S6 dst changed=0x%016llx (fence is observation only)",
+        static_cast<unsigned long long>(dst_first));
     return r3_substep_pass();
 }
 
@@ -856,6 +946,14 @@ R3SubstepResult chk_status(Sdma &s)
         return r;
     }
 
+    {
+        bool fok = false;
+        const uint32_t f32_now =
+            reg_read(s, s.sdma_f32_base + kRegSdma0F32Cntl, &fok);
+        evf(s.env, "sdma-chk", "S8 f32=0x%08x%s (read-only observation)",
+            f32_now, fok ? "" : "(unreadable)");
+    }
+
     /* UTCL1 is programmed at S5 (Linux sdma_v6_0.c:583-596). S8 records the post-state
      * as cross evidence; an unreadable value is recorded, never gated. */
     const uint32_t utcl1_cntl = s.sdma0_base + kRegSdma0Utcl1Cntl;
@@ -906,6 +1004,9 @@ R3SubstepResult sdma_v6_0_substep(const R3Io *io, const R3SubstepEnv *env)
         return r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
 
     R3SubstepResult r = pre(s);
+    if (r.status == kR3SsecOk &&
+        r3_wg_expect_abs_writes(s.csdma_rows, 3u, WSubstep::Sdma) != 0)
+        r = r3_substep_fail(kR3SecPre, 0, "pre:expect-cap");
     if (r.status == kR3SsecOk)
         r = seq_zero_and_stage(s);
     if (r.status == kR3SsecOk)
@@ -938,9 +1039,16 @@ R3SubstepResult sdma_v6_0_substep(const R3Io *io, const R3SubstepEnv *env)
         set_prop(env, "N48R3EVID-sdma-done", "No");
         if (s.copy_ok)
             set_prop(env, "N48R3EVID-sdma-copy", "ok");
-        else if (r.section == kR3SecChk && r.step == 7)
-            set_prop(env, "N48R3EVID-sdma-copy",
-                     strcmp(r.name, kFailReadUnread) == 0 ? "unreadable" : "mismatch");
+        else if ((r.section == kR3SecChk && r.step == 7) ||
+                 (r.section == kR3SecSeq && r.step == 6)) {
+            const char *copy_state = "mismatch";
+            if (strcmp(r.name, kFailDstUntouched) == 0)
+                copy_state = "untouched";
+            else if (strcmp(r.name, kFailDstUnread) == 0 ||
+                     strcmp(r.name, kFailReadUnread) == 0)
+                copy_state = "unreadable";
+            set_prop(env, "N48R3EVID-sdma-copy", copy_state);
+        }
         else
             set_prop(env, "N48R3EVID-sdma-copy", "n/a");
         snprintf(s.wptr_prop, sizeof(s.wptr_prop), "pre=%u post=%u",

@@ -28,6 +28,7 @@
 
 #include "amdgpu_ip.h"
 #include "amd/sdma_v6_0.h"
+#include "amd/nbio_v7_7.h"
 #include "n48log_stub.h"
 #include "rdna3/rdna3_layout.h"
 #include "rdna3/rdna3_runtime.h"
@@ -45,6 +46,9 @@ constexpr uint64_t kBar0Bytes = 0x10000000ull; /* layout ceiling: 256 MiB */
 constexpr uint32_t kBar5Dwords = 0x100000u;
 constexpr uint32_t kSdmaBase0 = 0x20000u;
 constexpr uint32_t kSdmaBase1 = 0xa000u; /* regSDMA0_F32_CNTL_BASE_IDX = 1 */
+constexpr uint32_t kNbioBase1 = 0x14u;     /* RSMU INDEX/DATA (BASE_IDX 1) */
+constexpr uint32_t kNbioBase3 = 0x10400u;  /* CSDMA range segment (BASE_IDX 3) */
+constexpr uint32_t kCsdmaRangeAddr = kNbioBase3 + 0x4f0afbu;
 
 constexpr uint64_t kTmrSizeDefault = 0x4000000ull;  /* 64 MiB */
 constexpr uint64_t kGopEndRelocate = 0x7f00000ull; /* 127 MiB -> 128 MiB guard, forces SDMA relocation */
@@ -88,6 +92,8 @@ struct Dev {
     uint32_t fail_write_dword;
     uint64_t fail_bus_write_at;
     uint64_t fail_bus_read_at;
+    bool nbio_data_override_on;
+    uint32_t nbio_data_override;
 
     Dev()
         : bar0(static_cast<size_t>(kBar0Bytes), 0xa5u),
@@ -100,7 +106,9 @@ struct Dev {
           fail_read_dword(0xffffffffu),
           fail_write_dword(0xffffffffu),
           fail_bus_write_at(~0ull),
-          fail_bus_read_at(~0ull)
+          fail_bus_read_at(~0ull),
+          nbio_data_override_on(false),
+          nbio_data_override(0u)
     {
         bar5[kSdmaBase0 + kRegSdma0StatusReg] = 0x00000005u; /* IDLE | RB_EMPTY */
         bar5[kSdmaBase0 + kRegSdma0Queue0RbCntl] = 0x00040000u; /* timer=4 (nullarc) */
@@ -211,7 +219,10 @@ static bool io_mmio(void *ctx, uint32_t dword, uint32_t *value, bool write)
     d.reads.push_back(dword);
     if (dword == d.fail_read_dword)
         return false;
-    *value = d.bar5[dword];
+    if (dword == kNbioBase1 + 1u && d.nbio_data_override_on)
+        *value = d.nbio_data_override;
+    else
+        *value = d.bar5[dword];
     return true;
 }
 
@@ -316,6 +327,9 @@ static bool build_fixture(Fixture &f, Dev &d, bool psp_ready = true,
     f.ip = IPBaseTable();
     f.ip.set(IPBlock::SDMA0, kSdmaBase0);
     f.ip.setBase(IPBlock::SDMA0, 1, kSdmaBase1);
+    f.ip.set(IPBlock::NBIO, 0u);
+    f.ip.setBase(IPBlock::NBIO, 1, kNbioBase1);
+    f.ip.setBase(IPBlock::NBIO, 3, kNbioBase3);
 
     R3LayoutInputs in;
     memset(&in, 0, sizeof(in));
@@ -412,6 +426,15 @@ static RunResult run(Fixture &f, Dev &d)
               "register sdma grant");
     }
     register_sdma_rows();
+    CHECK(r3_wg_register_reg(kCsdmaRangeAddr, 1u, WClass::Protocol, WSubstep::Sdma,
+                             "reg:sdma-csdma") == 0,
+          "register csdma range target");
+    CHECK(r3_wg_register_shared_reg(kNbioBase1 + 0u, 1u, WClass::Protocol, WSubstep::Sdma,
+                                    "reg:sdma-rsmu-index") == 0,
+          "register RSMU index port");
+    CHECK(r3_wg_register_shared_reg(kNbioBase1 + 1u, 1u, WClass::Protocol, WSubstep::Sdma,
+                                    "reg:sdma-rsmu-data") == 0,
+          "register RSMU data port");
 
 
     RunResult out;
@@ -679,6 +702,10 @@ static void test_happy_path(void)
     CHECK((d.bar5[doorbell_off] & kSdmaDoorbellOffsetMask) ==
               ((0x200u << kSdmaDoorbellOffsetShift) & kSdmaDoorbellOffsetMask),
           "QUEUE0_DOORBELL_OFFSET = 0x800 (0x%08x)", d.bar5[doorbell_off]);
+    CHECK(d.bar5[kNbioBase1] == (kCsdmaRangeAddr << 2),
+          "RSMU INDEX = CSDMA reg << 2 (0x%08x)", d.bar5[kNbioBase1]);
+    CHECK(d.bar5[kNbioBase1 + 1u] == 0x140800u,
+          "RSMU DATA = encoded range (0x%08x)", d.bar5[kNbioBase1 + 1u]);
 
     /* S5: UTCL1 programmed with Linux values; non-owned bits preserved. */
     const uint32_t utcl1_cntl = kSdmaBase0 + kRegSdma0Utcl1Cntl;
@@ -727,7 +754,8 @@ static void test_happy_path(void)
     CHECK(ev_has(f, "S3 wptr shadow=100"), "evidence S3 shadow");
     CHECK(ev_has(f, "S4 queue config"), "evidence S4 config");
     CHECK(ev_has(f, "S4 WPTR window pre=1 post=0"), "evidence S4 window");
-    CHECK(ev_has(f, "S6 fence=0x"), "evidence S6");
+    CHECK(ev_has(f, "S4 csdma-range index=0x200"), "evidence S4 csdma-range");
+    CHECK(ev_has(f, "S6 dst changed"), "evidence S6 dst");
     CHECK(ev_has(f, "S7 target copy ok"), "evidence S7");
     CHECK(ev_has(f, "S8 SDMA0_STATUS_REG=0x"), "evidence S8");
     CHECK(ev_has(f, "S8b sdma0_version"), "evidence S8b version observation");
@@ -999,9 +1027,9 @@ static void test_readback_unreadable(void)
     d.fail_bus_read_at = g->start + kSdmaDstOff;
     RunResult rr = run(f, d);
     CHECK(rr.r.status == kR3SsecFail, "must fail");
-    CHECK(strcmp(rr.r.name, "chk:readback-unreadable") == 0, "name %s", rr.r.name);
+    CHECK(strcmp(rr.r.name, "seq:dst-unreadable") == 0, "name %s", rr.r.name);
     CHECK(!rr.ready, "no ready bit");
-    CHECK(ev_has(f, "S7 target read failed"), "evidence read failure");
+    CHECK(ev_has(f, "S6 dst read unreadable"), "evidence read failure");
     const char *copy = prop_get(f, "N48R3EVID-sdma-copy");
     CHECK(copy && strcmp(copy, "unreadable") == 0, "copy prop unreadable");
 }
@@ -1021,19 +1049,20 @@ static void test_pre_no_doorbell_index(void)
 static void test_window_never_opens(void)
 {
     // SDMA-03: the window readback is evidence only. The substep proceeds and writes
-    // RB_WPTR anyway; the engine never sees an open window, so the fence times out.
+    // RB_WPTR anyway; the engine never sees an open window, so the destination keeps
+    // its sentinel and S6 fails on the untouched-destination criterion.
     Dev d;
     Fixture f;
     CHECK(build_fixture(f, d), "fixture");
     d.window_never_opens = true;
     RunResult rr = run(f, d);
     CHECK(rr.r.status == kR3SsecFail, "must fail (engine never runs)");
-    CHECK(strcmp(rr.r.name, "seq:fence-timeout") == 0, "name %s", rr.r.name);
+    CHECK(strcmp(rr.r.name, "seq:dst-untouched") == 0, "name %s", rr.r.name);
     CHECK(d.wptr_writes.size() == 2u, "WPTR still written without a gating readback");
     CHECK(!all_wptr_writes_in_window(d), "writes happened outside the window");
     CHECK(!rr.ready, "no ready bit");
     CHECK(ev_has(f, "S4 WPTR window pre=0"), "window readback recorded");
-    CHECK(ev_has(f, "S6 fence timeout"), "evidence fence timeout");
+    CHECK(ev_has(f, "S6 dst untouched"), "evidence dst untouched");
 }
 
 static void test_window_read_unreadable()
@@ -1078,13 +1107,13 @@ static void test_fence_timeout(void)
     const uint64_t t0 = d.now;
     RunResult rr = run(f, d);
     CHECK(rr.r.status == kR3SsecFail, "must fail");
-    CHECK(strcmp(rr.r.name, "seq:fence-timeout") == 0, "name %s", rr.r.name);
+    CHECK(strcmp(rr.r.name, "seq:dst-untouched") == 0, "name %s", rr.r.name);
     CHECK(d.now - t0 >= kSdmaFenceBudgetUs, "bounded by the 2 s budget (%llu us)",
           static_cast<unsigned long long>(d.now - t0));
     const R3Grant *g = r3_layout_grant(&f.rt.layout, "sdma");
     CHECK(g && b0_32(d, g->start + kSdmaFenceOff) == 0u, "fence never written");
     CHECK(!rr.ready, "no ready bit");
-    CHECK(ev_has(f, "S6 fence timeout"), "evidence fence timeout");
+    CHECK(ev_has(f, "S6 dst untouched"), "evidence dst untouched");
 }
 
 static void test_readback_mismatch(void)
@@ -1150,6 +1179,49 @@ static void test_relocated_grant(void)
     CHECK(ev_has(f, "S7 target copy ok"), "relocated copy evidence");
 }
 
+static void test_s4_csdma_range_verify_fail(void)
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d), "fixture");
+    d.nbio_data_override_on = true;
+    d.nbio_data_override = 0u;
+    RunResult rr = run(f, d);
+    CHECK(rr.r.status == kR3SsecFail, "must fail on range readback");
+    CHECK(strcmp(rr.r.name, "seq:csdma-range") == 0, "name %s", rr.r.name);
+    CHECK(!rr.ready, "no ready bit");
+    const uint32_t minor = kSdmaBase0 + kRegSdma0Queue0MinorPtrUpdate;
+    CHECK(d.bar5[minor] == 0u, "MINOR window closed after range failure");
+    CHECK(ev_has(f, "S4 csdma-range failed"), "evidence range failure");
+
+    r3_writeguard_install_mm();
+    CHECK(r3_wg_register_reg(kCsdmaRangeAddr, 1u, WClass::Protocol, WSubstep::Sdma,
+                             "reg:sdma-csdma") == 0, "direct csdma grant");
+    CHECK(r3_wg_register_shared_reg(kNbioBase1 + 0u, 1u, WClass::Protocol, WSubstep::Sdma,
+                                    "reg:sdma-rsmu-index") == 0, "direct index grant");
+    CHECK(r3_wg_register_shared_reg(kNbioBase1 + 1u, 1u, WClass::Protocol, WSubstep::Sdma,
+                                    "reg:sdma-rsmu-data") == 0, "direct data grant");
+    r3_wg_arm_substep(WSubstep::Sdma);
+    uint32_t before = 0u, after = 0u;
+    CHECK(nbio_v7_7::program_csdma_doorbell_range(&f.io, f.ip, 0x200u, 20u, true, &before,
+                                                  &after) ==
+              nbio_v7_7::RangeResult::VerifyFail,
+          "direct helper reports VerifyFail");
+    r3_wg_disarm_substep();
+}
+
+static void test_pre_no_nbio(void)
+{
+    Dev d;
+    Fixture f;
+    CHECK(build_fixture(f, d), "fixture");
+    f.ip.setBase(IPBlock::NBIO, 3, 0xFFFFFFFFu);
+    RunResult rr = run(f, d);
+    CHECK(rr.r.status == kR3SsecFail, "must fail without NBIO CSDMA base");
+    CHECK(strcmp(rr.r.name, "pre:no-nbio-rsmu") == 0, "name %s", rr.r.name);
+    CHECK(!rr.ready, "no ready bit");
+}
+
 } /* namespace */
 
 int main(void)
@@ -1182,6 +1254,8 @@ int main(void)
     test_readback_mismatch();
     test_status_unreadable();
     test_relocated_grant();
+    test_s4_csdma_range_verify_fail();
+    test_pre_no_nbio();
 
     printf("test_sdma_msg: %u checks, %u failed\n", g_checks, g_fail);
     return g_fail == 0u ? 0 : 1;

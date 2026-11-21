@@ -145,6 +145,8 @@ constexpr uint64_t kSdmaFenceOff  = kSdmaWbOff + 0x0020ull; /* 4 B fence dword *
 constexpr uint32_t kSdmaCopyDwords = 16;                 /* 64 B copy proof */
 constexpr uint32_t kSdmaCopyBytes  = kSdmaCopyDwords * 4;
 constexpr uint32_t kSdmaFenceMagic = 0x53444d41u;        /* "SDMA", distinct from pattern */
+constexpr uint32_t kSdmaSentinel   = 0xFFFFFFFFu;        /* S2 dst pre-clear sentinel */
+constexpr uint32_t kSdmaDoorbellRangeSize = 20u;         /* Linux sdma_v6_0.c:565-568: size=20*instances */
 
 /* --- ring geometry and budgets ---------------------------------------------------- */
 constexpr uint32_t kSdmaRingDwords = static_cast<uint32_t>(kSdmaRingBytes / 4);
