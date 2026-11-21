@@ -616,8 +616,21 @@ static void test_s7_gart(void)
     CHECK(d.bar5[kGc0 + 0x16F4u] == static_cast<uint32_t>(g_mem.phys[0] >> 32),
           "gc ptb hi");
     CHECK(d.bar5[kGc0 + 0x1713u] == 0u, "gc start lo");
-    CHECK(d.bar5[kGc0 + 0x1733u] == 0xffffffffu, "gc end lo");
-    CHECK(d.bar5[kGc0 + 0x1734u] == 0x0fu, "gc end hi");
+    CHECK(d.bar5[kGc0 + 0x1733u] == 0x0007ffffu, "gc end lo (got 0x%x)",
+          d.bar5[kGc0 + 0x1733u]);
+    CHECK(d.bar5[kGc0 + 0x1734u] == 0x0u, "gc end hi");
+    CHECK(d.bar5[kMmhub1 + 0x07EBu] == 0x0007ffffu, "mmhub end lo");
+    CHECK(d.bar5[kMmhub1 + 0x07ECu] == 0x0u, "mmhub end hi");
+    /* The literal above is the card's acceptance value; keep it tied to the
+     * derived constant so the two cannot drift. */
+    CHECK(kGmcGartEndLo == 0x0007ffffu, "gart end lo constant matches the window");
+    /* The window must not cover the SDMA ring: boot10's 16 TiB window did,
+     * and the ring's PTE index ran past the 512K-entry table. */
+    const uint64_t end_va =
+        ((static_cast<uint64_t>(d.bar5[kGc0 + 0x1734u]) << 32) |
+         d.bar5[kGc0 + 0x1733u]) << 12u;
+    CHECK(0x800C000000ull > end_va, "gart window excludes the sdma ring (end=0x%llx)",
+          (unsigned long long)end_va);
     CHECK(d.bar5[kMmhub1 + 0x0740u] == 0x01fffe01u, "mmhub ctx0 cntl");
     CHECK(d.bar5[kMmhub1 + 0x07ABu] == static_cast<uint32_t>(g_mem.phys[0] | 3u),
           "mmhub ptb lo");
@@ -645,6 +658,9 @@ static void test_s7_gart(void)
     uint32_t got;
     memcpy(&got, &d.bar0[tb->start + kGmcTestPageIntra], 4);
     CHECK(got == kGmcTestMagic, "sdma wrote through the gart (got 0x%x)", got);
+    /* R4②: FAULT_CNTL is restored after the verify (record mode is transient). */
+    CHECK(d.bar5[kGc0 + 0x15C4u] == 0x00001ffcu,
+          "fault cntl restored after the verify (got 0x%x)", d.bar5[kGc0 + 0x15C4u]);
 }
 
 /* S5 leaves queue0's RB_RPTR at 100 bytes (boot6 driver log); dword and byte
@@ -700,14 +716,20 @@ static void test_s7_verify_failure_readings(void)
 
     bool saw_mismatch = false, saw_fault = false, saw_rptr = false;
     bool saw_shadow = false, saw_wptr = false, saw_cntl = false, saw_f32 = false;
+    bool saw_addr = false;
     for (uint32_t i = 0; i < r.reading_count; i++) {
         const R3SubstepReading &e = r.readings[i];
         if (strcmp(e.what, "gart verify mismatch") == 0)
             saw_mismatch = true;
-        if (strcmp(e.what, "gart-diag:mmhub-l2-fault-status") == 0) {
+        if (strcmp(e.what, "gart-diag:gfxhub-l2-fault-status") == 0) {
             saw_fault = true;
-            CHECK(e.value == d.bar5[kMmhub1 + 0x070Cu],
+            CHECK(e.value == d.bar5[kGc0 + 0x15C8u],
                   "fault-status reading matches the register (got 0x%x)", e.value);
+        }
+        if (strcmp(e.what, "gart-diag:gfxhub-l2-fault-addr-lo") == 0) {
+            saw_addr = true;
+            CHECK(e.value == d.bar5[kGc0 + 0x15C9u],
+                  "fault-address reading matches the register (got 0x%x)", e.value);
         }
         if (strcmp(e.what, "sdma rptr after poll") == 0)
             saw_rptr = true;
@@ -722,6 +744,7 @@ static void test_s7_verify_failure_readings(void)
     }
     CHECK(saw_mismatch, "failure keeps the mismatch reading");
     CHECK(saw_fault, "failure keeps the fault-status reading");
+    CHECK(saw_addr, "failure keeps the fault-address reading");
     CHECK(saw_rptr, "failure keeps the sdma rptr reading");
     CHECK(saw_shadow, "failure keeps the sdma wptr shadow reading");
     CHECK(saw_wptr, "failure keeps the sdma rb wptr reading");
@@ -739,10 +762,21 @@ static void test_s7_verify_failure_readings(void)
           "sdma status diag line");
     CHECK(strstr(n48log_host_text(), "gmc-gart: diag sdma shadow hi=0x") != nullptr,
           "sdma shadow hi diag line");
+    CHECK(strstr(n48log_host_text(), "gmc-gart: diag gfxhub-l2-fault: status=0x") != nullptr,
+          "gfxhub fault decode line");
+    CHECK(strstr(n48log_host_text(), "gmc-gart: diag mmhub-l2-fault-status=0x") != nullptr,
+          "mmhub fault pair stays in the log");
     CHECK(strstr(n48log_host_text(), "gmc-gart: diag gfxhub-fb-offset=0x6a0c") != nullptr,
           "gfxhub fb-offset uses the GC seg0 base, not 0x10000");
     CHECK(strstr(n48log_host_text(), "gmc-gart: diag mmhub-fb-offset=0x6a0c") != nullptr,
           "mmhub fb-offset uses the MMHUB seg1 base");
+    CHECK(d.bar5[kGc0 + 0x15C4u] == 0x00001ffcu,
+          "fault cntl restored on the failure path (got 0x%x)",
+          d.bar5[kGc0 + 0x15C4u]);
+    CHECK(strstr(n48log_host_text(), "gmc-gart: diag s7-entry(poll-fail): ctx0 cntl=0x") != nullptr,
+          "s7 entry snapshot line");
+    CHECK(strstr(n48log_host_text(), "rptr-fetch=0x") != nullptr,
+          "s7 entry snapshot carries the 64-bit fetch pointer");
 }
 
 /* A register that accepts the write but never latches it must be caught by the arming readback:
@@ -1047,11 +1081,11 @@ static void test_s9_vmid8(void)
               (unsigned long long)*e, (unsigned long long)want);
     }
     /* W4/§7.2: the same install_mm accumulates sdma layout (1) + S6 layouts (6)
-     * + S7 GART rows (21) + S9 vmid8 first-15 rows = 43 grants. */
+     * + S7 GART rows (22) + S9 vmid8 first-15 rows = 44 grants. */
     CHECK(r3_wg_grant_count() ==
               kGmcSeqLayoutCount + kGartRowCount + kVmid8FirstInvalidateRow +
               kSdmaLayoutCount,
-          "chain budget == 43 (got %u)", r3_wg_grant_count());
+          "chain budget == 44 (got %u)", r3_wg_grant_count());
 }
 
 /* #6 regression: FAULT_CNTL (0x15c4) is verified read-only. The old path

@@ -68,12 +68,28 @@ constexpr uint32_t kGmcPtPoolPages  = 1024u; /* 4MiB / 4KiB */
 constexpr uint32_t kGmcPtPoolBytes  = kGmcPtPoolPages * 4096u;
 constexpr uint32_t kGmcPtGrantBytes = kGmcPtRootBytes + kGmcPtPoolBytes;
 
-/* ---- vmBind register values (nullarc R10 §2.3) ---- */
+/* ---- vmBind register values (S8/S9 full-VA window, nullarc R10 §2.3) ----
+ * START/END are page numbers (Linux gfxhub_v3_0.c:133-148).  This window is
+ * the 16 TiB user-VM window used by the four-level paths (S8/S9); the flat
+ * GART has its own window right below. */
 constexpr uint32_t kGmcVbindCntl    = 0x01fffe07u;
 constexpr uint32_t kGmcVbindStartLo = 0u;
 constexpr uint32_t kGmcVbindStartHi = 0u;
 constexpr uint32_t kGmcVbindEndLo   = 0xffffffffu;
 constexpr uint32_t kGmcVbindEndHi   = 0x0fu;
+
+/* ---- S7 flat-GART window (Linux gfxhub_v3_0.c:133-148) ----
+ * The window must cover exactly the first-level table: one entry per 4 KiB
+ * page, so END = (kGmcGartEntries * 4 KiB - 1) >> 12 = 0x0007ffff (2 GiB).
+ * A wider window lets an address beyond the table walk past its end. */
+constexpr uint32_t kGmcGartStartLo = 0u;
+constexpr uint32_t kGmcGartStartHi = 0u;
+constexpr uint32_t kGmcGartEndLo =
+    static_cast<uint32_t>(((static_cast<uint64_t>(kGmcGartEntries) * 4096ull) - 1ull) >> 12);
+constexpr uint32_t kGmcGartEndHi =
+    static_cast<uint32_t>(((static_cast<uint64_t>(kGmcGartEntries) * 4096ull) - 1ull) >> 44);
+static_assert(kGmcGartEndLo == 0x0007ffffu, "flat-GART window covers the 512K-entry table");
+static_assert(kGmcGartEndHi == 0u, "flat-GART window page number fits in 44 bits");
 
 /* ---- Invalidate (Linux gmc_v11_0.c:220-312 degraded, nullarc R10 §2.3) ----
  * req = base | (1 << vmid) | 1; ack poll = 1 << vmid. Engine 17 fixed. */
@@ -82,8 +98,11 @@ constexpr uint32_t kGmcInvEng17  = 17u;
 constexpr uint32_t kGmcInvPolls  = 1000u;
 constexpr uint32_t kGmcInvPollUs = 1u;
 
-/* ---- S9 fault default (mesboot env_on("FAULT_DEFAULT") measured value) ---- */
+/* ---- fault control: mesboot env_on("FAULT_DEFAULT") measured value ---- */
 constexpr uint32_t kGmcFaultDefault = 0x3ffffffcu;
+/* mesboot gart() record mode: allow status updates, no default-page redirect,
+ * no crash (tools/phxctl/mesboot.c:113). */
+constexpr uint32_t kGmcFaultRecordMode = 0x00000002u;
 
 /* ---- Test VAs / pages ---- */
 constexpr uint64_t kGmcTestVaGart   = 0ull;            /* S7 flat GART */

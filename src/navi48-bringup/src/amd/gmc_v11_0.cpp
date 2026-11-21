@@ -224,6 +224,11 @@ constexpr R3WriteRowReg kGartRows[] = {
      WClass::State, WNeed::OnSuccessPath, "gmc:inv-arm-gc"},
     {nullptr, static_cast<uint8_t>(IPBlock::MMHUB), 1, kMmInvArmLoOff, 36u,
      WClass::State, WNeed::OnSuccessPath, "gmc:inv-arm-mm"},
+    /* R4②: record-mode FAULT_CNTL for the SDMA verify; mesboot leaves 0x2 so
+     * the first translation fault latches (tools/phxctl/mesboot.c:113). The
+     * entry value is restored by run_gart before S9 runs. */
+    {&r3gold::kGcvmL2ProtectionFaultCntl, static_cast<uint8_t>(IPBlock::GC), 0, 0, 1,
+     WClass::State, WNeed::OnSuccessPath, "gmc:fault-record"},
 };
 static_assert(sizeof(kGartRows) / sizeof(kGartRows[0]) == kGartRowCount,
               "gart row table shape");
@@ -239,12 +244,18 @@ static_assert(kGartRows[kGartVbindRowCount].golden == nullptr &&
               kGartRows[kGartVbindRowCount + 1u].golden == nullptr &&
               kGartRows[kGartVbindRowCount + 1u].dwords == kInvArmEngines * 2u,
               "arm rows must trail the vbind set");
+/* The fault-record row trails both arm rows; S8 never walks it. */
+constexpr uint32_t kGartFaultCntlRow = kGartVbindRowCount + 2u;
+static_assert(kGartRowCount == kGartFaultCntlRow + 1u,
+              "fault-record row trails the arm rows");
 
-/* GCVM_L2_PROTECTION_FAULT_CNTL (0x15c4) is verified read-only in this phase.
- * Linux programs it at GART enable (gmc_v11_0.c:243-284); the mesboot window
- * measured kGmcFaultDefault. Only the 13 enable-default bits and the two top
- * control bits carry meaning here, so the gate checks exactly those and leaves
- * the register untouched. */
+/* GCVM_L2_PROTECTION_FAULT_CNTL (0x15c4) gates fault recording and the
+ * default-page redirect. Linux switches the 11 ENABLE_DEFAULT bits through
+ * gfxhub_v3_0_set_fault_enable_default (gfxhub_v3_0.c:409-454); mesboot's
+ * gart() writes 0x2 for the bring-up window so the first fault latches
+ * (tools/phxctl/mesboot.c:113). S7 arms that record mode for the duration of
+ * the SDMA verify and restores the entry value afterwards; S9 still verifies
+ * the register read-only against kGmcFaultDefault (the FAULT_DEFAULT variant). */
 constexpr uint32_t kGmcFaultCntlLowMask = 0x00001fffu;
 constexpr uint32_t kGmcFaultCntlHighMask = 0xc0000000u;
 constexpr uint32_t kGmcFaultCntlWantLow = kGmcFaultDefault & kGmcFaultCntlLowMask;
@@ -336,6 +347,22 @@ struct Gmc {
     uint32_t sdma_shadow_back;
     uint32_t sdma_shadow_hi;   /* upper dword, observation only */
 
+    /* R4②: entry FAULT_CNTL value saved for the post-verify restore. */
+    uint32_t fault_cntl_saved;
+    bool fault_cntl_active;
+
+    /* R4③: S7 entry snapshot (context0 programming + SDMA fetch state). */
+    uint32_t entry_ctx0_cntl;
+    uint32_t entry_ctx0_pdb_lo;
+    uint32_t entry_ctx0_pdb_hi;
+    uint32_t entry_ctx0_start_lo;
+    uint32_t entry_ctx0_start_hi;
+    uint32_t entry_ctx0_end_lo;
+    uint32_t entry_ctx0_end_hi;
+    uint32_t entry_f32_cntl;
+    uint32_t entry_rptr_fetch;
+    uint32_t entry_rptr_fetch_hi;
+
     /* grants / sysmem blocks */
     const R3Grant *sdma_grant;
     const R3Grant *test_grant;
@@ -362,6 +389,83 @@ int reg_write(Gmc &s, uint32_t abs, uint32_t value, R3WClassId cls, const char *
         return -1;
     r3_io_write32(s.io, abs, value);
     return 0;
+}
+
+/* R4②: switch FAULT_CNTL to mesboot's record mode for the SDMA verify.  The
+ * entry value is kept so gart_fault_restore() can put it back; S9's read-only
+ * gate and test_s9_* keep expecting kGmcFaultDefault. */
+int gart_fault_record_begin(Gmc &s)
+{
+    const uint32_t addr = s.rows_addr[kGartFaultCntlRow];
+    bool ok = false;
+    s.fault_cntl_saved = reg_read(s, addr, &ok);
+    if (!ok) {
+        evf(s.env, "gmc-gart", "fault-cntl read failed at 0x%x", addr);
+        return -1;
+    }
+    if (reg_write(s, addr, kGmcFaultRecordMode, kR3WState, "gmc:fault-record")) {
+        evf(s.env, "gmc-gart", "fault-cntl record-mode write failed at 0x%x", addr);
+        return -1;
+    }
+    s.fault_cntl_active = true;
+    evf(s.env, "gmc-gart", "fault cntl record mode 0x%x (was 0x%x)",
+        kGmcFaultRecordMode, s.fault_cntl_saved);
+    return 0;
+}
+
+void gart_fault_restore(Gmc &s)
+{
+    if (!s.fault_cntl_active)
+        return;
+    const uint32_t addr = s.rows_addr[kGartFaultCntlRow];
+    if (reg_write(s, addr, s.fault_cntl_saved, kR3WState, "gmc:fault-restore"))
+        evf(s.env, "gmc-gart", "fault-cntl restore failed at 0x%x", addr);
+    else
+        evf(s.env, "gmc-gart", "fault cntl restored to 0x%x", s.fault_cntl_saved);
+    s.fault_cntl_active = false;
+}
+
+/* R4③: bounded read helper for the S7 entry snapshot.  An unreadable address
+ * yields 0xffffffff, which cannot be a valid context0 control/pointer value,
+ * so the log marks it unreadable instead of reporting a plausible zero. */
+uint32_t snap_read(Gmc &s, uint32_t addr)
+{
+    bool ok = false;
+    const uint32_t v = reg_read(s, addr, &ok);
+    return ok ? v : 0xffffffffu;
+}
+
+/* R4③: snapshot the context0 programming and the SDMA fetch state at S7 entry
+ * so a later failure can tell "fetched and failed translation" from "never
+ * fetched" (values are logged only on failure). */
+void capture_gart_entry(Gmc &s)
+{
+    s.entry_ctx0_cntl = snap_read(s, s.rows_addr[0]);
+    s.entry_ctx0_pdb_lo = snap_read(s, s.rows_addr[1]);
+    s.entry_ctx0_pdb_hi = snap_read(s, s.rows_addr[2]);
+    s.entry_ctx0_start_lo = snap_read(s, s.rows_addr[3]);
+    s.entry_ctx0_start_hi = snap_read(s, s.rows_addr[4]);
+    s.entry_ctx0_end_lo = snap_read(s, s.rows_addr[5]);
+    s.entry_ctx0_end_hi = snap_read(s, s.rows_addr[6]);
+    const uint32_t sdma1 = s.ip->getBase(IPBlock::SDMA0, 1);
+    const uint32_t sdma0 = s.ip->getBase(IPBlock::SDMA0, 0);
+    s.entry_f32_cntl = sdma1 == 0xffffffffu
+        ? 0xffffffffu : snap_read(s, sdma1 + kRegSdma0F32Cntl);
+    s.entry_rptr_fetch = sdma0 == 0xffffffffu
+        ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0RbRptrFetch);
+    s.entry_rptr_fetch_hi = sdma0 == 0xffffffffu
+        ? 0xffffffffu : snap_read(s, sdma0 + kRegSdma0RbRptrFetchHi);
+}
+
+void log_gart_entry(const Gmc &s, const char *when)
+{
+    evf(s.env, "gmc-gart",
+        "diag s7-entry(%s): ctx0 cntl=0x%x pdb=0x%x%08x start=0x%x%08x end=0x%x%08x "
+        "f32=0x%x rptr-fetch=0x%x%08x",
+        when, s.entry_ctx0_cntl, s.entry_ctx0_pdb_hi, s.entry_ctx0_pdb_lo,
+        s.entry_ctx0_start_hi, s.entry_ctx0_start_lo, s.entry_ctx0_end_hi,
+        s.entry_ctx0_end_lo, s.entry_f32_cntl, s.entry_rptr_fetch_hi,
+        s.entry_rptr_fetch);
 }
 
 int bus_write(Gmc &s, uint64_t bar0_off, uint32_t value, uint32_t dwords, const char *ctx)
@@ -694,11 +798,22 @@ int cross_check(Gmc &s, const uint32_t *rows, uint32_t vmid)
 }
 
 /* ---- vmBind register sequence (nullarc R10 §2.3) ----
- * CNTL=0x01fffe07, PDB|3, START=0, END=0xffffffff|0xf, on both hubs.  The
- * flat-GART caller (S7) keeps its own RMW-ed CNTL (DEPTH=0, mesboot gart()
- * :122 0x01fffe01) and passes write_cntl=false. */
+ * CNTL=0x01fffe07, PDB|3, then START/END from the window the caller owns.  The
+ * four-level paths (S8/S9) use the full-VA window; the flat-GART caller (S7)
+ * keeps its own RMW-ed CNTL (DEPTH=0, mesboot gart() :122 0x01fffe01), passes
+ * write_cntl=false and bounds the window to its first-level table. */
+struct VbindWindow {
+    uint32_t start_lo;
+    uint32_t start_hi;
+    uint32_t end_lo;
+    uint32_t end_hi;
+};
+constexpr VbindWindow kFullVaWindow = {kGmcVbindStartLo, kGmcVbindStartHi, kGmcVbindEndLo,
+                                       kGmcVbindEndHi};
+constexpr VbindWindow kGartWindow   = {kGmcGartStartLo, kGmcGartStartHi, kGmcGartEndLo,
+                                       kGmcGartEndHi};
 int vbind_write(Gmc &s, const uint32_t *regs, uint64_t root, bool write_cntl,
-                const char *ctx)
+                const VbindWindow &win, const char *ctx)
 {
     if (write_cntl &&
         reg_write(s, regs[0], kGmcVbindCntl, kR3WState, ctx))
@@ -706,10 +821,10 @@ int vbind_write(Gmc &s, const uint32_t *regs, uint64_t root, bool write_cntl,
     if (reg_write(s, regs[1], static_cast<uint32_t>((root | kGmcRootFlags) & 0xffffffffu),
                   kR3WState, ctx) ||
         reg_write(s, regs[2], static_cast<uint32_t>(root >> 32), kR3WState, ctx) ||
-        reg_write(s, regs[3], kGmcVbindStartLo, kR3WState, ctx) ||
-        reg_write(s, regs[4], kGmcVbindStartHi, kR3WState, ctx) ||
-        reg_write(s, regs[5], kGmcVbindEndLo, kR3WState, ctx) ||
-        reg_write(s, regs[6], kGmcVbindEndHi, kR3WState, ctx))
+        reg_write(s, regs[3], win.start_lo, kR3WState, ctx) ||
+        reg_write(s, regs[4], win.start_hi, kR3WState, ctx) ||
+        reg_write(s, regs[5], win.end_lo, kR3WState, ctx) ||
+        reg_write(s, regs[6], win.end_hi, kR3WState, ctx))
         return -1;
     return 0;
 }
@@ -953,8 +1068,8 @@ R3SubstepResult pre_gart(const R3Io *io, const R3SubstepEnv *env)
     if (g_gmc_fb_phys_base == 0)
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
 
-    /* 预算预检：21 条 GART 行整体预留；表满在阶段入口失败
-     * （pre:register-full），不再逐条 register 折叠成 pre:register。 */
+    /* 预算预检：整张 GART 行表（kGartRowCount 条）一次性预留；表满在阶段入口
+     * 失败（pre:register-full），不再逐条 register 折叠成 pre:register。 */
     if (r3_wg_reserve(kGartRowCount) != 0) {
         evf(s.env, "gmc-gart", "grant budget: need=%u used=%u cap=%u",
             kGartRowCount, r3_wg_grant_count(),
@@ -1020,14 +1135,18 @@ R3SubstepResult seq_gart_build(Gmc &s)
 R3SubstepResult seq_gart_regs(Gmc &s)
 {
     R3SubstepResult r = r3_substep_pass();
+    /* R4③: snapshot before this substep programs anything. */
+    capture_gart_entry(s);
     /* Linux gart_enable's program_invalidation runs before the invalidate
      * requests; the ranges persist, so this is the one place that arms them. */
     if (arm_invalidation(s, "gmc:inv-arm"))
         return r3_substep_fail(kR3SecSeq, 2, kFailGartRegs);
-    /* VMID0 flat GART configuration on both hubs (Linux gfxhub_v3_0.c
-     * enable_system_domain shape: RMW the CNTL keeping DEPTH=0/RETRY off,
-     * then the table base and the full-VA START/END from the nullarc
-     * mesboot gart() measurements). */
+    /* VMID0 flat GART on both hubs: RMW the CNTL keeping DEPTH=0 and RETRY
+     * off (Linux gfxhub_v3_0_enable_system_domain, gfxhub_v3_0.c:255-265),
+     * then the table base and the GART window.  START/END are page numbers
+     * (gfxhub_v3_0.c:139-147); the window must cover exactly the first-level
+     * table (kGmcGartEntries x 4 KiB), not the whole VA space, or a ring
+     * outside the table walks off its end (boot10 S7 failure). */
     const uint64_t root = s.gart_blk->phys;
     for (uint32_t hub = 0; hub < 2; hub++) {
         const uint32_t *regs = s.rows_addr + (hub == 0 ? 0 : 7);
@@ -1039,9 +1158,13 @@ R3SubstepResult seq_gart_regs(Gmc &s)
         cntl &= ~(0x6u | 0x80u); /* PAGE_TABLE_DEPTH=0, RETRY_PERMISSION_OR_INVALID=0 */
         cntl |= 0x1u;            /* ENABLE_CONTEXT=1 */
         if (reg_write(s, regs[0], cntl, kR3WState, ctx) ||
-            vbind_write(s, regs, root, false, ctx))
+            vbind_write(s, regs, root, false, kGartWindow, ctx))
             return fail_note(kR3SecSeq, 2, kFailGartRegs, regs[0], cntl, ctx);
     }
+    /* R4②: the SDMA verify needs the first fault to latch (record mode, as
+     * mesboot leaves it); run_gart restores the entry value. */
+    if (gart_fault_record_begin(s))
+        return r3_substep_fail(kR3SecSeq, 2, kFailGartRegs);
     r3_substep_note(&r, s.rows_addr[0], 0, "gart regs ok");
     return r;
 }
@@ -1099,6 +1222,7 @@ R3SubstepResult seq_gart_verify(Gmc &s)
         evf(s.env, "gmc-gart", "diag sdma shadow back=0x%x", s.sdma_shadow_back);
         evf(s.env, "gmc-gart", "diag sdma status=0x%x", status);
         evf(s.env, "gmc-gart", "diag sdma shadow hi=0x%x", s.sdma_shadow_hi);
+        log_gart_entry(s, "prep-fail");
         return f;
     }
     uint32_t got = 0;
@@ -1119,6 +1243,7 @@ R3SubstepResult seq_gart_verify(Gmc &s)
             rptr_ok ? "" : "(unreadable)", rptr_now, rptr_now >> 2u,
             s.sdma_rptr_before, s.last_sdma_wptr_bytes);
 
+        log_gart_entry(s, "poll-fail");
         r3_substep_note(&f, static_cast<uint32_t>(s.test_grant->start + kGmcTestPageIntra),
                         got, "gart verify mismatch");
 
@@ -1133,12 +1258,20 @@ R3SubstepResult seq_gart_verify(Gmc &s)
         if (mm1 == 0xffffffffu || gc0 == 0xffffffffu)
             return f;
         bool diag_ok = false;
-        const uint32_t fault_status = r3_io_read32(s.io, mm1 + 0x070Cu, &diag_ok);
-        r3_substep_note(&f, mm1 + 0x070Cu, fault_status,
-                        "gart-diag:mmhub-l2-fault-status");
-        const uint32_t fault_cntl = r3_io_read32(s.io, mm1 + 0x0708u, &diag_ok);
-        r3_substep_note(&f, mm1 + 0x0708u, fault_cntl,
-                        "gart-diag:mmhub-l2-fault-cntl");
+        /* R4①: the SDMA ring fetch is translated by the GC L2 (GFXHUB), so its
+         * protection-fault status/address are the primary evidence; the MMHUB
+         * pair is kept in the process log only.  Registers: golden
+         * kGcvmL2ProtectionFaultStatus/AddrLo32 (gc_11_0_0_offset.h:2754-2759). */
+        const uint32_t fault_status = r3_io_read32(s.io, gc0 + 0x15C8u, &diag_ok);
+        r3_substep_note(&f, gc0 + 0x15C8u, fault_status,
+                        "gart-diag:gfxhub-l2-fault-status");
+        const uint32_t fault_addr_lo = r3_io_read32(s.io, gc0 + 0x15C9u, &diag_ok);
+        r3_substep_note(&f, gc0 + 0x15C9u, fault_addr_lo,
+                        "gart-diag:gfxhub-l2-fault-addr-lo");
+        const uint32_t mm_status = r3_io_read32(s.io, mm1 + 0x070Cu, &diag_ok);
+        const uint32_t mm_cntl = r3_io_read32(s.io, mm1 + 0x0708u, &diag_ok);
+        evf(s.env, "gmc-gart", "diag mmhub-l2-fault-status=0x%x cntl=0x%x",
+            mm_status, mm_cntl);
         r3_substep_note(&f, s.sdma_rptr_reg, rptr_now, "sdma rptr after poll");
 
         /* Publish-side observations for a polling failure: did the write land
@@ -1175,6 +1308,22 @@ R3SubstepResult seq_gart_verify(Gmc &s)
                         f32_cntl, "sdma f32 cntl");
         evf(s.env, "gmc-gart", "diag sdma status=0x%x", status);
         evf(s.env, "gmc-gart", "diag sdma shadow hi=0x%x", s.sdma_shadow_hi);
+        /* Field layout: gc_11_0_0_sh_mask.h:11002-11024.  The address
+         * registers hold the faulting page number; Linux rebuilds the VA by
+         * shifting by AMDGPU_GPU_PAGE_SHIFT (gmc_v8_0.c:1440-1450,
+         * amdgpu_gart.h:37). */
+        const uint32_t fault_addr_hi = r3_io_read32(s.io, gc0 + 0x15CAu, &diag_ok);
+        const uint32_t fault_cntl_now = r3_io_read32(s.io, gc0 + 0x15C4u, &diag_ok);
+        const uint64_t fault_va =
+            (((static_cast<uint64_t>(fault_addr_hi) & 0xFu) << 32u) |
+             fault_addr_lo) << 12u;
+        evf(s.env, "gmc-gart",
+            "diag gfxhub-l2-fault: status=0x%x more=%u walker=0x%x perm=0x%x map=%u cid=0x%x rw=%u vmid=%u addr=0x%llx cntl=0x%x",
+            fault_status, fault_status & 0x1u, (fault_status >> 1u) & 0x7u,
+            (fault_status >> 4u) & 0xFu, (fault_status >> 8u) & 0x1u,
+            (fault_status >> 9u) & 0x1ffu, (fault_status >> 18u) & 0x1u,
+            (fault_status >> 20u) & 0xFu, (unsigned long long)fault_va,
+            fault_cntl_now);
 
         /* Remaining diagnostic set: process log only (no snapshot slots). */
         const uint32_t mx_l1 = r3_io_read32(s.io, mm1 + 0x08F3u, &diag_ok);
@@ -1284,7 +1433,7 @@ R3SubstepResult seq_vbind0(Gmc &s)
     for (uint32_t hub = 0; hub < 2; hub++) {
         const uint32_t *regs = s.rows_addr + (hub == 0 ? 0 : 7);
         const char *ctx = hub == 0 ? "gmc:ctx0" : "gmc:mm-ctx0";
-        if (vbind_write(s, regs, root, true, ctx)) {
+        if (vbind_write(s, regs, root, true, kFullVaWindow, ctx)) {
             r3_substep_note(&r, regs[0], 0, ctx);
             return r3_substep_fail(kR3SecSeq, 2, kFailVbind);
         }
@@ -1426,7 +1575,7 @@ R3SubstepResult seq_vbind8(Gmc &s)
     for (uint32_t hub = 0; hub < 2; hub++) {
         const uint32_t *regs = s.rows_addr + (hub == 0 ? 0 : 7);
         const char *ctx = hub == 0 ? "gmc:ctx8" : "gmc:mm-ctx8";
-        if (vbind_write(s, regs, root, true, ctx)) {
+        if (vbind_write(s, regs, root, true, kFullVaWindow, ctx)) {
             r3_substep_note(&r, regs[0], 0, ctx);
             return r3_substep_fail(kR3SecSeq, 2, kFailVbind);
         }
@@ -1557,6 +1706,9 @@ R3SubstepResult run_gart(const R3Io *io, const R3SubstepEnv *env)
         r = seq_gart_invalidate(g_gmc);
     if (r.status == kR3SsecOk)
         r = seq_gart_verify(g_gmc);
+
+    /* R4②: restore on both paths so S9 still sees kGmcFaultDefault. */
+    gart_fault_restore(g_gmc);
 
     if (r.status == kR3SsecOk) {
         r3_substep_note(&r, 0, 0, "gart: table built, VMID0 flat, invalidate ok, SDMA verify ok");
