@@ -24,6 +24,7 @@
 
 #include "amdgpu_ip.h"
 #include "amd/gmc_v11_0.h"
+#include "amd/nbio_v7_7.h"
 #include "n48log_stub.h"
 #include "rdna3/rdna3_layout.h"
 #include "rdna3/rdna3_runtime.h"
@@ -421,6 +422,10 @@ static bool build_fixture(Fixture &f, Dev &d)
     f.ip.setBase(IPBlock::MMHUB, 1, kMmhub1);
     f.ip.set(IPBlock::SDMA0, kSdma0);
     f.ip.setBase(IPBlock::SDMA0, 1, kSdma1);
+    /* NBIO: the RSMU INDEX/DATA pair that fronts the CSDMA doorbell range. */
+    f.ip.set(IPBlock::NBIO, 0u);
+    f.ip.setBase(IPBlock::NBIO, 1, 0x14u);
+    f.ip.setBase(IPBlock::NBIO, 3, 0x10400u);
 
     /* MMHUB + GC FB aperture (S6 recheck reads and cross-checks these) */
     d.bar5[kMmhub1 + 0x08D7u] = 0x6a0cu; /* MMMC_VM_FB_OFFSET */
@@ -508,6 +513,22 @@ static void prepare_sdma(const Fixture &f)
                                 static_cast<uint32_t>(g->size >> 2),
                                 WSubstep::Sdma, "layout:sdma") == 0,
           "register sdma grant");
+    /* Stage 2 registers the CSDMA range triplet under Sdma; mirror it so the
+     * S7 re-program (armed as Sdma) passes the classifier. */
+    const uint32_t rsmu = f.ip.getBase(IPBlock::NBIO, nbio_v7_7::kRsmuBaseIdx);
+    const uint32_t csdma =
+        f.ip.getBase(IPBlock::NBIO, nbio_v7_7::kCsdmaBaseIdx) +
+        nbio_v7_7::kCsdmaDoorbellRangeOff;
+    CHECK(r3_wg_register_reg(csdma, 1u, WClass::Protocol, WSubstep::Sdma,
+                             "reg:sdma-csdma") == 0, "csdma target grant");
+    CHECK(r3_wg_register_shared_reg(rsmu + nbio_v7_7::kRsmuIndexOff, 1u,
+                                    WClass::Protocol, WSubstep::Sdma,
+                                    "reg:sdma-rsmu-index") == 0,
+          "rsmu index grant");
+    CHECK(r3_wg_register_shared_reg(rsmu + nbio_v7_7::kRsmuDataOff, 1u,
+                                    WClass::Protocol, WSubstep::Sdma,
+                                    "reg:sdma-rsmu-data") == 0,
+          "rsmu data grant");
 }
 
 /* ---- pure-function tests ---- */
@@ -1123,12 +1144,12 @@ static void test_s9_vmid8(void)
               (unsigned long long)*e, (unsigned long long)want);
     }
     /* W4/§7.2: the same install_mm accumulates sdma layout (1) + S6 layouts (6)
-     * + S7 GART rows (20) + the runtime SDMA doorbell (1) + S9 vmid8 first-15
-     * rows = 43 grants. */
+     * + S7 GART rows (20) + the runtime SDMA doorbell (1) + the CSDMA range
+     * triplet (3) + S9 vmid8 first-15 rows = 46 grants. */
     CHECK(r3_wg_grant_count() ==
               kGmcSeqLayoutCount + kGartRowCount + kGartDoorbellCount +
-              kVmid8FirstInvalidateRow + kSdmaLayoutCount,
-          "chain budget == 43 (got %u)", r3_wg_grant_count());
+              kCsdmaRangeGrantCount + kVmid8FirstInvalidateRow + kSdmaLayoutCount,
+          "chain budget == 46 (got %u)", r3_wg_grant_count());
 }
 
 /* #6 regression: FAULT_CNTL (0x15c4) is verified read-only. The old path

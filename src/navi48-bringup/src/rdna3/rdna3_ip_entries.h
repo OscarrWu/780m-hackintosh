@@ -46,6 +46,7 @@ constexpr uint32_t kMesLayoutCount   = 1u;   // mes_v11_0.cpp layout:mes 计 1 �
 constexpr uint32_t kMesRowCount      = 74u;  // mes_v11_0.cpp kMesRows[]（52 hub + 10 S0-S5 + 12 HQD）
 constexpr uint32_t kMesDoorbellCount = 4u;   // mes_v11_0.cpp kMesDoorbells[]（kiq+sch+cmp+gfx）
 constexpr uint32_t kMesQueueRowCount = 11u;  // mes_v11_0.cpp kMesQueueRows[]（2 dbrange+GRBM+5 S11+3 拆除行）
+constexpr uint32_t kCsdmaRangeGrantCount = 3u;  // CSDMA 目标 + RSMU INDEX/DATA 两个端口（S4 与 S7 共用）
 
 // ---- 阶段2之后（S6..S11 增量）常量 ----
 constexpr uint32_t kHdpGrantCount           = 1u;   // stages.cpp reg:hdp-flush 共享窗口 1 条
@@ -78,18 +79,21 @@ constexpr uint32_t R3_WG_BUDGET_REG_TOTAL =
     kMesDoorbellCount + kMesQueueRowCount + kHdpGrantCount +
     kGartRowCount + kGartDoorbellCount + kVmid8FirstInvalidateRow + kGfxTeardownRowCount +
     kIhTeardownRowCount + kIhInputRowCount +
-    kGfxStage2RowCount + kGfxStage3RowCount;                         // = 185
+    kGfxStage2RowCount + kGfxStage3RowCount + kCsdmaRangeGrantCount;   // = 188
 constexpr uint32_t R3_WG_BUDGET_STAGE2 =
     kPspLayoutCount + kPspRowCount + kSmuRowCount + kSdmaLayoutCount +
     kSdmaRowCount + kMesLayoutCount + kMesRowCount + kMesDoorbellCount +
-    kMesQueueRowCount;                                               // = 124
+    kMesQueueRowCount + kCsdmaRangeGrantCount;                        // = 127
 constexpr uint32_t R3_WG_BUDGET_TOTAL =
-    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 199
+    R3_WG_BUDGET_LAYOUT_TOTAL + R3_WG_BUDGET_REG_TOTAL;              // = 202
 
-static_assert(R3_WG_BUDGET_STAGE2 == 124u, "阶段2 生产注册预算应为 124 项");
+static_assert(R3_WG_BUDGET_STAGE2 == 124u + kCsdmaRangeGrantCount,
+              "阶段2 生产注册预算应为 127 项");
 static_assert(R3_WG_BUDGET_LAYOUT_TOTAL == 14u, "全链 layout 预算应为 14 项");
-static_assert(R3_WG_BUDGET_REG_TOTAL == 185u, "全链 reg 预算应为 185 项");
-static_assert(R3_WG_BUDGET_TOTAL == 199u, "全链写守卫预算应为 199 项");
+static_assert(R3_WG_BUDGET_REG_TOTAL == 185u + kCsdmaRangeGrantCount,
+              "全链 reg 预算应为 188 项");
+static_assert(R3_WG_BUDGET_TOTAL == 199u + kCsdmaRangeGrantCount,
+              "全链写守卫预算应为 202 项");
 static_assert(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
               "写守卫 grant 容量小于全链预算：请同步 R3_WG_GRANT_MAX");
 

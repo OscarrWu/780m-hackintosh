@@ -38,6 +38,7 @@
 #include "../rdna3/golden_values.h"
 #include "../rdna3/rdna3_layout.h"
 #include "../rdna3/rdna3_runtime.h"
+#include "nbio_v7_7.h"
 
 namespace amdgpu {
 namespace {
@@ -133,6 +134,7 @@ enum : uint32_t {
     kSdmaStepPktBack = 2u,
     kSdmaStepShadowBack = 3u,
     kSdmaStepDoorbell = 4u,
+    kSdmaStepRange = 5u,
 };
 /* MMHUB invalidate engine 17 golden symbols added in T-E;
  * mmhub_3_0_1_offset.h (BASE_IDX=1): ENG17_SEM=0x0762, ENG17_REQ=0x0774. */
@@ -344,7 +346,7 @@ struct Gmc {
 
     /* frequently used rows, copied out for readability */
     uint32_t gc_inv_req, gc_inv_ack, mm_inv_sem, mm_inv_req, mm_inv_ack;
-    R3WriteRowAbs sdma_db_row;
+    R3WriteRowAbs sdma_abs[4];  /* CSDMA range target + RSMU index/data + SDMA0 doorbell */
     /* last sdma_submit, kept for the S7 failure diagnostic (W3) */
     uint32_t sdma_rptr_reg;
     uint32_t sdma_rptr_before;
@@ -705,7 +707,37 @@ int sdma_submit(Gmc &s, uint64_t dst_va, uint32_t value, const char *ctx)
     s.sdma_shadow_back = 0u;
     s.sdma_shadow_hi = 0u;
 
+    r3_wg_arm_substep(WSubstep::Gmc);
+    if (r3_wg_expect_abs_writes(s.sdma_abs, 4u, WSubstep::Gmc) != 0) {
+        r3_wg_arm_substep(WSubstep::Gmc);
+        return -1;
+    }
+    /* The CSDMA range grant is registered under the Sdma owner in stage 2,
+     * so the helper must run armed as Sdma (r3_wg_classify checks the armed
+     * owner against the grant).  The abs expect set is already installed.
+     * Re-program after the PSP/MES hand-off (Linux nbio_v7_7.c:64-85; the
+     * RSMU sequence is shared with S4). */
     r3_wg_arm_substep(WSubstep::Sdma);
+    {
+        uint32_t before = 0u, after = 0u;
+        const nbio_v7_7::RangeResult rr =
+            nbio_v7_7::program_csdma_doorbell_range(
+                s.io, *s.ip, s.env->sdma_doorbell, kSdmaDoorbellRangeSize,
+                true, &before, &after);
+        if (rr != nbio_v7_7::RangeResult::Ok) {
+            evf(s.env, "gmc-gart",
+                "csdma-range reprogram failed reason=%u index=0x%x "
+                "before=0x%08x after=0x%08x",
+                static_cast<unsigned>(rr), s.env->sdma_doorbell, before, after);
+            s.sdma_fail_step = kSdmaStepRange;
+            r3_wg_arm_substep(WSubstep::Gmc);
+            return -1;
+        }
+        evf(s.env, "gmc-gart",
+            "csdma-range index=0x%x size=%u before=0x%08x after=0x%08x "
+            "(reprogrammed after MES)",
+            s.env->sdma_doorbell, kSdmaDoorbellRangeSize, before, after);
+    }
 
     /* Ring pointers are BYTE offsets (Linux sdma_v6_0.c ring_get_rptr
      * shifts the dword read right by 2; the S5 path programs the queue the
@@ -802,11 +834,11 @@ int sdma_submit(Gmc &s, uint64_t dst_va, uint32_t value, const char *ctx)
         s.sdma_fail_step = kSdmaStepDoorbell;
         return -1;
     }
-    if (r3_wg_expect_abs_writes(&s.sdma_db_row, 1u, WSubstep::Gmc) != 0) {
+    if (r3_wg_expect_abs_writes(s.sdma_abs, 4u, WSubstep::Gmc) != 0) {
         s.sdma_fail_step = kSdmaStepDoorbell;
         return -1;
     }
-    if (gmc_doorbell_write(s, s.sdma_db_row.addr, wptr_bytes, "gmc:sdma-db")) {
+    if (gmc_doorbell_write(s, s.sdma_abs[3].addr, wptr_bytes, "gmc:sdma-db")) {
         s.sdma_fail_step = kSdmaStepDoorbell;
         return -1;
     }
@@ -818,7 +850,7 @@ int sdma_submit(Gmc &s, uint64_t dst_va, uint32_t value, const char *ctx)
             reg_read(s, sdma_base + kRegSdma0RbRptrFetch, &rok);
         evf(s.env, "gmc-gart",
             "sdma-db-after: index=0x%x wptr=0x%x rb_wptr=0x%x%s rptr-fetch=0x%x%s",
-            s.sdma_db_row.addr, wptr_bytes, rb_wptr_after,
+            s.sdma_abs[3].addr, wptr_bytes, rb_wptr_after,
             wok ? "" : "(unreadable)", rptr_fetch_after,
             rok ? "" : "(unreadable)");
     }
@@ -1101,6 +1133,24 @@ R3SubstepResult seq_layout(Gmc &s)
 
 /* ---- S7: flat GART ---- */
 
+/* Fill the CSDMA range declaration rows from the NBIO segments. The range
+ * register is reached through the RSMU pair (nbio_v7_7.c:64-85, 211-219). */
+bool fill_csdma_rows(Gmc &s, const IPBaseTable *ip)
+{
+    if (!ip || !ip->isResolved(IPBlock::NBIO, nbio_v7_7::kRsmuBaseIdx) ||
+        !ip->isResolved(IPBlock::NBIO, nbio_v7_7::kCsdmaBaseIdx))
+        return false;
+    const uint32_t csdma = ip->getBase(IPBlock::NBIO, nbio_v7_7::kCsdmaBaseIdx) +
+                           nbio_v7_7::kCsdmaDoorbellRangeOff;
+    const uint32_t rsmu = ip->getBase(IPBlock::NBIO, nbio_v7_7::kRsmuBaseIdx);
+    s.sdma_abs[0] = {csdma, 1u, WClass::Protocol, WNeed::Required, "reg:gmc-csdma-range"};
+    s.sdma_abs[1] = {rsmu + nbio_v7_7::kRsmuIndexOff, 1u, WClass::Protocol,
+                     WNeed::Required, "reg:gmc-csdma-index"};
+    s.sdma_abs[2] = {rsmu + nbio_v7_7::kRsmuDataOff, 1u, WClass::Protocol,
+                     WNeed::Required, "reg:gmc-csdma-data"};
+    return true;
+}
+
 R3SubstepResult pre_gart(const R3Io *io, const R3SubstepEnv *env)
 {
     if (!io || !r3_io_complete(io))
@@ -1166,11 +1216,16 @@ R3SubstepResult pre_gart(const R3Io *io, const R3SubstepEnv *env)
             env->sdma_doorbell);
         return r3_substep_fail(kR3SecPre, 0, kFailRegister);
     }
-    s.sdma_db_row.addr = env->sdma_doorbell;
-    s.sdma_db_row.dwords = kGmcSdmaDoorbellDwords;
-    s.sdma_db_row.cls = WClass::Protocol;
-    s.sdma_db_row.need = WNeed::OnSuccessPath;
-    s.sdma_db_row.ctx = "gmc:sdma-db";
+    /* CSDMA doorbell range: target + RSMU ports. The grants live in stage 2
+     * (register_sdma, Sdma owner); here only the abs expect rows are filled
+     * so the shared helper's writes are accounted by expect_abs_writes. */
+    if (!fill_csdma_rows(s, s.ip))
+        return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
+    s.sdma_abs[3].addr = env->sdma_doorbell;
+    s.sdma_abs[3].dwords = kGmcSdmaDoorbellDwords;
+    s.sdma_abs[3].cls = WClass::Protocol;
+    s.sdma_abs[3].need = WNeed::OnSuccessPath;
+    s.sdma_abs[3].ctx = "gmc:sdma-db";
     if (r3_wg_grant_count() - grant_before != need_rows) {
         evf(s.env, "gmc-gart", "register increment %u != %u",
             r3_wg_grant_count() - grant_before, need_rows);
@@ -1466,6 +1521,8 @@ R3SubstepResult pre_gpuvm0(const R3Io *io, const R3SubstepEnv *env)
     if (!s.ip->isResolved(IPBlock::GC, 0) || !s.ip->isResolved(IPBlock::MMHUB, 1) ||
         !s.ip->isResolved(IPBlock::SDMA0, 0))
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
+    if (!fill_csdma_rows(s, s.ip))
+        return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
     s.sdma_grant = r3_layout_grant(s.plan, "sdma");
     s.test_grant = r3_layout_grant(s.plan, "test_buf");
     if (!s.sdma_grant || !s.test_grant)
@@ -1490,11 +1547,11 @@ R3SubstepResult pre_gpuvm0(const R3Io *io, const R3SubstepEnv *env)
     s.gc_inv_req = s.rows_addr[14];
     s.mm_inv_sem = s.rows_addr[15];
     s.mm_inv_req = s.rows_addr[16];
-    s.sdma_db_row.addr = env->sdma_doorbell;
-    s.sdma_db_row.dwords = kGmcSdmaDoorbellDwords;
-    s.sdma_db_row.cls = WClass::Protocol;
-    s.sdma_db_row.need = WNeed::OnSuccessPath;
-    s.sdma_db_row.ctx = "gmc:sdma-db";
+    s.sdma_abs[3].addr = env->sdma_doorbell;
+    s.sdma_abs[3].dwords = kGmcSdmaDoorbellDwords;
+    s.sdma_abs[3].cls = WClass::Protocol;
+    s.sdma_abs[3].need = WNeed::OnSuccessPath;
+    s.sdma_abs[3].ctx = "gmc:sdma-db";
     if (resolve_inv_addrs(s))
         return r3_substep_fail(kR3SecPre, 0, kFailNoBase);
     return r3_substep_pass();

@@ -177,6 +177,9 @@ static void fill_ip(IPBaseTable *ip)
     ip->setBase(IPBlock::MMHUB, 1, 0x1a000u);
     /* NBIO seg2 for MES S-1 doorbell aperture row. */
     ip->setBase(IPBlock::NBIO, 2, 0xd20u);
+    /* NBIO seg1/seg3: RSMU INDEX/DATA and the CSDMA doorbell-range target. */
+    ip->setBase(IPBlock::NBIO, 1, 0x14u);
+    ip->setBase(IPBlock::NBIO, 3, 0x10400u);
 }
 
 static bool has_reg(uint32_t addr, uint32_t dwords, WClass cls, WSubstep owner)
@@ -214,7 +217,7 @@ static void test_registration()
 
     /* Step2: runtime expected row count (GFX=0).
      * SDMA regs+layout + MES rows+layout+doorbells + QUEUE rows + PSP rows+layouts + SMU rows */
-    const uint32_t expected = getSdmaRowCount() + 1u +          // SDMA regs + layout
+    const uint32_t expected = getSdmaRowCount() + 1u + kCsdmaRangeGrantCount +
                               getMesRowCount() + 1u + amdgpu::getMesDoorbellCount() +
                               amdgpu::getMesQueueRowCount() +   // T-E split: queue rows (S7-S11)
                               getPspRowCount() + getPspLayoutCount() +
@@ -243,6 +246,14 @@ static void test_registration()
                      WSubstep::Sdma), "sdma layout grant missing");
     CHECK(has_layout(static_cast<uint32_t>(0x0c800000ull >> 2), 0x00800000u >> 2,
                      WSubstep::Mes), "mes layout grant missing");
+
+    /* S7: the CSDMA range triplet is registered under the SDMA owner. */
+    CHECK(has_reg(0x10400u + 0x4f0afbu, 1u, WClass::Protocol, WSubstep::Sdma),
+          "csdma range grant missing");
+    CHECK(has_reg(0x14u, 1u, WClass::Protocol, WSubstep::Sdma),
+          "rsmu index grant missing");
+    CHECK(has_reg(0x15u, 1u, WClass::Protocol, WSubstep::Sdma),
+          "rsmu data grant missing");
 
     /* MES doorbells come from the doorbell declaration table (single source of truth):
      * every declared doorbell must be registered with its dwords/class/owner. */

@@ -57,12 +57,12 @@ static void test_budget_arithmetic(void)
 {
     CHECK(R3_WG_BUDGET_LAYOUT_TOTAL == 14u,
           "layout total == 14 (got %u)", (unsigned)R3_WG_BUDGET_LAYOUT_TOTAL);
-    CHECK(R3_WG_BUDGET_REG_TOTAL == 185u,
-          "reg total == 185 (got %u)", (unsigned)R3_WG_BUDGET_REG_TOTAL);
-    CHECK(R3_WG_BUDGET_STAGE2 == 124u,
-          "stage2 == 124 (got %u)", (unsigned)R3_WG_BUDGET_STAGE2);
-    CHECK(R3_WG_BUDGET_TOTAL == 199u,
-          "total == 199 (got %u)", (unsigned)R3_WG_BUDGET_TOTAL);
+    CHECK(R3_WG_BUDGET_REG_TOTAL == 188u,
+          "reg total == 188 (got %u)", (unsigned)R3_WG_BUDGET_REG_TOTAL);
+    CHECK(R3_WG_BUDGET_STAGE2 == 127u,
+          "stage2 == 127 (got %u)", (unsigned)R3_WG_BUDGET_STAGE2);
+    CHECK(R3_WG_BUDGET_TOTAL == 202u,
+          "total == 202 (got %u)", (unsigned)R3_WG_BUDGET_TOTAL);
     CHECK(R3_WG_BUDGET_TOTAL <= R3_WG_GRANT_MAX,
           "contract total fits grant table (%u <= %u)",
           (unsigned)R3_WG_BUDGET_TOTAL, (unsigned)R3_WG_GRANT_MAX);
@@ -87,25 +87,25 @@ static void test_fill_to_capacity(void)
 {
     r3_writeguard_install_mm();
 
-    /* 先按全链预算 199 注册合成 reg grant：必须全部成功。 */
+    /* 先按全链预算 202 注册合成 reg grant：必须全部成功。 */
     for (uint32_t i = 0; i < R3_WG_BUDGET_TOTAL; i++) {
         CHECK(syn_reg(0x1000u + i * 4u) == 0, "contract row %u registers", i);
     }
     CHECK(r3_wg_grant_count() == R3_WG_BUDGET_TOTAL,
-          "grant_count == 199 (got %u)", r3_wg_grant_count());
+          "grant_count == 202 (got %u)", r3_wg_grant_count());
 
-    /* 继续注册到物理容量 R3_WG_GRANT_MAX（200 = 199 预算 + 1 行预留）。 */
+    /* 继续注册到物理容量 R3_WG_GRANT_MAX（203 = 202 预算 + 1 行预留）。 */
     for (uint32_t i = R3_WG_BUDGET_TOTAL; i < R3_WG_GRANT_MAX; i++) {
         CHECK(syn_reg(0x1000u + i * 4u) == 0, "row %u fills spare slots", i);
     }
     CHECK(r3_wg_grant_count() == R3_WG_GRANT_MAX,
-          "grant_count == 200 (got %u)", r3_wg_grant_count());
+          "grant_count == 203 (got %u)", r3_wg_grant_count());
 
     /* 第 MAX+1 条必须 -2 且不改变计数（planted break >= -> > 会在此处失败）。 */
     CHECK(syn_reg(0x1000u + R3_WG_GRANT_MAX * 4u) == -2,
           "row %u rejected (table full)", (unsigned)(R3_WG_GRANT_MAX + 1u));
     CHECK(r3_wg_grant_count() == R3_WG_GRANT_MAX,
-          "rejected row left grant_count at 200 (got %u)", r3_wg_grant_count());
+          "rejected row left grant_count at 203 (got %u)", r3_wg_grant_count());
 }
 
 static void test_capacity_log(void)
@@ -139,13 +139,13 @@ static void test_reserve_boundary(void)
     CHECK(r3_wg_reserve(R3_WG_BUDGET_TOTAL) == 0, "reserve(full contract) fits empty table");
     CHECK(r3_wg_grant_count() == 0u, "reserve registers nothing");
 
-    /* 填到 200-5=195：reserve(4) 成功（195+4 <= 200）、reserve(6) 拒绝（195+6 > 200）。
+    /* 填到 203-5=198：reserve(4) 成功（198+4 <= 203）、reserve(6) 拒绝（198+6 > 203）。
      * reserve 只读：成功/失败都不改变 grant_count。 */
     for (uint32_t i = 0; i < R3_WG_GRANT_MAX - 5u; i++) {
         CHECK(syn_reg(0x3000u + i * 4u) == 0, "fill row %u", i);
     }
     CHECK(r3_wg_grant_count() == R3_WG_GRANT_MAX - 5u,
-          "grant_count == 195 (got %u)", r3_wg_grant_count());
+          "grant_count == 198 (got %u)", r3_wg_grant_count());
 
     CHECK(r3_wg_reserve(4u) == 0, "reserve(4) fits in last 5 slots");
     CHECK(r3_wg_grant_count() == R3_WG_GRANT_MAX - 5u,

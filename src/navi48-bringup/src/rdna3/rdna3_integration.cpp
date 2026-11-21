@@ -24,6 +24,7 @@
 #include "common/StageRunner.h"
 #include "rdna3_dump.h"
 #include "rdna3_writeguard.h"
+#include "amd/nbio_v7_7.h"
 
 namespace {
 using amdgpu::IPBaseTable;
@@ -39,6 +40,9 @@ constexpr const char *kTagRegPsp = "reg:psp";
 constexpr const char *kTagRegSmu = "reg:smu";
 constexpr const char *kTagRegSdma = "reg:sdma";
 constexpr const char *kTagRegMes = "reg:mes";
+constexpr const char *kTagRegSdmaCsdma = "reg:sdma-csdma";
+constexpr const char *kTagRegSdmaRsmuIndex = "reg:sdma-rsmu-index";
+constexpr const char *kTagRegSdmaRsmuData = "reg:sdma-rsmu-data";
 
 
 
@@ -128,6 +132,27 @@ uint32_t register_sdma(const R3LayoutPlan *plan, const IPBaseTable *ip)
                                WSubstep::Sdma, kTagRegSdma) == 0)
             n++;
     }
+
+    /* The CSDMA doorbell range (Linux nbio_v7_7.c:64-85) is written through the
+     * RSMU index/data pair. Register the target and both ports so the S4 write
+     * is classified and later reprogramming after MES stays inside the guard. */
+    if (!ip || !ip->isResolved(IPBlock::NBIO, amdgpu::nbio_v7_7::kRsmuBaseIdx) ||
+        !ip->isResolved(IPBlock::NBIO, amdgpu::nbio_v7_7::kCsdmaBaseIdx))
+        return n;
+    const uint32_t csdma = ip->getBase(IPBlock::NBIO, amdgpu::nbio_v7_7::kCsdmaBaseIdx) +
+                           amdgpu::nbio_v7_7::kCsdmaDoorbellRangeOff;
+    const uint32_t rsmu = ip->getBase(IPBlock::NBIO, amdgpu::nbio_v7_7::kRsmuBaseIdx);
+    if (r3_wg_register_reg(csdma, 1u, WClass::Protocol, WSubstep::Sdma,
+                           kTagRegSdmaCsdma) == 0)
+        n++;
+    if (r3_wg_register_shared_reg(rsmu + amdgpu::nbio_v7_7::kRsmuIndexOff, 1u,
+                                  WClass::Protocol, WSubstep::Sdma,
+                                  kTagRegSdmaRsmuIndex) == 0)
+        n++;
+    if (r3_wg_register_shared_reg(rsmu + amdgpu::nbio_v7_7::kRsmuDataOff, 1u,
+                                  WClass::Protocol, WSubstep::Sdma,
+                                  kTagRegSdmaRsmuData) == 0)
+        n++;
     return n;
 }
 
@@ -281,7 +306,9 @@ int r3_integration_register_production(const R3LayoutPlan *plan,
         return -1;
     if (register_smu(ip) != 3u)
         return -1;
-    if (register_sdma(plan, ip) != 1u + amdgpu::getSdmaRowCount())
+    const uint32_t sdma_want = 1u + amdgpu::getSdmaRowCount() +
+                               amdgpu::kCsdmaRangeGrantCount;
+    if (register_sdma(plan, ip) != sdma_want)
         return -1;
     if (register_mes(plan, ip) != 1u + amdgpu::getMesRowCount() + amdgpu::getMesDoorbellCount())
         return -1;
