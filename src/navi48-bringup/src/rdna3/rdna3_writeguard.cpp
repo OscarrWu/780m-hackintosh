@@ -472,9 +472,10 @@ WVerdict r3_wg_classify(uint64_t pa, uint32_t size, WClass cls, const char *ctx)
 
     const uint64_t hi = pa + static_cast<uint64_t>(size) - 1u;
 
-    // One pass, address first: the window that fully contains [pa, hi] decides the verdict on
-    // its own (owner + class must match), so a write is never re-tried against a second window.
-    // A window that only partially contains the write was not written and claims nothing.
+    // Address first: only a window that fully contains [pa, hi] claims the write; a window that
+    // only partially contains it was not written and claims nothing. Rules 1 and 2 decide on
+    // their own rows; rule 3 (② Data layout grants) scans every containing row so the armed
+    // owner's row wins regardless of registration order, and a read-only grant (D6) is absolute.
     // 1. Legacy stage-1 windows: ① Access, owner-less (WSubstep::None) only.
     for (uint32_t i = 0; i < R3_WG_WINDOW_COUNT; i++) {
         if (!g.on[i] || pa < g.lo[i] || hi > g.hi[i])
@@ -502,7 +503,13 @@ WVerdict r3_wg_classify(uint64_t pa, uint32_t size, WClass cls, const char *ctx)
     if (fits_tag)
         return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, fits_tag);
 
-        // 3. ② Data layout grants: Data only, any sub-range inside the interval (either edge).
+    // 3. ② Data layout grants: Data only, any sub-range inside the interval (either edge).
+    //    Several substeps may register a grant for the same interval (e.g. the gmc test_buf
+    //    row and the mes row for the same buffer). They are ONE virtual table: the armed
+    //    owner's row wins, independent of registration order. A read-only grant is a property
+    //    of the address (D6), so it still refuses every write first.
+    const R3WgGrant *first_gr = nullptr;
+    const R3WgGrant *owner_gr = nullptr;
     for (uint32_t i = 0; i < g.grant_count; i++) {
         const R3WgGrant &gr = g.grants[i];
         if (!gr.range)
@@ -510,14 +517,21 @@ WVerdict r3_wg_classify(uint64_t pa, uint32_t size, WClass cls, const char *ctx)
         const uint64_t end = static_cast<uint64_t>(gr.start) + gr.dwords - 1u;
         if (pa < gr.start || hi > end)
             continue;
+        if (!first_gr)
+            first_gr = &gr;
         if (gr.readonly)
             // D6 read-only fence page: every write is refused, whatever the class.
             return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, gr.tag);
-        if (gr.owner == g.owner && cls == WClass::Data)
-            // A5: aggregate the whole grant interval, not each dword address.
-            return note_allow(&gr, ctx, gr.start, gr.dwords, WClass::Data, gr.tag);
-        return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, gr.tag);
-    }    return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, kOffListTag);
+        if (!owner_gr && gr.owner == g.owner && cls == WClass::Data)
+            owner_gr = &gr;
+    }
+    if (owner_gr)
+        // A5: aggregate the whole grant interval, not each dword address.
+        return note_allow(owner_gr, ctx, owner_gr->start, owner_gr->dwords, WClass::Data,
+                          owner_gr->tag);
+    if (first_gr)
+        return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, first_gr->tag);
+    return note_deny(ctx, static_cast<uint32_t>(pa), size, cls, kOffListTag);
 }
 
 WVerdict r3_write_classify(uint64_t pa, uint32_t size, const char *tag)

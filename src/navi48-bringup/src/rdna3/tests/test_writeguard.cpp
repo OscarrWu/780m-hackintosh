@@ -571,6 +571,146 @@ static uint32_t deny_lines(const R3WManifest *m)
     return n;
 }
 
+/* Two owners on one interval: owner priority, not "last registrant wins". */
+static void test_layout_owner_priority(void)
+{
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Gmc, "layout:test_buf") == 0,
+          "gmc row registered");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Mes, "layout:test_buf") == 0,
+          "mes row registered (same interval)");
+
+    r3_wg_arm_substep(WSubstep::Mes);
+    /* Before the fix the first row (Gmc) fully contains the write but its owner differs,
+     * so the classifier returns Deny here. */
+    CHECK(r3_wg_classify(FW_START + 2u, 1u, WClass::Data, "mes-mid") == WVerdict::TxnRead,
+          "armed later registrant writes the shared interval");
+    CHECK(r3_wg_classify(FW_START, FW_LEN, WClass::Data, "mes-full") == WVerdict::TxnRead,
+          "whole interval allowed for the later registrant");
+    CHECK(r3_writeguard_deny_count() == 0, "no deny for the two owners");
+
+    r3_wg_arm_substep(WSubstep::Gmc);
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::Data, "gmc-first") == WVerdict::TxnRead,
+          "earlier registrant still allowed (owner priority, not last-wins)");
+    CHECK(r3_writeguard_last_tag() && strcmp(r3_writeguard_last_tag(), "layout:test_buf") == 0,
+          "allow tag is the row tag");
+
+    r3_wg_arm_substep(WSubstep::Smu);
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::Data, "smu") == WVerdict::Deny,
+          "third party still denied");
+    CHECK(r3_writeguard_deny_count() == 1, "exactly one third-party deny");
+    r3_wg_disarm_substep();
+}
+
+/* D6: the read-only row is absolute and independent of registration order. */
+static void test_layout_readonly_priority(void)
+{
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok");
+    CHECK(r3_wg_register_layout_readonly(FW_START + 4u, 1u, WSubstep::Abi,
+                                         "layout:fence-ro") == 0,
+          "fence row registered first");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Mes, "layout:test_buf") == 0,
+          "mes row registered second");
+    r3_wg_arm_substep(WSubstep::Mes);
+    /* With the fence first the old code already denied; the reversed block below is the
+     * discriminating case. */
+    CHECK(r3_wg_classify(FW_START + 4u, 1u, WClass::Data, "fence") == WVerdict::Deny,
+          "readonly wins over the armed owner's row");
+    CHECK(r3_wg_classify(FW_START + 4u, 1u, WClass::State, "fence-state") == WVerdict::Deny,
+          "readonly wins for every class");
+    CHECK(r3_writeguard_deny_count() == 2, "two fence denies");
+    CHECK(r3_wg_classify(FW_START, 4u, WClass::Data, "before") == WVerdict::TxnRead,
+          "write ending before the fence is allowed");
+    CHECK(r3_wg_classify(FW_START + 5u, 1u, WClass::Data, "after") == WVerdict::TxnRead,
+          "write starting after the fence is allowed");
+    r3_wg_disarm_substep();
+
+    /* Reversed registration: the old code sees the Mes row first and allows the write. */
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok (reversed)");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Mes, "layout:test_buf") == 0,
+          "mes row registered first");
+    CHECK(r3_wg_register_layout_readonly(FW_START + 4u, 1u, WSubstep::Abi,
+                                         "layout:fence-ro") == 0,
+          "fence row registered second");
+    r3_wg_arm_substep(WSubstep::Mes);
+    CHECK(r3_wg_classify(FW_START + 4u, 1u, WClass::Data, "fence2") == WVerdict::Deny,
+          "registration order does not weaken D6");
+    CHECK(r3_writeguard_deny_count() == 1, "one deny after reinstall");
+    r3_wg_disarm_substep();
+}
+
+/* Class and bounds: a layout row accepts Data only; an overrun is off-list. */
+static void test_layout_class_and_off_list(void)
+{
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Gmc, "layout:test_buf") == 0,
+          "gmc row");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Mes, "layout:test_buf") == 0,
+          "mes row");
+    r3_wg_arm_substep(WSubstep::Mes);
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::State, "state") == WVerdict::Deny,
+          "layout rows are Data only");
+    CHECK(r3_wg_classify(FW_START + 7u, 2u, WClass::Data, "overrun") == WVerdict::Deny,
+          "a write crossing the interval end is off-list");
+    CHECK(r3_writeguard_deny_count() == 2, "two denies");
+    {
+        const R3WManifest *m = r3_writeguard_manifest();
+        char text[4096];
+        const size_t n = r3_wm_format(m, text, sizeof text);
+        CHECK(n > 0 && strstr(text, "layout:test_buf") != nullptr,
+              "deny carries the fitting row's tag");
+    }
+    r3_wg_disarm_substep();
+}
+
+/* Rule 2 does not regress: an exact register row still decides before the layout phase. */
+static void test_layout_rule2_precedence(void)
+{
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok");
+    CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Psp, FW_TAG) == 0, "layout row");
+    CHECK(r3_wg_register_reg(FW_START, 1u, WClass::State, WSubstep::Psp,
+                             "reg:state-fw") == 0,
+          "state row at the layout start");
+    r3_wg_arm_substep(WSubstep::Psp);
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::State, "state") == WVerdict::TxnRead,
+          "exact register row decides before the layout phase");
+    CHECK(r3_writeguard_last_tag() && strcmp(r3_writeguard_last_tag(), "reg:state-fw") == 0,
+          "rule 2 tag");
+    /* Rule 2 is still address-first for an exact addr+width: a Data write with the same
+     * address and width is denied with the register row's tag and never reaches rule 3.
+     * This is pre-existing behaviour; the fix does not change it. */
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::Data, "data-exact") == WVerdict::Deny,
+          "rule 2 still claims the exact row for a mismatched class");
+    CHECK(r3_writeguard_last_tag() == nullptr, "deny clears the tag");
+    /* A Data write that misses the register row falls through to the layout row. */
+    CHECK(r3_wg_classify(FW_START + 2u, 1u, WClass::Data, "data-off") == WVerdict::TxnRead,
+          "Data away from the register row falls through to the layout row");
+    CHECK(r3_writeguard_last_tag() && strcmp(r3_writeguard_last_tag(), FW_TAG) == 0,
+          "rule 3 tag");
+    r3_wg_arm_substep(WSubstep::Smu);
+    CHECK(r3_wg_classify(FW_START, 1u, WClass::State, "state-other") == WVerdict::Deny,
+          "rule 2 owner mismatch still denies");
+    CHECK(r3_wg_classify(FW_START + 2u, 1u, WClass::Data, "data-other") == WVerdict::Deny,
+          "rule 3 owner mismatch still denies");
+    CHECK(r3_writeguard_deny_count() == 3, "three denies");
+    r3_wg_disarm_substep();
+}
+
+/* Rule 1 does not regress: legacy windows still accept only Access writes with no substep. */
+static void test_rule1_legacy_unchanged(void)
+{
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok");
+    CHECK(r3_wg_classify(0x6u, 1u, WClass::Access, "mm") == WVerdict::TxnRead,
+          "legacy Access window allowed with no substep armed");
+    CHECK(r3_writeguard_last_tag() && strcmp(r3_writeguard_last_tag(), "mm-indirect") == 0,
+          "legacy tag");
+    CHECK(r3_wg_classify(0x6u, 1u, WClass::Data, "mm-data") == WVerdict::Deny,
+          "legacy window refuses a non-Access class");
+    CHECK(r3_wg_classify(AUX(0x1f50u), 1u, WClass::Access, "aux") == WVerdict::TxnRead,
+          "legacy AUX window allowed");
+    CHECK(r3_writeguard_deny_count() == 1, "one legacy deny");
+}
+
 static void test_manifest_merge(void)
 {
     char text[R3_WM_TEXT_BYTES];
@@ -1206,6 +1346,11 @@ int main(void)
     test_stage2_owner();
     test_stage2_disarm();
     test_stage2_readonly();
+    test_layout_owner_priority();
+    test_layout_readonly_priority();
+    test_layout_class_and_off_list();
+    test_layout_rule2_precedence();
+    test_rule1_legacy_unchanged();
     test_manifest_merge();
     test_manifest_deny_each();
     test_manifest_truncated();

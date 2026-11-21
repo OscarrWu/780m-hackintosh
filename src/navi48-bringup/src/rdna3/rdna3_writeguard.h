@@ -246,16 +246,20 @@ void r3_wg_set_log(R3WgLogFn fn, void *user);
  * layout grant the manifest records the grant interval (A5 aggregation); every other write is
  * recorded at its actual address/width. `ctx` is the caller's operation label.
  *
- * A window is claimed by address first: if the range lies inside a registered window no other
- * window is consulted. Two windows may cover one address (e.g. a ② layout grant and a ④ state
- * register at its start): they are ONE virtual table and each page is a row, and the row whose
- * owner is the armed substep and whose class matches the declared class is the one written
- * (several substeps may also register the same address and tag: the armed owner's row wins).
- * If some row fits address/width but none fits owner + class, the write is DENIED with that
- * row's tag. A row that only contains part of the range was not written and claims nothing:
- * a write that starts inside a layout grant and ends past its last dword is checked against
- * the remaining windows and normally DENIED. A read-only grant (D6 fence page) denies every
- * write that lands inside it, whatever the declared class. */
+ * Rules 1 and 2 keep their address-first behaviour: a stage-1 window or an exact
+ * address/width register row decides the write. If some exact register row fits address/width
+ * but none matches the class and is shared or owned by the armed substep, the write is DENIED
+ * with the tag of the last such fitting row. Rule 3 (② Data layout grants) instead considers
+ * every layout row that fully contains the range. Several substeps may register the same
+ * interval (e.g. the Gmc and Mes rows of test_buf); they are ONE virtual table, and the row
+ * whose owner is the armed substep and whose class matches the declared class is the one
+ * written (the armed owner's row wins, independent of registration order). If no layout row
+ * matches the armed owner and the Data class, the write is DENIED with the first
+ * fully-containing layout row's tag. A row that only contains part of the range was not
+ * written and claims nothing: a write that starts inside a layout grant and ends past its
+ * last dword is checked against the remaining windows and normally DENIED. A read-only grant
+ * (D6 fence page) denies every write that lies fully inside it, whatever the declared class,
+ * and no owner row can override it. */
 WVerdict r3_wg_classify(uint64_t pa, uint32_t size, WClass cls, const char *ctx);
 
 /* Stage-1 compatibility wrapper: classifies as WClass::Access. */
