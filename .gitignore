@@ -26,3 +26,6 @@ src/navi48-bringup/tmp/
 .DS_Store
 re/
 .codegraph/
+
+# local test artifacts / scratch
+tmp/
