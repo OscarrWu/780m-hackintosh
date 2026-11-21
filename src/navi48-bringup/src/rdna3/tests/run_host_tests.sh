@@ -101,8 +101,9 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_gfx_status" \
 
 echo "== test_sdma_msg (K7, SDMA0 queue0)"
 $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_sdma_msg" \
-    "$here/test_sdma_msg.cpp" "$src/amd/sdma_v6_0.cpp" "$src/rdna3/rdna3_substep.cpp" \
-    "$src/rdna3/rdna3_layout.cpp" "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" "$STUB"
+    "$here/test_sdma_msg.cpp" "$src/amd/sdma_v6_0.cpp" "$src/amd/nbio_v7_7.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" \
+    "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" "$STUB"
 "$out/test_sdma_msg"
 
 echo "== test_mes_api (K8, MES scheduler)"
@@ -142,7 +143,8 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_teardown" \
     "$src/rdna3/rdna3_teardown.cpp" "$src/rdna3/rdna3_writeguard.cpp" \
     "$src/rdna3/rdna3_wmanifest.cpp" "$src/rdna3/rdna3_substep.cpp" \
     "$src/rdna3/rdna3_layout.cpp" "$src/rdna3/rdna3_integration.cpp" \
-    "$src/amd/sdma_v6_0.cpp" "$src/amd/mes_v11_0.cpp" "$src/amd/pm4_v11.cpp" \
+    "$src/amd/pm4_v11.cpp" \
+    "$src/amd/sdma_v6_0.cpp" "$src/amd/nbio_v7_7.cpp" "$src/amd/mes_v11_0.cpp" \
     "$src/amd/psp_v13_0.cpp" "$src/amd/smu_v13_0.cpp" \
     "$src/rdna3/rdna3_fwhdr.cpp" "$src/rdna3/fw_table_rdna3.cpp" \
     "$out"/fw_*.o "$src/common/StageRunner.cpp" "$STUB"
@@ -153,7 +155,7 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_integration" \
     "$here/test_integration.cpp" "$src/rdna3/rdna3_integration.cpp" \
     "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" \
     "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" \
-    "$src/rdna3/rdna3_dump.cpp" "$src/amd/sdma_v6_0.cpp" \
+    "$src/rdna3/rdna3_dump.cpp" "$src/amd/sdma_v6_0.cpp" "$src/amd/nbio_v7_7.cpp" \
     "$src/amd/mes_v11_0.cpp" "$src/amd/pm4_v11.cpp" "$src/amd/psp_v13_0.cpp" \
     "$src/amd/smu_v13_0.cpp" \
     "$src/rdna3/rdna3_fwhdr.cpp" "$src/rdna3/fw_table_rdna3.cpp" \
@@ -162,12 +164,19 @@ $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_integration" \
 
 echo "== test_gmc (T-B, S6..S9 substeps + pure functions)"
 $CXX $FLAGS -include stdio.h -include string.h -o "$out/test_gmc" \
-    "$here/test_gmc.cpp" "$src/amd/gmc_v11_0.cpp" \
+    "$here/test_gmc.cpp" "$src/amd/gmc_v11_0.cpp" "$src/amd/nbio_v7_7.cpp" \
     "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_layout.cpp" \
     "$src/rdna3/rdna3_writeguard.cpp" "$src/rdna3/rdna3_wmanifest.cpp" \
     "$STUB"
 "$out/test_gmc"
 
+
+echo "== test_nbio_doorbell_range (S7, CSDMA doorbell range encoding)"
+$CXX $FLAGS -include stdio.h -include string.h -o "$out/test_nbio_doorbell_range" \
+    "$here/test_nbio_doorbell_range.cpp" "$src/amd/nbio_v7_7.cpp" \
+    "$src/rdna3/rdna3_substep.cpp" "$src/rdna3/rdna3_writeguard.cpp" \
+    "$src/rdna3/rdna3_wmanifest.cpp" "$STUB"
+"$out/test_nbio_doorbell_range"
 
 echo "== test_golden_values (T18, P1 address mechanism)"
 $CXX $FLAGS -o "$out/test_golden_values" "$here/test_golden_values.cpp"

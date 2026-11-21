@@ -26,13 +26,15 @@ CXX := clang++
 CC  := clang
 
 CXX_SRCS := src/Navi48Bringup.cpp src/Navi48UserClient.cpp src/Navi48NativeClient.cpp src/Navi48MetalNub.cpp src/Navi48DisplayNub.cpp src/ipdiscovery.cpp src/psp.cpp $(wildcard src/amd/*.cpp) $(wildcard src/apple/*.cpp) $(wildcard src/dcn/*.cpp)
-# The five stage-2 RDNA3 IP implementations under src/amd/ belong to the rdna3 set only
+# The stage-2 RDNA3 IP implementations under src/amd/ belong to the rdna3 set only
 # (that branch below replaces CXX_SRCS outright). Exclude them from the default/rdna4
 # product: their r3_* helpers are linked only for rdna3, so the src/amd/*.cpp wildcard
-# would otherwise leave those symbols undefined in the rdna4 kext.
+# would otherwise leave those symbols undefined in the rdna4 kext. nbio_v7_7 is the
+# RSMU-backed CSDMA doorbell-range helper and is likewise rdna3-only.
 RDNA3_ONLY_SRCS := src/amd/psp_v13_0.cpp src/amd/smu_v13_0.cpp \
                    src/amd/gfx_v11_0.cpp src/amd/sdma_v6_0.cpp \
-                   src/amd/mes_v11_0.cpp
+                   src/amd/mes_v11_0.cpp src/amd/gmc_v11_0.cpp \
+                   src/amd/nbio_v7_7.cpp
 CXX_SRCS := $(filter-out $(RDNA3_ONLY_SRCS),$(CXX_SRCS))
 # Firmware blobs (firmware/*.bin, NOT tracked in git — fetched from linux-firmware, see
 # BUILDING.md) are embedded as C arrays generated at build time into src/fw/ (gitignored)
@@ -138,6 +140,7 @@ CFLAGS   := $(COMMON)
 # blobs and is picked up by the src/rdna3/*.cpp wildcard in CXX_SRCS below.
 ifeq ($(TARGET),rdna3)
 CXX_SRCS := $(wildcard src/common/*.cpp src/rdna3/*.cpp) src/ipdiscovery.cpp src/amd/n48log.cpp src/amd/amdgpu_sysmem.cpp \
+            src/amd/nbio_v7_7.cpp \
             $(wildcard src/amd/psp_v13_*.cpp src/amd/smu_v13_*.cpp \
                       src/amd/gfx_v11_*.cpp src/amd/sdma_v6_*.cpp \
                       src/amd/mes_v11_*.cpp src/amd/ih_v6_*.cpp \
