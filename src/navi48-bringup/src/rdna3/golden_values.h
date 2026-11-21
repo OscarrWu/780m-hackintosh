@@ -370,7 +370,7 @@ constexpr GoldenReg kGcvmInvalidateEng17Ack = {
 constexpr GoldenReg kGcvmL2ProtectionFaultCntl = {
     "GCVM_L2_PROTECTION_FAULT_CNTL", amdgpu::IPBlock::GC, 0x15C4u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "gc_11_0_0_offset.h:2746/2747 (offset/_BASE_IDX); L2 fault default control (nullarc E7 writes 0x3ffffffc here)",
+    "gc_11_0_0_offset.h:2746/2747 (offset/_BASE_IDX); L2 fault default control (nullarc mesboot gart(): record mode 0x2 by default, 0x3ffffffc only with FAULT_DEFAULT, tools/phxctl/mesboot.c:113)",
 };
 
 constexpr GoldenReg kGcvmL2ProtectionFaultCntl2 = {
@@ -540,6 +540,7 @@ constexpr GoldenReg kSdma0Queue0RbBaseHi = {
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
     "gc_11_0_0_offset.h:194/195 (offset/_BASE_IDX); queue0 ring base, high",
 };
+
 constexpr GoldenReg kSdma0Queue0RbRptr = {
     "SDMA0_QUEUE0_RB_RPTR", amdgpu::IPBlock::SDMA0, 0x0083u, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
@@ -615,13 +616,13 @@ constexpr GoldenReg kSdma0Version = {
 constexpr GoldenReg kSdma0Utcl1Cntl = {
     "SDMA0_UTCL1_CNTL", amdgpu::IPBlock::SDMA0, 0x003Cu, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "gc_11_0_0_offset.h:98/99 (offset/_BASE_IDX); UTCL1 control (C-12 record item)",
+    "gc_11_0_0_offset.h:98/99 (offset/_BASE_IDX); programmed at S5 (sdma_v6_0.c:583-587); recorded at S8; RMW keeps non-owned bits (C-12)",
 };
 
 constexpr GoldenReg kSdma0Utcl1Page = {
     "SDMA0_UTCL1_PAGE", amdgpu::IPBlock::SDMA0, 0x003Fu, 0u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "gc_11_0_0_offset.h:104/105 (offset/_BASE_IDX); UTCL1 page control (C-12 record item)",
+    "gc_11_0_0_offset.h:104/105 (offset/_BASE_IDX); programmed at S5 (sdma_v6_0.c:589-596); recorded at S8; RMW keeps non-owned bits (C-12)",
 };
 
 constexpr GoldenReg kMmmcVmFbOffset = {
@@ -767,16 +768,17 @@ constexpr GoldenReg kMmvmContext8PageTableEndAddrHi32 = {
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
     "mmhub_3_0_1_offset.h:1494/1495 (offset/_BASE_IDX); MMHUB context8 page-table end high",
 };
+
 constexpr GoldenReg kMmvmInvalidateEng17Sem = {
     "MMVM_INVALIDATE_ENG17_SEM", amdgpu::IPBlock::MMHUB, 0x0762u, 1u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "mmhub_3_0_1_offset.h:1222/1223 (offset/_BASE_IDX); MMHUB invalidate engine 17 semaphore (T-E golden supplement)",
+    "mmhub_3_0_1_offset.h:1186/1187 (offset/_BASE_IDX); MMHUB invalidate engine 17 semaphore (T-E golden supplement)",
 };
 
 constexpr GoldenReg kMmvmInvalidateEng17Req = {
     "MMVM_INVALIDATE_ENG17_REQ", amdgpu::IPBlock::MMHUB, 0x0774u, 1u,
     Gate::RecordOnly, 0x00000000u, 0x00000000u,
-    "mmhub_3_0_1_offset.h:1258/1259 (offset/_BASE_IDX); MMHUB invalidate engine 17 request (T-E golden supplement)",
+    "mmhub_3_0_1_offset.h:1222/1223 (offset/_BASE_IDX); MMHUB invalidate engine 17 request (T-E golden supplement)",
 };
 
 constexpr GoldenReg kIhRbCntl = {

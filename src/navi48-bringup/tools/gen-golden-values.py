@@ -173,7 +173,7 @@ REGS = [
     ("GC", "GCVM_INVALIDATE_ENG17_ACK", "RecordOnly", 0, 0,
      "invalidate engine 17 acknowledge"),
     ("GC", "GCVM_L2_PROTECTION_FAULT_CNTL", "RecordOnly", 0, 0,
-     "L2 fault default control (nullarc E7 writes 0x3ffffffc here)"),
+     "L2 fault default control (nullarc mesboot gart(): record mode 0x2 by default, 0x3ffffffc only with FAULT_DEFAULT, tools/phxctl/mesboot.c:113)"),
     ("GC", "GCVM_L2_PROTECTION_FAULT_CNTL2", "RecordOnly", 0, 0,
      "L2 fault default control 2"),
     ("GC", "GCVM_L2_PROTECTION_FAULT_DEFAULT_ADDR_LO32", "RecordOnly", 0, 0,
@@ -232,6 +232,8 @@ REGS = [
      "queue0 ring base, low"),
     ("SDMA0", "SDMA0_QUEUE0_RB_BASE_HI", "RecordOnly", 0, 0,
      "queue0 ring base, high"),
+    ("SDMA0", "SDMA0_QUEUE0_RB_RPTR", "RecordOnly", 0, 0,
+     "queue0 read pointer (T-E golden supplement)"),
     ("SDMA0", "SDMA0_QUEUE0_RB_RPTR_ADDR_LO", "RecordOnly", 0, 0,
      "queue0 read-pointer writeback address, low"),
     ("SDMA0", "SDMA0_QUEUE0_RB_RPTR_ADDR_HI", "RecordOnly", 0, 0,
@@ -255,9 +257,9 @@ REGS = [
     ("SDMA0", "SDMA0_VERSION", "RecordOnly", 0, 0,
      "version observation, not a gate (Linux driver does not read it; D3/§8.2)"),
     ("SDMA0", "SDMA0_UTCL1_CNTL", "RecordOnly", 0, 0,
-     "UTCL1 control (C-12 record item)"),
+     "programmed at S5 (sdma_v6_0.c:583-587); recorded at S8; RMW keeps non-owned bits (C-12)"),
     ("SDMA0", "SDMA0_UTCL1_PAGE", "RecordOnly", 0, 0,
-     "UTCL1 page control (C-12 record item)"),
+     "programmed at S5 (sdma_v6_0.c:589-596); recorded at S8; RMW keeps non-owned bits (C-12)"),
 
     # ---- MMHUB: framebuffer location (mmhub_3_0_1_offset.h) ------------------
     ("MMHUB", "MMMC_VM_FB_OFFSET", "RecordOnly", 0, 0,
@@ -310,6 +312,10 @@ REGS = [
      "MMHUB context8 page-table end low"),
     ("MMHUB", "MMVM_CONTEXT8_PAGE_TABLE_END_ADDR_HI32", "RecordOnly", 0, 0,
      "MMHUB context8 page-table end high"),
+    ("MMHUB", "MMVM_INVALIDATE_ENG17_SEM", "RecordOnly", 0, 0,
+     "MMHUB invalidate engine 17 semaphore (T-E golden supplement)"),
+    ("MMHUB", "MMVM_INVALIDATE_ENG17_REQ", "RecordOnly", 0, 0,
+     "MMHUB invalidate engine 17 request (T-E golden supplement)"),
 
     # ---- OSSSYS: IH ring snapshot (osssys_6_0_0_offset.h; ih_v6_0.c:29) -------
     # Phoenix reports OSSSYS 6.0.x and Linux maps it to ih_v6_0, which includes
@@ -361,7 +367,7 @@ SEGMENTS = [
     ("MMHUB", 1, 0x0001A000, "tmp/tech/E13 (survey); nullarc ip_discovery.txt:26"),
     ("NBIO", 0, 0x00000000, "machine-config.md:129 (survey; group 0 is legitimately 0)"),
     ("NBIO", 1, 0x00000014, "machine-config.md:129 (survey)"),
-    ("OSSSYS", 0, 0x00011400, "machine-config.md:128 (survey; IH 6.0.1)"),
+    ("OSSSYS", 0, 0x000010A0, "machine-config.md:130 (survey; IH 6.0.1, hwid=40); nullarc ip_discovery.txt:31"),
 ]
 
 IP_VERSIONS = [
@@ -371,6 +377,7 @@ IP_VERSIONS = [
     ("MP1", 13, 0, 4, "machine-config.md:126"),
     ("SDMA0", 6, 0, 1, "machine-config.md:127"),
     ("NBIO", 7, 7, 0, "machine-config.md:129"),
+    ("OSSSYS", 6, 0, 1, "machine-config.md:130"),
 ]
 
 SCALARS = [
