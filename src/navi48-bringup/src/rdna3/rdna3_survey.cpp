@@ -533,7 +533,7 @@ static bool item_discovery(void *user, R3SurveyLines *lines) {
     uint32_t seg[DCN314_NUM_SEGS];
     for (uint32_t b = 0; b < DCN314_NUM_SEGS; b++) seg[b] = dmu->bases[b];
 
-    if (r3_writeguard_install(seg) != 0) {
+    if (r3_writeguard_install(seg, (uint32_t)(hw->dev->rmmioSize / 4)) != 0) {
         addf(lines, "d1-discovery", "FAIL: writeguard install rejected DMU bases");
         return true;
     }

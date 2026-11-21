@@ -56,9 +56,15 @@ static void prop_capture_init(PropCapture *p)
     p->value[0] = '\0';
 }
 
+/* The five DMU (DCN) discovery segment bases measured on the 780M, as dword offsets
+ * (Linux amdgpu_discovery.c: "The base address is in dwords"). seg[2] is the DCN/AUX base;
+ * seg[0] = 0x12 is the value the old byte-alignment test rejected; seg[4] lies outside BAR5
+ * because no armed window references either of them. */
 static const uint32_t SEG[R3_WG_SEGS] = {
-    0x00000000u, 0x00001000u, 0x00010000u, 0x00020000u, 0x00030000u
+    0x00000012u, 0x000000c0u, 0x000034c0u, 0x00009000u, 0x2403c00u
 };
+/* BAR5 is 512 KiB on the 780M: 0x20000 dwords (rmmioSize / 4). */
+static const uint32_t kBar5Dwords = 0x00020000u;
 #define AUX(a) (SEG[2] + (uint32_t)(a))
 
 /* Absolute BAR5 dwords from the base window implementation (Navi48Bringup.cpp:160-165). */
@@ -93,16 +99,16 @@ static const uint32_t kDeny[] = {
     AUX(0x1fbfu),
     AUX(0x1fc7u),                      /* first dword past AUX4_SW_DATA */
     AUX(0x1f4fu),                      /* first dword before AUX0 */
-    0x00002f50u,                       /* SEG1 + 0x1f50 */
-    0x00021f50u,                       /* SEG3 + 0x1f50 */
+    SEG[1] + 0x1f50u,                  /* AUX offset in an unarmed segment */
+    SEG[3] + 0x1f50u,                  /* AUX offset in an unarmed segment */
 };
 
 /* --------------------------------------------------------------------- stage 1 (unchanged) */
 
 static void test_install(void)
 {
-    CHECK(r3_writeguard_install(nullptr) == -1, "null seg refused");
-    CHECK(r3_writeguard_install(SEG) == 0, "install ok");
+    CHECK(r3_writeguard_install(nullptr, kBar5Dwords) == -1, "null seg refused");
+    CHECK(r3_writeguard_install(SEG, kBar5Dwords) == 0, "install ok");
     CHECK(r3_writeguard_deny_count() == 0 && r3_writeguard_txn_count() == 0,
           "install resets counters");
 }
@@ -124,37 +130,74 @@ static void ic_log_capture(void *user, const char *line)
 
 static void test_install_checked(void)
 {
-    uint32_t bad[R3_WG_SEGS] = {0x00000000u, 0x00001000u, 0x00010000u, 0x00020000u,
-                                0x00030000u};
-    CHECK(r3_writeguard_install_checked(nullptr, SEG, false) == -1, "null seg refused");
-    CHECK(r3_writeguard_install_checked(SEG, nullptr, false) == -1, "null disc refused");
+    uint32_t real[R3_WG_SEGS] = {0x00000012u, 0x000000c0u, 0x000034c0u, 0x00009000u,
+                                 0x2403c00u};
+    CHECK(r3_writeguard_install_checked(nullptr, real, kBar5Dwords, false) == -1,
+          "null seg refused");
+    CHECK(r3_writeguard_install_checked(real, nullptr, kBar5Dwords, false) == -1,
+          "null disc refused");
 
-    bad[1] = 0x00001001u; /* not dword aligned */
-    CHECK(r3_writeguard_install_checked(bad, bad, false) == -2, "unaligned segment refused");
-    bad[1] = 0x00001000u;
-    bad[4] = 0xFFFF0004u; /* above the BAR5 dword range */
-    CHECK(r3_writeguard_install_checked(bad, bad, false) == -2, "out-of-range segment refused");
+    /* seg[0] = 0x12 and seg[4] = 0x2403c00: if these dword offsets were mistaken for byte
+     * addresses, seg[0] would look unaligned and seg[4] out of range; neither feeds an armed
+     * window, so neither may reject the install. */
+    CHECK(r3_writeguard_install_checked(real, real, kBar5Dwords, true) == 0,
+          "real DMU bases accepted");
+    for (unsigned i = 0; i < R3_WG_MM_WINDOW_COUNT; i++) {
+        CHECK(r3_write_classify(kMmOffsets[i], 1u, "real-mm") == WVerdict::TxnRead,
+              "real MM dword 0x%x allowed", kMmOffsets[i]);
+    }
+    for (unsigned i = 0; i < R3_WG_AUX_WINDOW_COUNT; i++) {
+        CHECK(r3_write_classify(real[2] + kAuxOffsets[i], 1u, "real-aux") ==
+                  WVerdict::TxnRead,
+              "real AUX offset 0x%x allowed", kAuxOffsets[i]);
+    }
 
-    /* A zero base is legal: the MM window sits at BAR5 dword 0. */
-    CHECK(r3_writeguard_install_checked(SEG, SEG, true) == 0, "zero base + no drift accepted");
+    /* A zero base is legal: no armed window reads seg[0]. */
+    uint32_t zero[R3_WG_SEGS] = {0u, 0x000000c0u, 0x000034c0u, 0x00009000u, 0x2403c00u};
+    CHECK(r3_writeguard_install_checked(zero, zero, kBar5Dwords, true) == 0,
+          "zero base accepted");
+
+    /* Re-arm the real set so the next refusal has a real window to fall back on; the
+     * preceding zero install would otherwise leave window 5 at 0x1f50, not 0x5410. */
+    CHECK(r3_writeguard_install_checked(real, real, kBar5Dwords, true) == 0,
+          "real DMU bases re-armed");
+
+    /* Only the windows actually armed are range-checked. seg[2] feeds the AUX windows,
+     * so a seg[2] at or past the BAR5 capacity makes them leave the mapping. */
+    uint32_t bad[R3_WG_SEGS];
+    memcpy(bad, real, sizeof bad);
+    bad[2] = kBar5Dwords;
+    CHECK(r3_writeguard_install_checked(bad, bad, kBar5Dwords, false) == -2,
+          "seg[2] beyond BAR5 refused");
+    bad[2] = 0xFFFFFFFFu;
+    CHECK(r3_writeguard_install_checked(bad, bad, kBar5Dwords, false) == -2,
+          "referenced segment wrap refused");
+    CHECK(r3_writeguard_install_checked(real, real, 0u, false) == -2,
+          "unmapped BAR5 refused");
+    /* A refused install leaves the previous arm intact. */
+    CHECK(r3_write_classify(real[2] + 0x1f50u, 1u, "after-reject") == WVerdict::TxnRead,
+          "failed install did not disarm");
 
     g_ic_used = 0;
     g_ic_log[0] = '\0';
     r3_wg_set_log(&ic_log_capture, nullptr);
     uint32_t disc[R3_WG_SEGS];
-    memcpy(disc, SEG, sizeof disc);
+    memcpy(disc, real, sizeof disc);
     disc[2] += 0x1000u;
-    CHECK(r3_writeguard_install_checked(SEG, disc, false) == 0, "drift warns but installs");
+    CHECK(r3_writeguard_install_checked(real, disc, kBar5Dwords, false) == 0,
+          "drift warns but installs");
     CHECK(strstr(g_ic_log, "INSTALL-DRIFT seg2=") != nullptr, "drift line missing");
     CHECK(strstr(g_ic_log, "INSTALL-DRIFT-SKIP") != nullptr, "drift skip note missing");
-    CHECK(r3_writeguard_install_checked(SEG, disc, true) == -2, "enforced drift refused");
+    CHECK(r3_writeguard_install_checked(real, disc, kBar5Dwords, true) == -2,
+          "enforced drift refused");
 
     /* The log sink is not whitelist state: an install must not silence later DENY lines
      * (INV-D12). Without the fix g_ic_used stays 0 and this fails. */
     g_ic_used = 0;
     g_ic_log[0] = '\0';
     r3_wg_set_log(&ic_log_capture, nullptr);
-    CHECK(r3_writeguard_install_checked(SEG, SEG, false) == 0, "reinstall with sink ok");
+    CHECK(r3_writeguard_install_checked(real, real, kBar5Dwords, false) == 0,
+          "reinstall with sink ok");
     CHECK(r3_write_classify(0x7u, 1u, "post-install") == WVerdict::Deny, "off-window denied");
     CHECK(g_ic_used > 0u, "install must keep the log sink (INV-D12)");
     r3_wg_set_log(nullptr, nullptr);
@@ -203,7 +246,7 @@ static void test_table(void)
 
 static void test_allow(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     for (uint32_t i = 0; i < R3_WG_MM_WINDOW_COUNT; i++) {
         const WVerdict v = r3_write_classify(kMmOffsets[i], 1u, "tmr-read");
         CHECK(v == WVerdict::TxnRead, "MM dword 0x%x allowed", kMmOffsets[i]);
@@ -230,7 +273,7 @@ static void test_allow(void)
 
 static void test_deny(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     for (unsigned i = 0; i < sizeof(kDeny) / sizeof(kDeny[0]); i++) {
         CHECK(r3_write_classify(kDeny[i], 1u, "probe") == WVerdict::Deny,
               "addr 0x%x denied", kDeny[i]);
@@ -242,7 +285,7 @@ static void test_deny(void)
 
 static void test_cross_window(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     /* A two-dword write starting at a one-dword window crosses out of it. */
     CHECK(r3_write_classify(AUX(0x1f56u), 2u, "wide") == WVerdict::Deny, "wide write denied");
     CHECK(r3_write_classify(AUX(0x1f50u), 2u, "wide") == WVerdict::Deny, "wide write denied 2");
@@ -255,7 +298,7 @@ static void test_cross_window(void)
 
 static void test_unarmed(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     r3_write_classify(AUX(0x1f50u), 1u, "ok");
     r3_writeguard_disarm();
     CHECK(r3_write_classify(AUX(0x1f50u), 1u, "ok") == WVerdict::Deny,
@@ -268,7 +311,7 @@ static void test_unarmed(void)
 
 static void test_adapter(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     CHECK(r3_writeguard_write_ok(nullptr, AUX(0x1f56u), 0xdeadbeefu) == true,
           "adapter allows AUX SW_DATA");
     CHECK(r3_writeguard_write_ok(nullptr, AUX(0x1f54u), 0u) == false,
@@ -280,7 +323,7 @@ static void test_adapter(void)
 
 static void test_overflow(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     CHECK(r3_write_classify(0xFFFFFFFFull, 1u, "x") == WVerdict::Deny, "top dword denied");
     CHECK(r3_write_classify(0xFFFFFFFFull, 2u, "x") == WVerdict::Deny, "top+1 denied");
     CHECK(r3_write_classify(0x100000000ull, 1u, "x") == WVerdict::Deny, ">32-bit denied");
@@ -303,7 +346,7 @@ static void test_overflow(void)
 
 static void arm_stage2(void)
 {
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     CHECK(r3_wg_register_layout(FW_START, FW_LEN, WSubstep::Psp, FW_TAG) == 0,
           "layout grant registered");
     CHECK(r3_wg_register_reg(GPCOM, 1u, WClass::Protocol, WSubstep::Psp, "reg:psp-gpcom") == 0,
@@ -342,7 +385,7 @@ static void test_stage2_register_reject(void)
           "grant 0 keeps layout shape");
     CHECK(r3_wg_grant(n) == nullptr, "past-the-end grant is null");
 
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     CHECK(r3_wg_grant_count() == 0, "install clears grants");
     CHECK(r3_wg_substep() == WSubstep::None, "install resets the substep owner");
 }
@@ -484,7 +527,7 @@ static void test_stage2_readonly(void)
     CHECK(strcmp(r3_wg_substep_name(WSubstep::Ih), "ih") == 0, "substep name ih");
     CHECK(strcmp(r3_wg_substep_name(WSubstep::Abi), "abi") == 0, "substep name abi");
 
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     CHECK(r3_wg_register_layout_readonly(FW_START, FW_LEN, WSubstep::Abi,
                                          "layout:fence-ro") == 0,
           "readonly layout registered");
@@ -679,7 +722,7 @@ static void test_manifest_deny_each(void)
 static void test_manifest_truncated(void)
 {
     char text[R3_WM_TEXT_BYTES];
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     r3_wg_arm_substep(WSubstep::Psp);
     const R3WManifest *m = r3_writeguard_manifest();
     CHECK(m != nullptr, "writeguard owns a write manifest");
@@ -698,7 +741,7 @@ static void test_manifest_truncated(void)
 
     /* The cap is independent of the merge: an allowed repeat still merges once full, so a
      * known (owner, cls, addr, len, tag) is not counted as dropped. */
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     r3_wg_register_reg(GPCOM, 1u, WClass::Protocol, WSubstep::Psp, "reg:psp-gpcom");
     r3_wg_arm_substep(WSubstep::Psp);
     for (uint32_t i = 0; i < R3_WM_MAX; i++)
@@ -726,7 +769,7 @@ static void test_manifest_capacity(void)
 
     /* Fill with the worst-case count of distinct ③ entries and confirm no truncation and a
      * fully formatted export. */
-    r3_writeguard_install(SEG);
+    r3_writeguard_install(SEG, kBar5Dwords);
     r3_wg_arm_substep(WSubstep::Psp);
     const R3WManifest *m = r3_writeguard_manifest();
     CHECK(m != nullptr, "writeguard owns a write manifest");

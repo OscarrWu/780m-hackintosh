@@ -16,6 +16,12 @@
  * MMIO windows, exactly the value dcn314 passes to its write_ok callback). `size` is the access
  * width in dwords. Grant intervals use the same dword space.
  *
+ * Discovery segment bases are dword offsets into BAR5 too (Linux amdgpu_discovery.c: "The base
+ * address is in dwords"), not byte addresses: no base is alignment-checked, zero is allowed,
+ * and there is no per-base range check. A base is constrained only through the windows that
+ * reference it: the install checks each armed window's [base, base + width) against the runtime
+ * BAR5 capacity (`bar5_dwords`) and returns -2 if any window leaves it.
+ *
  * Stage 2 extension (tech plan §6.1):
  *   WClass   - B2 side-effect class: Access / Data / Protocol / State.
  *   WSubstep - power-up substep owner: None / Psp / Smu / Gfx / Sdma / Mes / Gmc / Ih / Abi.
@@ -38,7 +44,7 @@
  * r3_wm_format(r3_writeguard_manifest(), ...).
  *
  * Wiring for stage 1 (T2b):
- *   r3_writeguard_install(dmu.bases);              // once, from the DMU IP discovery entry
+ *   r3_writeguard_install(dmu.bases, bar5_dwords);  // bar5_dwords = BAR5 map length / 4
  *   dev.write_ok = r3_writeguard_write_ok;         // dcn314_write_ok_fn adapter
  *   // on an allowed write (V5 "逐条标注"):
  *   r3_writeguard_last_tag() + r3_writeguard_last_context() + address + size
@@ -59,13 +65,14 @@
 #define R3_WG_AUX_WINDOW_COUNT 25u
 #define R3_WG_WINDOW_COUNT (R3_WG_MM_WINDOW_COUNT + R3_WG_AUX_WINDOW_COUNT)
 #define R3_WG_GRANT_MAX 200u
-/* 写守卫 grant 表容量：全链预算 196 项（rdna3_ip_entries.h 预算契约；其中
- * reg 182 + layout 14）+ 4 行预留。
+/* 写守卫 grant 表容量：全链预算 199 项（rdna3_ip_entries.h 预算契约；其中
+ * reg 185 + layout 14）+ 1 行预留。
  * 数值一致性由该头文件的 static_assert 机械保证（R3_WG_BUDGET_TOTAL <=
  * R3_WG_GRANT_MAX）。容量只是兜底：越界的第一道拦截是批量注册前的
  * r3_wg_reserve() 预算检查（prep/stage 入口），此宏仅供表数组与诊断使用。
  * 2026-11-20 主 agent 裁决：IH 输入行 +6 使全链预算 170→176，容量 192→200；
- * 后续登记使全链预算为 196，容量维持 200（IH 6 条已计入 196）。
+ * 后续登记使全链预算为 199（IH 6 条已计入；另含 S7 UTCL1 两行与 GART
+ * fault-record 一行），容量维持 200。
  * GRANT_MAX 是防松胀上限而非硬件约束；防松胀由"实际注册计数 vs 预算常数"的
  * 机械断言承担（见 rdna3_ip_entries.h 与 test_write_budget）。 */
 
@@ -151,21 +158,29 @@ struct R3WgGrant {
     bool readonly;    /* true: D6 fence page — every write DENY (reads bypass this layer) */
 };
 
-/* Arm the guard from the DMU (DCN) IP's five discovery segment bases. Returns 0 on success,
- * -1 on a null argument. Until armed, every classify() is Deny (fail closed). Re-installing
+/* Arm the guard from the DMU (DCN) IP's five discovery segment bases and the runtime BAR5
+ * capacity. `seg` holds dword offsets (the Linux discovery unit), so a base may be zero and is
+ * never alignment-checked; only the segments an armed window actually references consume their
+ * base (the MM windows are absolute, the AUX windows use seg[2]), so a legal-but-unused high
+ * base such as the DMU's seg[4] cannot reject the install. `bar5_dwords` is the mapped BAR5
+ * length in dwords (rmmioSize / 4); a window whose [base, base + width) leaves it returns -2.
+ * Returns 0 on success, -1 on a null argument, -2 for a window outside BAR5 or an unmapped
+ * BAR5 (bar5_dwords == 0). A failed install leaves the current arm, grants and counters
+ * untouched. Until armed, every classify() is Deny (fail closed). Re-installing
  * re-arms, clears stage-2 grants and resets the counters and the write manifest. */
-int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS]);
+int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS], uint32_t bar5_dwords);
 
 /* #17: install with a discovery-source cross-check. `seg` is the authoritative base table;
  * `disc_seg` is the same table as independently read back from discovery (when it is not
- * available at this point, callers pass `seg` itself and the check is a no-op). Every base
- * must be non-zero, dword aligned and within the 32-bit register space; a structural
- * violation returns -2 before any state changes. A per-segment difference logs
- * "INSTALL-DRIFT" + "INSTALL-DRIFT-SKIP" and, with enforce_drift=true, returns -2 instead of
- * arming on unverified data. Returns 0 on success, -1 on a null argument. */
+ * available at this point, callers pass `seg` itself and the check is a no-op). The bases are
+ * dword offsets, so there is no structural alignment/per-base test; the window range check
+ * against `bar5_dwords` is the only structural gate and returns -2 before any state changes.
+ * A per-segment difference logs "INSTALL-DRIFT" + "INSTALL-DRIFT-SKIP" and, with
+ * enforce_drift=true, returns -2 instead of arming on unverified data. Returns 0 on success,
+ * -1 on a null argument, -2 for a window outside BAR5 or an unmapped BAR5. */
 int r3_writeguard_install_checked(const uint32_t seg[R3_WG_SEGS],
                                   const uint32_t disc_seg[R3_WG_SEGS],
-                                  bool enforce_drift);
+                                  uint32_t bar5_dwords, bool enforce_drift);
 
 /* Arm only the absolute MM_INDEX/MM_DATA/MM_INDEX_HI read-transaction windows (BAR5 dwords
  * 0x0/0x1/0x6, base Navi48Bringup.cpp:160-165). T2 needs these BEFORE discovery has supplied

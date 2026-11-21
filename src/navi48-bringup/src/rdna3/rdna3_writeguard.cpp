@@ -207,19 +207,28 @@ void r3_wg_set_log(R3WgLogFn fn, void *user)
 }
 
 namespace {
-bool seg_ok(uint32_t base)
+/* Absolute dword address a window would be armed at. Discovery bases are dword offsets, so
+ * the only structural question is whether the window's resulting range fits the mapped BAR5;
+ * a legal-but-unused high base (the DMU's seg[4] = 0x2403c00, outside BAR5) must not reject
+ * the install. Pure arithmetic, no I/O. */
+static inline uint64_t window_base(const uint32_t seg[R3_WG_SEGS], uint32_t i)
 {
-    return (base & 3u) == 0u && base <= 0xFFFF0000u;
+    return (kWindows[i].absolute ? 0ull : static_cast<uint64_t>(seg[kWindows[i].base_idx])) +
+           kWindows[i].offset;
 }
 } // namespace
 
 int r3_writeguard_install_checked(const uint32_t seg[R3_WG_SEGS],
-                                  const uint32_t disc_seg[R3_WG_SEGS], bool enforce_drift)
+                                  const uint32_t disc_seg[R3_WG_SEGS],
+                                  uint32_t bar5_dwords, bool enforce_drift)
 {
     if (!seg || !disc_seg)
         return -1;
-    for (uint32_t i = 0; i < R3_WG_SEGS; i++) {
-        if (!seg_ok(seg[i]))
+    /* Every window armed by this call must stay inside the mapped BAR5. uint64 arithmetic
+     * keeps a 32-bit wrap of seg[base_idx] + offset from passing; bar5_dwords == 0 (BAR5 not
+     * mapped) therefore rejects every install. Nothing is modified on failure. */
+    for (uint32_t i = 0; i < R3_WG_WINDOW_COUNT; i++) {
+        if (window_base(seg, i) + kWindows[i].dwords > bar5_dwords)
             return -2;
     }
     bool drift = false;
@@ -246,18 +255,15 @@ int r3_writeguard_install_checked(const uint32_t seg[R3_WG_SEGS],
     g.log_fn = log_fn;
     g.log_user = log_user;
     r3_wm_init(&g.manifest);
-    for (uint32_t i = 0; i < R3_WG_WINDOW_COUNT; i++) {
-        const uint32_t base = kWindows[i].absolute ? kWindows[i].offset
-                                                   : seg[kWindows[i].base_idx] + kWindows[i].offset;
-        arm_window(i, base);
-    }
+    for (uint32_t i = 0; i < R3_WG_WINDOW_COUNT; i++)
+        arm_window(i, static_cast<uint32_t>(window_base(seg, i)));
     g.armed = true;
     return 0;
 }
 
-int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS])
+int r3_writeguard_install(const uint32_t seg[R3_WG_SEGS], uint32_t bar5_dwords)
 {
-    return r3_writeguard_install_checked(seg, seg, false);
+    return r3_writeguard_install_checked(seg, seg, bar5_dwords, false);
 }
 
 int r3_writeguard_install_mm(void)

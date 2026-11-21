@@ -220,7 +220,8 @@ static bool prepare_stage2(StageCtx &ctx, R3IntegrationCtx *ic, R3SurveyStageSta
         /* #17: discovery is the only truthful source here; with a single snapshot the
          * drift check has nothing to compare against, so it is reported as skipped and
          * left non-enforcing (no fabricated second source). */
-        arm_rc = r3_writeguard_install_checked(seg, seg, false);
+        arm_rc = r3_writeguard_install_checked(seg, seg,
+                                               static_cast<uint32_t>(d.rmmioSize / 4), false);
         emitf(ctx, "stage2 prep: writeguard INSTALL-DRIFT-SKIP (single discovery source)");
     } else {
         arm_rc = r3_writeguard_install_mm();
