@@ -155,6 +155,13 @@ constexpr uint32_t kMesWbStatusOff              = 64u;
 constexpr uint32_t kMesWbSchCtxOff              = 128u;
 constexpr uint32_t kMesWbQueryFenceOff          = 136u;
 
+/* S11: intra-page offset of the VMID8 fence inside the single test page that
+ * seq_pt_build8 (gmc_v11_0.cpp:1702-1721) maps at kGmcTestVaVmid8.  It stays
+ * clear of the 13-dw IB (0x000..0x033) and the magic (kGmcTestPageIntra =
+ * 0x100), and is qword aligned for the 64-bit RELEASE_MEM write (Linux
+ * gfx_v11_0.c:6087-6090). */
+constexpr uint32_t kMesS11FenceIntra            = 0x200u;
+
 /* Doorbell indices (BAR2 dword index). */
 constexpr uint32_t kMesBarDoorbell              = 2u;
 constexpr uint32_t kMesDoorbellKiq              = 0x18u;

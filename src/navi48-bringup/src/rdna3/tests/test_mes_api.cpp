@@ -368,8 +368,14 @@ static void cp_run(Dev &d, uint32_t wptr)
                             const uint32_t seq =
                                 b0_32(d, test_page + static_cast<uint64_t>(i + 5u) * 4ull);
                             const uint64_t fmc = (fhi << 32) | flo;
-                            if (fmc >= kFbMcBase && !d.stall_cmp_fence)
-                                b0_put64(d, fmc - kFbMcBase, seq);
+                            if (!d.stall_cmp_fence) {
+                                /* VMID8 IB: the operand is a VA in the S9 page. */
+                                if (fmc >= kGmcTestVaVmid8 &&
+                                    fmc < kGmcTestVaVmid8 + 4096ull)
+                                    b0_put64(d, test_page + (fmc - kGmcTestVaVmid8), seq);
+                                else if (fmc >= kFbMcBase)
+                                    b0_put64(d, fmc - kFbMcBase, seq);
+                            }
                             i += itotal;
                         } else {
                             break;
@@ -1375,10 +1381,10 @@ static void test_s11_vmid8_ib()
         CHECK(d.ib_fetch[5] == 0xC0064900u, "ib rm w0=0x%08x", d.ib_fetch[5]);
         CHECK(d.ib_fetch[6] == 0x06603514u, "ib rm w1=0x%08x", d.ib_fetch[6]);
         CHECK(d.ib_fetch[7] == 0x40000000u, "ib rm w2=0x%08x", d.ib_fetch[7]);
-        const uint64_t fence_mc = grant_mc(kMesCmpWbOff) + kMesWbFenceOff;
-        CHECK(d.ib_fetch[8] == static_cast<uint32_t>(fence_mc), "ib rm fence_lo=0x%08x",
+        const uint64_t fence_va = kGmcTestVaVmid8 + kMesS11FenceIntra;
+        CHECK(d.ib_fetch[8] == static_cast<uint32_t>(fence_va), "ib rm fence_lo=0x%08x",
               d.ib_fetch[8]);
-        CHECK(d.ib_fetch[9] == static_cast<uint32_t>(fence_mc >> 32), "ib rm fence_hi=0x%08x",
+        CHECK(d.ib_fetch[9] == static_cast<uint32_t>(fence_va >> 32), "ib rm fence_hi=0x%08x",
               d.ib_fetch[9]);
         CHECK(d.ib_fetch[10] == 1u, "ib rm seq_lo=0x%08x", d.ib_fetch[10]);
         CHECK(d.ib_fetch[11] == 0u, "ib rm seq_hi=0x%08x", d.ib_fetch[11]);
@@ -1387,8 +1393,10 @@ static void test_s11_vmid8_ib()
 
     /* The VMID8 WRITE_DATA landed through the mapped page. */
     CHECK(b0_32(d, magic_off) == kGmcTestMagic, "vmid8 magic=0x%08x", b0_32(d, magic_off));
-    /* RELEASE_MEM wrote the fence. */
-    CHECK(b0_64(d, grant_bar0(kMesCmpWbOff) + kMesWbFenceOff) == 1ull, "cmp fence");
+    /* RELEASE_MEM wrote the fence through the VMID8 page, not the VMID0 WB. */
+    CHECK(b0_64(d, test_page + kMesS11FenceIntra) == 1ull, "vmid8 fence");
+    CHECK(b0_64(d, grant_bar0(kMesCmpWbOff) + kMesWbFenceOff) == 0ull,
+          "cmp wb fence must stay untouched");
     /* Wrap-around reset: whole ring is 2-dw NOPs, WB wptr back to 0. */
     bool all_nop = true;
     for (uint32_t i = 0; i < kMesCmpRingDwords; i += 2) {

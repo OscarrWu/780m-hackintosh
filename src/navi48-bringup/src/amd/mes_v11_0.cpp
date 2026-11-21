@@ -1789,24 +1789,35 @@ R3SubstepResult chk_queues(Mes &s)
  * translation, not via an MC address. Shape mirrors S13 (compute_v11.cpp) with
  * vmid=8: WRITE_DATA magic -> mapped VA, RELEASE_MEM fence (8 dw, Linux
  * gfx_v11_0.c emit_fence shape), fence poll, read-back. PM4 encoding comes
- * from pm4_v11.h (single authority). */
+ * from pm4_v11.h (single authority).  Every IB operand is a VA of the one page
+ * S9 mapped at kGmcTestVaVmid8; the fence therefore targets that page
+ * (kMesS11FenceIntra), not the VMID0 writeback MC address (Linux
+ * gfx_v11_0_ring_emit_fence writes the ring's GPU VA verbatim,
+ * gfx_v11_0.c:6065-6096). */
 R3SubstepResult seq_s11_vmid8_ib(Mes &s)
 {
     const R3Grant *test_grant = r3_layout_grant(&s.plan, "test_buf");
     if (!test_grant)
         return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
 
-    /* S9 mapped grant page 2 (start + 2*4096) at kGmcTestVaVmid8. */
+    /* S9 mapped grant page 2 (start + 2*4096) at kGmcTestVaVmid8.  The IB
+     * executes under the VMID carried in the INDIRECT_BUFFER packet, so every
+     * address it touches must be a VA in that one mapped page; the VMID0
+     * writeback MC address is not translatable here. */
     const uint64_t test_page_off = test_grant->start + 2 * 4096ull;
     const uint64_t vmid8_va = kGmcTestVaVmid8;
     const uint64_t magic_off = test_page_off + kGmcTestPageIntra;
-    const uint64_t fence_mc = s.cmp_wb_mc + kMesWbFenceOff;
+    const uint64_t fence_va = vmid8_va + kMesS11FenceIntra;
+    const uint64_t fence_off = test_page_off + kMesS11FenceIntra;
 
     /* IB body preloaded at the mapped page start: WRITE_DATA magic, then
-     * RELEASE_MEM fence (GL2 writeback included, nullarc vkprobe shape). */
+     * RELEASE_MEM fence (GL2 writeback included, nullarc vkprobe shape).  The
+     * fence operand is the VMID8 VA of the same page (Linux
+     * gfx_v11_0_ring_emit_fence writes the ring's GPU VA verbatim,
+     * gfx_v11_0.c:6065-6096), not the VMID0 writeback MC address. */
     uint32_t ib[13] = {};
     if (pm4_write_data(ib, vmid8_va + kGmcTestPageIntra, kGmcTestMagic) == 0u ||
-        pm4_release_mem(ib + 5, fence_mc, 1u) == 0u)
+        pm4_release_mem(ib + 5, fence_va, 1u) == 0u)
         return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
     if (!write_dwords(s, test_page_off, ib, 13u, "mes-s11-vmid8-ib"))
         return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
@@ -1819,7 +1830,7 @@ R3SubstepResult seq_s11_vmid8_ib(Mes &s)
         return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
 
     /* Clear the fence first so a stale value cannot fake completion. */
-    if (!bus_write(s, s.cmp_wb_bar0 + kMesWbFenceOff, 0ull, 2u, "mes-s11-vmid8-fence"))
+    if (!bus_write(s, fence_off, 0ull, 2u, "mes-s11-vmid8-fence"))
         return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
 
     /* Submit tail (pm4_submit_tail order via mes helpers): drain read, HDP
@@ -1841,7 +1852,7 @@ R3SubstepResult seq_s11_vmid8_ib(Mes &s)
     uint64_t fence = 0;
     bool fence_seen = false;
     for (uint32_t polls = 0; polls < kMesFencePolls; polls++) {
-        if (!bus_read(s, s.cmp_wb_bar0 + kMesWbFenceOff, 2u, &fence))
+        if (!bus_read(s, fence_off, 2u, &fence))
             return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
         if (fence == 1ull) {
             fence_seen = true;
@@ -1850,8 +1861,10 @@ R3SubstepResult seq_s11_vmid8_ib(Mes &s)
         r3_io_udelay(s.io, kMesPollUs);
     }
     if (!fence_seen) {
-        evf(s.env, "mes-s11", "vmid8 ib fence timeout: got 0x%llx want 1",
-            static_cast<unsigned long long>(fence));
+        evf(s.env, "mes-s11",
+            "vmid8 ib fence timeout: got 0x%llx want 1 (fence bar0=0x%llx)",
+            static_cast<unsigned long long>(fence),
+            static_cast<unsigned long long>(fence_off));
         return r3_substep_fail(kR3SecSeq, 11, kFailS11Vmid8Ib);
     }
 

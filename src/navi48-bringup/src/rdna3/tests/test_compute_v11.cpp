@@ -658,7 +658,7 @@ static void test_s13_stale_fence_precleared(void)
     const uint64_t mes_off = grant_start(f.rt.layout, "mes");
     const uint64_t cmp_fence_off = mes_off + kMesCmpWbOff + kMesWbFenceOff;
     d.ring_off = mes_off + kMesCmpRingOff;
-    /* S11 already released seq 1 into this slot; the CP never fires here. */
+    /* Seed a stale fence as a previous VMID0 release would; the CP never fires here. */
     b0_put64(d, cmp_fence_off, 1ull);
     d.stall_fence = true;
 
