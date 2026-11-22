@@ -23,6 +23,7 @@
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
+#include <IOKit/IODeviceMemory.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/pci/IOPCIDevice.h>
 #include <libkern/c++/OSDictionary.h>
@@ -644,6 +645,7 @@ struct BOEntry {
     void    *sysmem_cpu;   // GTT: sysmem CPU pointer; nullptr for UMA
     uint32_t pages;        // page count
     bool     in_use;
+    IOMemoryDescriptor *map_md;  // P1: the ONE CPU-map descriptor of this BO (cache holds 1 ref)
 };
 static constexpr uint32_t kABIMaxBOs = 64u;
 static BOEntry s_bo_pool[kABIMaxBOs] = {};
@@ -701,6 +703,8 @@ static void gart_free_va(uint64_t va) {
 static uint64_t bo_next_slot() {
     for (uint32_t i = 0; i < kABIMaxBOs; i++) {
         if (!s_bo_pool[i].in_use) {
+            // Claim = clean record + visible to bo_by_slot/bo_by_va in one step (D1).
+            s_bo_pool[i] = BOEntry{};
             s_bo_pool[i].in_use = true;
             return static_cast<uint64_t>(i) + 1ull;
         }
