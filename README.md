@@ -4,7 +4,7 @@
 
 <p align="center"><strong>Bringing modern AMD GPUs Apple no longer supports back to macOS</strong> — <em>no Apple AMD driver involved.</em></p>
 
-<p align="center"><sub>Radeon 780M (RDNA3, Phoenix) iGPU bring-up · staged roadmap, stage 2 complete · RDNA4 / Navi 48 sister line already exercised end to end</sub></p>
+<p align="center"><sub>Radeon 780M (RDNA3, Phoenix) iGPU bring-up · staged roadmap, stage 3 complete · RDNA4 / Navi 48 sister line already exercised end to end</sub></p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2b3bd6?style=for-the-badge"></a>
@@ -23,7 +23,7 @@ Two GPU lines share one codebase:
 
 - **Radeon 780M (RDNA3, Phoenix iGPU)** — the current focus of the project. Bring-up follows
   a staged roadmap (forensics & baseline → skeleton → power-up & firmware → memory & queues →
-  display & acceleration → Metal → daily driver), documented stage by stage in `docs/`.
+  display & acceleration → Metal → daily driver).
 - **Radeon RX 9070 XT (RDNA4, Navi 48 dGPU)** — reuses the existing implementation from
   upstream Cobalt64.
 
@@ -49,20 +49,18 @@ and generic; everything below the TTL — the per-card hardware layer — is our
 
 ## Status
 
-**780M (RDNA3) line** — staged roadmap, stage 2 complete:
+**780M (RDNA3) line** — staged roadmap, stage 3 complete, stage 4 (display & acceleration)
+underway:
 
 | Stage | Scope | Status |
 |---|---|---|
 | 0 | Forensics & baseline | ✅ complete |
 | 1 | Fork & skeleton | ✅ complete |
 | 2 | Power-up & firmware | ✅ complete |
-| 3 | Memory & queues | planned |
-| 4 | Display & acceleration | planned |
+| 3 | Memory & queues | ✅ complete (two-round hardware re-verification passed) |
+| 4 | Display & acceleration | 🚧 in progress (requirements phase) |
 | 5 | Metal | planned |
 | 6 | Daily driver | planned |
-
-Stage documents live in `docs/` (Chinese): `docs/00-总体路线.md` is the roadmap and
-literature base; `docs/10`–`docs/16` cover the stages above.
 
 This is an **experimental preview**: a lot is still rough, display modes are limited to what
 the test PC's monitors needed, and many pieces work around one specific macOS build.
@@ -78,7 +76,7 @@ is no warranty (see LICENSE).
 ## Can I install this?
 
 **Not yet.** Running it today needs a manual build and a lot of manual setup on a separate
-macOS install. Start with [`BUILDING.md`](BUILDING.md) and the stage documents in [`docs/`](docs/00-总体路线.md).
+macOS install. Start with [`BUILDING.md`](BUILDING.md).
 
 ## What this repo contains
 
@@ -91,7 +89,6 @@ macOS install. Start with [`BUILDING.md`](BUILDING.md) and the stage documents i
 | `tools/pc`, `tools/dcn41`, `tools/ioaccel-layout` | PC-side test CLI and run scripts, display-register tooling, test suite runners and "planted break" mutation tests. |
 | `mesa-patches` | RADV (Mesa Vulkan) Darwin port as nine patches on a pinned Mesa commit; see `mesa-patches/README.txt`. |
 | `third-party` | LGPL components kept separate from the MIT code; see `third-party/THIRD-PARTY-LICENSES.txt`. |
-| `docs` | Public project documentation: roadmap and per-stage bring-up documents (Chinese). |
 
 ## Building
 

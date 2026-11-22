@@ -1,5 +1,5 @@
 # Makefile.linux — Linux 交叉编译 Navi48Bringup.kext（原 Makefile 的 Linux 适配版，勿改原文件）。
-# 工具链前提见 docs/Linux快速迭代编译指南.md（clang + /opt/cctools ld64 + /opt/MacKernelSDK + /opt/dispatch）。
+# 工具链前提：clang + /opt/cctools ld64 + /opt/MacKernelSDK + /opt/dispatch（版本与安装见项目构建文档）。
 # Reuses RDNA4FB's MacKernelSDK. Targets macOS 11 ABI (loads on 11+, incl. Tahoe).
 #   make -f Makefile.linux TARGET=rdna4 all   -> build/rdna4/Navi48Bringup.kext + 同步 src/build/rdna4/
 #   make -f Makefile.linux TARGET=rdna3 all   -> build/rdna3/Navi48Bringup.kext + 同步 src/build/rdna3/

@@ -4,7 +4,7 @@
 
 <p align="center"><strong>让 Apple 不再支持的现代 AMD 显卡回到 macOS</strong>——<em>不依赖 Apple 的 AMD 驱动。</em></p>
 
-<p align="center"><sub>Radeon 780M（RDNA3，Phoenix）核显点亮 · 分阶段路线图，阶段 2 已完成</sub></p>
+<p align="center"><sub>Radeon 780M（RDNA3，Phoenix）核显点亮 · 分阶段路线图，阶段 3 已完成</sub></p>
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-2b3bd6?style=for-the-badge"></a>
@@ -19,8 +19,7 @@
 
 两条 GPU 线路共用同一套代码：
 - **Radeon 780M（RDNA3，Phoenix 核显）**——本项目重点。点亮工作按分阶段路线图推进
-  （取证与基线 → 骨架 → 上电与固件 → 内存与队列 → 显示与加速 → Metal → 日常化），
-  每个阶段在 `docs/` 中有对应文档。
+  （取证与基线 → 骨架 → 上电与固件 → 内存与队列 → 显示与加速 → Metal → 日常化）。
 - **Radeon RX 9070 XT（RDNA4，Navi 48 独显）**——复用上游 Cobalt64 的已有实现。
 
 ## 工作原理
@@ -45,20 +44,17 @@ TTL 边界是从 Cobalt64 继承的关键设计：Apple 上层保持不动、保
 
 ## 当前状态
 
-**780M（RDNA3）线路**——分阶段路线图，阶段 2 已完成：
+**780M（RDNA3）线路**——分阶段路线图，阶段 3 已完成，阶段 4（显示与加速）进行中：
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | 0 | 取证与基线 | ✅ 已完成 |
 | 1 | fork 与骨架 | ✅ 已完成 |
 | 2 | 上电与固件 | ✅ 已完成 |
-| 3 | 内存与队列 | 规划中 |
-| 4 | 显示与加速 | 规划中 |
+| 3 | 内存与队列 | ✅ 已完成（两轮真机复验通过） |
+| 4 | 显示与加速 | 🚧 进行中（需求阶段） |
 | 5 | Metal | 规划中 |
 | 6 | 日常化 | 规划中 |
-
-阶段文档位于 `docs/`：`docs/00-总体路线.md` 是总体路线与文献库；`docs/10`–`docs/16`
-对应上表各阶段。
 
 这是一个**实验性预览**：许多部分仍然粗糙，显示模式仅覆盖测试机显示器的需要，
 且不少环节针对特定 macOS 版本做了适配。
@@ -73,7 +69,7 @@ TTL 边界是从 Cobalt64 继承的关键设计：Apple 上层保持不动、保
 ## 现在能装吗？
 
 **还不能。** 当下运行需要手动构建，并在独立的 macOS 安装上做大量手动配置。
-请从 [`BUILDING.md`](BUILDING.md) 和 [`docs/`](docs/00-总体路线.md) 的阶段文档入手。
+请从 [`BUILDING.md`](BUILDING.md) 入手。
 
 ## 仓库内容
 
@@ -86,7 +82,6 @@ TTL 边界是从 Cobalt64 继承的关键设计：Apple 上层保持不动、保
 | `tools/pc`、`tools/dcn41`、`tools/ioaccel-layout` | PC 侧测试 CLI 与运行脚本、显示寄存器工具、测试套件运行器、"植入缺陷"变异测试。 |
 | `mesa-patches` | RADV（Mesa Vulkan）Darwin 移植，九个补丁，基于固定 Mesa 提交；见 `mesa-patches/README.txt`。 |
 | `third-party` | LGPL 组件，与 MIT 代码分离；见 `third-party/THIRD-PARTY-LICENSES.txt`。 |
-| `docs` | 公开项目文档：总体路线与各阶段点亮文档（中文）。 |
 
 ## 构建
 
