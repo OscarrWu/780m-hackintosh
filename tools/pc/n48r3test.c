@@ -668,8 +668,8 @@ static uint64_t n48r3_abi_fence_wait(io_connect_t conn, uint64_t expected_seq,
  * The IOUserClient's clientMemoryForType turns the type into a BAR0/sysmem
  * physical slice; the tool then reads/writes the mapped CPU window directly. */
 static kern_return_t n48r3_abi_map(io_connect_t conn, uint32_t memory_type,
+                                   IOOptionBits opt,
                                    mach_vm_address_t *addr, mach_vm_size_t *size) {
-    IOOptionBits opt = 0;
     *size = 0;
     *addr = 0;
     return IOConnectMapMemory64(conn, memory_type, mach_task_self(),
@@ -714,13 +714,15 @@ static int n48r3_bo_map(io_connect_t conn, const char *cmd, uint64_t size,
                         volatile uint32_t **cpu) {
     mach_vm_address_t addr = 0;
     mach_vm_size_t mapped = 0;
+    IOOptionBits opt = kIOMapAnywhere;
+    if (domain == (uint32_t)kN48R3DomainUMA) opt |= kIOMapWriteCombineCache;
     kern_return_t kr;
     *gva = n48r3_abi_alloc(conn, size, domain, handle);
     if (*gva == 0 || *handle == 0 || *handle > N48R3_BO_MAX) {
         fprintf(stderr, "n48r3: %s: BOAlloc failed\n", cmd);
         return N48R3_EXIT_CALL;
     }
-    kr = n48r3_abi_map(conn, (uint32_t)*handle, &addr, &mapped);
+    kr = n48r3_abi_map(conn, (uint32_t)*handle, opt, &addr, &mapped);
     if (kr != KERN_SUCCESS || addr == 0 || mapped < size) {
         fprintf(stderr, "n48r3: %s: map(handle=%llu) failed: %s (0x%x)\n",
                 cmd, (unsigned long long)*handle, n48r3_kr_text(kr), kr);
@@ -733,7 +735,10 @@ static int n48r3_bo_map(io_connect_t conn, const char *cmd, uint64_t size,
 
 static int n48r3_bo_release(io_connect_t conn, uint32_t memory_type,
                             mach_vm_address_t addr, uint64_t gva) {
-    n48r3_abi_unmap(conn, memory_type, addr);
+    kern_return_t ukr = n48r3_abi_unmap(conn, memory_type, addr);
+    if (ukr != KERN_SUCCESS)
+        fprintf(stderr, "n48r3: unmap(type=%u) failed: %s (0x%x)\n",
+                memory_type, n48r3_kr_text(ukr), ukr);
     return n48r3_abi_free(conn, gva) == KERN_SUCCESS ? N48R3_EXIT_OK : N48R3_EXIT_CALL;
 }
 
