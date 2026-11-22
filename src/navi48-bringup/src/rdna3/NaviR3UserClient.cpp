@@ -150,7 +150,7 @@ IOReturn NaviR3UserClient::clientMemoryForType(UInt32 type, IOOptionBits *option
     if (type == kN48R3MemoryTypeFenceRo)
         *memory = owner_->r3FenceRoMemory();
     else if (type >= 1u && type <= N48R3_BO_MAX)
-        *memory = owner_->r3BoMemory(type);  // handle == kernel map type
+        *memory = owner_->r3BoMemory(type, options);  // handle == kernel map type
     else
         return super::clientMemoryForType(type, options, memory);
     return *memory != nullptr ? kIOReturnSuccess : kIOReturnNotFound;

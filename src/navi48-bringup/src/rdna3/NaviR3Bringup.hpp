@@ -90,10 +90,11 @@ public:
     IOReturn   r3SubmitIB(const struct N48R3CsIb *ibs, uint32_t num_ibs, uint64_t *fence);
     IOReturn   r3WaitFence(uint64_t expected_seq, uint32_t timeout_us,
                            uint64_t *observed, bool *timed_out);
-    /* clientMemoryForType backing: a fresh device descriptor slice of the BO's backing
-     * memory (UMA: BAR0 window; GTT: sysmem pages), or the D6 fence page. The descriptor
-     * reference is handed to IOUserClient::mapClientMemory64 (Navi48UserClient.cpp:31-41). */
-    IOMemoryDescriptor *r3BoMemory(uint64_t handle);
+    /* clientMemoryForType backing: ONE cached device descriptor per BO (UMA: BAR0 window
+     * slice; GTT: sysmem pages) or the D6 fence page. Each call returns a retained reference
+     * that IOUserClient::mapClientMemory64 consumes (NaviR3UserClient.cpp:144-157); the cache
+     * holds exactly one reference, released by r3FreeBO / releaseMappingDescriptors. */
+    IOMemoryDescriptor *r3BoMemory(uint64_t handle, IOOptionBits *options);
     IOMemoryDescriptor *r3FenceRoMemory();
 private:
     static bool setPropertyThunk(void *user, const char *key, const char *bytes, size_t len);
@@ -123,6 +124,7 @@ private:
     void bindIntegrationIo();
     void exportArmedEvidence();
     void exportStage2Evidence();
+    void releaseMappingDescriptors();
     /* StageHooks: the K9 dump -> latch -> teardown order (R3 in StageRunner does the latch). */
     static void onStageStop(StageCtx &ctx, uint32_t index, StageResult result);
 
@@ -131,6 +133,7 @@ private:
     IOMemoryMap          *bar0Map_ { nullptr };
     IOMemoryMap          *bar2Map_ { nullptr };
     IOLock               *ioLock_ { nullptr };
+    IOMemoryDescriptor    *fence_ro_md_ { nullptr };  /* P1: cached D6 fence descriptor (1 ref) */
     R3IntegrationCtx      integ_ {};
     R3ReadManifest        rd_manifest_ {};   /* BAR5/BAR0 reads (B5)                  */
     R3ReadManifest        rd_smn_ {};        /* SMN reads, keyed by smn_byte_addr>>2  */

@@ -746,7 +746,6 @@ IOReturn NaviR3Bringup::r3AllocBO(uint32_t domain, uint64_t size,
     const uint64_t slot = bo_next_slot();
     if (slot == 0) { IOLockUnlock(s_bo_lock); return kIOReturnNoMemory; }
     BOEntry *e = &s_bo_pool[slot - 1];
-    *e = BOEntry{};
 
     IOReturn ret = kIOReturnSuccess;
     const R3LayoutPlan &plan = integ_.rt.layout;
@@ -808,6 +807,8 @@ IOReturn NaviR3Bringup::r3FreeBO(uint64_t gpu_va) {
     IOLockLock(s_bo_lock);
     BOEntry *e = bo_by_va(gpu_va);
     if (!e) { IOLockUnlock(s_bo_lock); return kIOReturnBadArgument; }
+    /* P1: drop the cached CPU-map descriptor before the backing range is returned. */
+    if (e->map_md != nullptr) { e->map_md->release(); e->map_md = nullptr; }
     if (e->domain == kN48R3DomainUMA) {
         const R3Grant *tb = find_grant(integ_.rt.layout, "test_buf");
         if (tb) uma_free_pages((e->off - tb->start) >> 12, e->pages);
@@ -975,33 +976,64 @@ IOReturn NaviR3Bringup::r3WaitFence(uint64_t expected_seq, uint32_t timeout_us,
     return kIOReturnSuccess;
 }
 
-IOMemoryDescriptor *NaviR3Bringup::r3BoMemory(uint64_t handle) {
+IOMemoryDescriptor *NaviR3Bringup::r3BoMemory(uint64_t handle, IOOptionBits *options) {
     if (!s_bo_lock) return nullptr;
     IOLockLock(s_bo_lock);
     BOEntry *e = bo_by_slot(handle);
-    IOMemoryDescriptor *md = nullptr;
-    if (e) {
+    if (!e) { IOLockUnlock(s_bo_lock); return nullptr; }
+    if (e->map_md == nullptr) {
+        // P1: build ONE descriptor per BO and cache it. UMA maps the BAR0 window slice at
+        // the same carveout offset the GPU sees (B4; grant->start is an offset into the
+        // BAR0 window); GTT maps the sysmem pages the GART PTEs already point at.
         if (e->domain == kN48R3DomainUMA) {
-            // UMA: CPU access goes through the BAR0 window slice at the same carveout
-            // offset the GPU sees (B4; grant->start is an offset into the BAR0 window).
-            md = IOMemoryDescriptor::withPhysicalAddress(
-                     dev_.bar0Phys + e->off, e->size, kIODirectionInOut);
+            e->map_md = IODeviceMemory::withRange(
+                (IOPhysicalAddress)(dev_.bar0Phys + e->off), (IOPhysicalLength)e->size);
         } else {
-            md = IOMemoryDescriptor::withPhysicalAddress(
-                     e->sysmem_phys, e->size, kIODirectionInOut);
+            e->map_md = IOMemoryDescriptor::withPhysicalAddress(
+                e->sysmem_phys, e->size, kIODirectionInOut);
         }
+        if (e->map_md == nullptr) { IOLockUnlock(s_bo_lock); return nullptr; }
     }
+    IOMemoryDescriptor *md = e->map_md;
+    md->retain();  // one reference per mapClientMemory64 call; unmap releases it
+    if (e->domain == kN48R3DomainUMA && options != nullptr)
+        *options |= kIOMapWriteCombineCache;
     IOLockUnlock(s_bo_lock);
-    return md;  // fresh descriptor; mapClientMemory64 consumes the reference
+    return md;
 }
 
 IOMemoryDescriptor *NaviR3Bringup::r3FenceRoMemory() {
     const R3Grant *fence_ro = find_grant(integ_.rt.layout, "fence_ro");
     if (!fence_ro) return nullptr;
-    return IOMemoryDescriptor::withPhysicalAddress(
-        dev_.bar0Phys + fence_ro->start, fence_ro->size, kIODirectionIn);
+    if (!s_bo_lock) s_bo_lock = IOLockAlloc();
+    if (!s_bo_lock) return nullptr;
+    IOLockLock(s_bo_lock);
+    if (fence_ro_md_ == nullptr) {
+        fence_ro_md_ = IODeviceMemory::withRange(
+            (IOPhysicalAddress)(dev_.bar0Phys + fence_ro->start),
+            (IOPhysicalLength)fence_ro->size);
+    }
+    IOMemoryDescriptor *md = fence_ro_md_;
+    if (md) md->retain();  // one reference per mapClientMemory64 call
+    IOLockUnlock(s_bo_lock);
+    return md;
 }
 
+void NaviR3Bringup::releaseMappingDescriptors() {
+    if (s_bo_lock == nullptr) return;
+    IOLockLock(s_bo_lock);
+    for (uint32_t i = 0; i < kABIMaxBOs; i++) {
+        if (s_bo_pool[i].map_md != nullptr) {
+            s_bo_pool[i].map_md->release();
+            s_bo_pool[i].map_md = nullptr;
+        }
+    }
+    if (fence_ro_md_ != nullptr) {
+        fence_ro_md_->release();
+        fence_ro_md_ = nullptr;
+    }
+    IOLockUnlock(s_bo_lock);
+}
 
 void NaviR3Bringup::exportStage2Evidence() {
     char buf[1024];
@@ -1072,6 +1104,7 @@ void NaviR3Bringup::stop(IOService *provider) {
         r3_writeguard_disarm();
         started_ = false;
     }
+    releaseMappingDescriptors();
     if (ioLock_) {
         IOLockFree(ioLock_);
         ioLock_ = nullptr;
@@ -1083,6 +1116,7 @@ void NaviR3Bringup::stop(IOService *provider) {
 }
 
 void NaviR3Bringup::free() {
+    releaseMappingDescriptors();
     unmapBar2();
     unmapBar0();
     unmapBar5();
